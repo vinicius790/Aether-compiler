@@ -1,0 +1,9 @@
+fn twice(p: i32) -> i32 {
+    let x = p + 1;
+    let y = p + 1;
+    return x + y;
+}
+
+fn main() -> i32 {
+    return twice(3);
+}

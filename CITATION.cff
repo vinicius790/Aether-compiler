@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+title: Aether
+message: If you use this compiler in academic work, cite this repository.
+type: software
+authors:
+  - name: Aether Contributors
+license: MIT
+version: 0.2.0
+date-released: "2026-09-19"
+abstract: >
+  Aether is a small statically typed imperative language with a complete
+  compiler pipeline, a register virtual machine, a textual LLVM backend,
+  and an in-tree fuzzer.
+keywords:
+  - compiler
+  - virtual machine
+  - optimizer
+  - fuzzing

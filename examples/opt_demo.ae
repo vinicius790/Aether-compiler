@@ -1,0 +1,8 @@
+// Constant expressions that the optimizer should fold.
+fn main() -> i32 {
+    let a = 1 + 2 * 3;
+    let b = (10 - 4) * 2;
+    let c = a + b;
+    print_i32(c);
+    return c;
+}

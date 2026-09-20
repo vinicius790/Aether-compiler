@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (ubuntu, rust 1.75)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - name: test
+        run: cargo test --all
+      - name: examples
+        run: |
+          cargo run --quiet -- run examples/hello.ae
+          cargo run --quiet -- run examples/fib.ae
+          cargo run --quiet -- run examples/opaque.ae -O2
+          cargo run --quiet -- run stdlib/math.ae
+          cargo run --quiet -- optimize examples/opt_demo.ae
+          cargo run --quiet -- verify examples/fib.ae
+      - name: fuzz smoke
+        run: |
+          cargo run --quiet -- fuzz --iters 40 --kind all --seed 1
+          cargo run --quiet -- fuzz --iters 20 --kind format --seed 2
+          cargo run --quiet -- fuzz --iters 16 --kind greybox --seed 3

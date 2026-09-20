@@ -1,0 +1,12 @@
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i32 {
+    let v = fib(10);
+    print_i32(v);
+    return v;
+}

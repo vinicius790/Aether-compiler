@@ -1,0 +1,7 @@
+fn main() -> i32 {
+bb0:
+  %12 = const 19_i32
+  call print_i32(%12)
+  ret %12
+}
+

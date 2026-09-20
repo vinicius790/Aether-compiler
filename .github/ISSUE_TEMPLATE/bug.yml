@@ -1,0 +1,36 @@
+name: Bug report
+description: Miscompile, panic, or wrong diagnostic
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Aether version
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Reduced source
+      render: aether
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+    validations:
+      required: true
+  - type: input
+    id: seed
+    attributes:
+      label: Fuzz seed (if any)
+      placeholder: "aether fuzz --seed 123 --kind diff"

@@ -1,0 +1,95 @@
+fn abs(%0: i32 /* x */) -> i32 {
+bb0:
+  %1 = const 0_i32
+  %2 = <.i32 %0, %1
+  br %2, bb1, bb2
+bb1:
+  %3 = const 0_i32
+  %4 = -.i32 %3, %0
+  ret %4
+bb2:
+  jmp bb3
+bb3:
+  ret %0
+bb4:
+  jmp bb3
+bb5:
+  %5 = const 0_i32
+  ret %5
+}
+
+fn min(%0: i32 /* a */, %1: i32 /* b */) -> i32 {
+bb0:
+  %2 = <.i32 %0, %1
+  br %2, bb1, bb2
+bb1:
+  ret %0
+bb2:
+  jmp bb3
+bb3:
+  ret %1
+bb4:
+  jmp bb3
+bb5:
+  %3 = const 0_i32
+  ret %3
+}
+
+fn max(%0: i32 /* a */, %1: i32 /* b */) -> i32 {
+bb0:
+  %2 = >.i32 %0, %1
+  br %2, bb1, bb2
+bb1:
+  ret %0
+bb2:
+  jmp bb3
+bb3:
+  ret %1
+bb4:
+  jmp bb3
+bb5:
+  %3 = const 0_i32
+  ret %3
+}
+
+fn clamp(%0: i32 /* x */, %1: i32 /* lo */, %2: i32 /* hi */) -> i32 {
+bb0:
+  %3 = call min(%2, %0)
+  %4 = call max(%1, %3)
+  ret %4
+bb1:
+  %5 = const 0_i32
+  ret %5
+}
+
+fn main() -> i32 {
+bb0:
+  %0 = const 0_i32
+  %1 = const 5_i32
+  %2 = -.i32 %0, %1
+  %3 = call abs(%2)
+  call print_i32(%3)
+  %4 = const ()
+  %5 = const 3_i32
+  %6 = const 9_i32
+  %7 = call min(%5, %6)
+  call print_i32(%7)
+  %8 = const ()
+  %9 = const 3_i32
+  %10 = const 9_i32
+  %11 = call max(%9, %10)
+  call print_i32(%11)
+  %12 = const ()
+  %13 = const 15_i32
+  %14 = const 0_i32
+  %15 = const 10_i32
+  %16 = call clamp(%13, %14, %15)
+  call print_i32(%16)
+  %17 = const ()
+  %18 = const 0_i32
+  ret %18
+bb1:
+  %19 = const 0_i32
+  ret %19
+}
+

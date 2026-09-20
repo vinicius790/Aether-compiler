@@ -1,0 +1,5 @@
+# Default review path. Replace with real handles when the project is hosted.
+*       @aether-maintainers
+/src/opt/    @aether-maintainers
+/src/fuzz/   @aether-maintainers
+/docs/       @aether-maintainers

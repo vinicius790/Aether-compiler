@@ -1,0 +1,25 @@
+fn twice(%0: i32 /* p */) -> i32 {
+bb0:
+  %2 = const 1_i32
+  %3 = +.i32 %0, %2
+  %1 = mov %3
+  %5 = const 1_i32
+  %6 = +.i32 %0, %5
+  %4 = mov %6
+  %7 = +.i32 %1, %4
+  ret %7
+bb1:
+  %8 = const 0_i32
+  ret %8
+}
+
+fn main() -> i32 {
+bb0:
+  %0 = const 3_i32
+  %1 = call twice(%0)
+  ret %1
+bb1:
+  %2 = const 0_i32
+  ret %2
+}
+

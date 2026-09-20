@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    let mut s = 0;
+    for i in 0..10000 {
+        s = s + i * 2 - i / 2;
+    }
+    return s;
+}

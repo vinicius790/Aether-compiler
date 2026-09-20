@@ -1,0 +1,23 @@
+name: Language or compiler change
+description: Propose syntax, a pass, or a tool
+title: "[rfc] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+    validations:
+      required: true
+  - type: textarea
+    id: spec
+    attributes:
+      label: Spec sketch (syntax + semantics)
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: How it will be tested
+    validations:
+      required: true

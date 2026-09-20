@@ -1,0 +1,5 @@
+// corpus case 100 seed=20260919
+fn main() -> i32 {
+    print_i32(30);
+    return 3;
+}

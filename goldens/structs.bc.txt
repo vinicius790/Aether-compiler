@@ -1,0 +1,33 @@
+; strings: 0
+
+fn print #0 arity=1 regs=1
+
+fn println #1 arity=1 regs=1
+
+fn print_i32 #2 arity=1 regs=1
+
+fn print_i64 #3 arity=1 regs=1
+
+fn print_f64 #4 arity=1 regs=1
+
+fn print_bool #5 arity=1 regs=1
+
+fn len #6 arity=1 regs=1
+
+fn assert #7 arity=1 regs=1
+
+fn main #8 arity=0 regs=14
+  0000  allocobj r1, 2
+  0001  loadimm r2, I32(3)
+  0002  storefld r1.0, r2
+  0003  loadimm r3, I32(4)
+  0004  storefld r1.1, r3
+  0005  loadfld r5, r1.0
+  0006  loadfld r6, r1.0
+  0007  muli32 r7, r5, r6
+  0008  loadfld r8, r1.1
+  0009  loadfld r9, r1.1
+  0010  muli32 r10, r8, r9
+  0011  addi32 r11, r7, r10
+  0012  native #2 -> None [11]
+  0013  ret r11

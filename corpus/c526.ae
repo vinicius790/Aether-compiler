@@ -1,0 +1,7 @@
+// corpus 526
+fn main() -> i32 {
+    let x = 6;
+    let y = 2;
+    if x < y { return x + y; }
+    return x * 2 - y;
+}

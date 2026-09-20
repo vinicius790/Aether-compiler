@@ -1,0 +1,14 @@
+fn sum_to(n: i32) -> i32 {
+    let mut s = 0;
+    let mut i = 0;
+    while i < n {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main() -> i32 {
+    print_i32(sum_to(10));
+    return sum_to(10);
+}

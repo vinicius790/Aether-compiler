@@ -1,0 +1,20 @@
+// Tiny gameplay script: score + combo. Host would bind print/input.
+
+fn hit(score: i32, combo: i32) -> i32 {
+    return score + 10 + combo;
+}
+
+fn miss(combo: i32) -> i32 {
+    return 0;
+}
+
+fn main() -> i32 {
+    let mut score = 0;
+    let mut combo = 0;
+    score = hit(score, combo);
+    combo = combo + 1;
+    score = hit(score, combo);
+    combo = miss(combo);
+    print_i32(score);
+    return score;
+}

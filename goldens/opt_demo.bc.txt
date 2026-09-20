@@ -1,0 +1,22 @@
+; strings: 0
+
+fn print #0 arity=1 regs=1
+
+fn println #1 arity=1 regs=1
+
+fn print_i32 #2 arity=1 regs=1
+
+fn print_i64 #3 arity=1 regs=1
+
+fn print_f64 #4 arity=1 regs=1
+
+fn print_bool #5 arity=1 regs=1
+
+fn len #6 arity=1 regs=1
+
+fn assert #7 arity=1 regs=1
+
+fn main #8 arity=0 regs=16
+  0000  loadimm r12, I32(19)
+  0001  native #2 -> None [12]
+  0002  ret r12

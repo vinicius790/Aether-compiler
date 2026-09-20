@@ -1,0 +1,38 @@
+; strings: 0
+
+fn print #0 arity=1 regs=1
+
+fn println #1 arity=1 regs=1
+
+fn print_i32 #2 arity=1 regs=1
+
+fn print_i64 #3 arity=1 regs=1
+
+fn print_f64 #4 arity=1 regs=1
+
+fn print_bool #5 arity=1 regs=1
+
+fn len #6 arity=1 regs=1
+
+fn assert #7 arity=1 regs=1
+
+fn fib #8 arity=1 regs=11
+  0000  loadimm r1, I32(2)
+  0001  lti32 r2, r0, r1
+  0002  jz r2, 4
+  0003  jmp 5
+  0004  ret r0
+  0005  loadimm r3, I32(1)
+  0006  subi32 r4, r0, r3
+  0007  call f8 -> Some(5) [4]
+  0008  loadimm r6, I32(2)
+  0009  subi32 r7, r0, r6
+  0010  call f8 -> Some(8) [7]
+  0011  addi32 r9, r5, r8
+  0012  ret r9
+
+fn main #9 arity=0 regs=5
+  0000  loadimm r1, I32(10)
+  0001  call f8 -> Some(2) [1]
+  0002  native #2 -> None [2]
+  0003  ret r2

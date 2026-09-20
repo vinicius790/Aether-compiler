@@ -1,0 +1,49 @@
+; strings: 0
+
+fn print #0 arity=1 regs=1
+
+fn println #1 arity=1 regs=1
+
+fn print_i32 #2 arity=1 regs=1
+
+fn print_i64 #3 arity=1 regs=1
+
+fn print_f64 #4 arity=1 regs=1
+
+fn print_bool #5 arity=1 regs=1
+
+fn len #6 arity=1 regs=1
+
+fn assert #7 arity=1 regs=1
+
+fn main #8 arity=0 regs=22
+  0000  allocarr r1, 4
+  0001  loadimm r2, I32(1)
+  0002  loadimm r3, I32(0)
+  0003  storeidx r1[r3], r2
+  0004  loadimm r4, I32(2)
+  0005  loadimm r5, I32(1)
+  0006  storeidx r1[r5], r4
+  0007  loadimm r6, I32(3)
+  0008  loadimm r7, I32(2)
+  0009  storeidx r1[r7], r6
+  0010  loadimm r8, I32(4)
+  0011  loadimm r9, I32(3)
+  0012  storeidx r1[r9], r8
+  0013  mov r0, r1
+  0014  loadimm r10, I32(0)
+  0015  loadimm r12, I32(0)
+  0016  jmp 17
+  0017  loadimm r14, I32(4)
+  0018  lti32 r15, r12, r14
+  0019  jz r15, 21
+  0020  jmp 28
+  0021  loadidx r16, r0[r12]
+  0022  addi32 r17, r10, r16
+  0023  mov r10, r17
+  0024  loadimm r18, I32(1)
+  0025  addi32 r19, r12, r18
+  0026  mov r12, r19
+  0027  jmp 17
+  0028  native #2 -> None [10]
+  0029  ret r10

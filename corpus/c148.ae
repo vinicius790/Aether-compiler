@@ -1,0 +1,1 @@
+fn main() -> i32 { let x = 148; let y = 12; return x + y * 2; }

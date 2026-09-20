@@ -1,0 +1,4 @@
+// corpus case 126 seed=20260919
+fn main() -> i32 {
+    return (((0 - 9) - (9 * 6)) - 1);
+}

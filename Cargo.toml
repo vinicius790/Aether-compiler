@@ -1,0 +1,24 @@
+[package]
+name = "aether"
+version = "0.2.0"
+edition = "2021"
+description = "Aether — compiler, optimizer and virtual machine for the Aether language"
+license = "MIT"
+readme = "README.md"
+keywords = ["compiler", "vm", "optimizer", "language", "llvm"]
+categories = ["compilers"]
+authors = ["Aether Contributors"]
+
+[[bin]]
+name = "aether"
+path = "src/main.rs"
+
+[lib]
+name = "aether"
+path = "src/lib.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "debuginfo"

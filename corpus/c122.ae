@@ -1,0 +1,4 @@
+// corpus case 122 seed=20260919
+fn main() -> i32 {
+    if 6 < 10 { return ((8 + 4) * (4 + 4)); } else { return 0; }
+}

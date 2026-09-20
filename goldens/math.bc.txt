@@ -1,0 +1,66 @@
+; strings: 0
+
+fn print #0 arity=1 regs=1
+
+fn println #1 arity=1 regs=1
+
+fn print_i32 #2 arity=1 regs=1
+
+fn print_i64 #3 arity=1 regs=1
+
+fn print_f64 #4 arity=1 regs=1
+
+fn print_bool #5 arity=1 regs=1
+
+fn len #6 arity=1 regs=1
+
+fn assert #7 arity=1 regs=1
+
+fn abs #8 arity=1 regs=6
+  0000  loadimm r1, I32(0)
+  0001  lti32 r2, r0, r1
+  0002  jz r2, 4
+  0003  jmp 7
+  0004  loadimm r3, I32(0)
+  0005  subi32 r4, r3, r0
+  0006  ret r4
+  0007  ret r0
+
+fn min #9 arity=2 regs=4
+  0000  lti32 r2, r0, r1
+  0001  jz r2, 3
+  0002  jmp 4
+  0003  ret r0
+  0004  ret r1
+
+fn max #10 arity=2 regs=4
+  0000  gti32 r2, r0, r1
+  0001  jz r2, 3
+  0002  jmp 4
+  0003  ret r0
+  0004  ret r1
+
+fn clamp #11 arity=3 regs=6
+  0000  call f9 -> Some(3) [2, 0]
+  0001  call f10 -> Some(4) [1, 3]
+  0002  ret r4
+
+fn main #12 arity=0 regs=20
+  0000  loadimm r2, I32(-5)
+  0001  call f8 -> Some(3) [2]
+  0002  native #2 -> None [3]
+  0003  loadimm r5, I32(3)
+  0004  loadimm r6, I32(9)
+  0005  call f9 -> Some(7) [5, 6]
+  0006  native #2 -> None [7]
+  0007  loadimm r9, I32(3)
+  0008  loadimm r10, I32(9)
+  0009  call f10 -> Some(11) [9, 10]
+  0010  native #2 -> None [11]
+  0011  loadimm r13, I32(15)
+  0012  loadimm r14, I32(0)
+  0013  loadimm r15, I32(10)
+  0014  call f11 -> Some(16) [13, 14, 15]
+  0015  native #2 -> None [16]
+  0016  loadimm r18, I32(0)
+  0017  ret r18

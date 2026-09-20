@@ -1,0 +1,9 @@
+Aether
+Copyright 2026 Aether Contributors
+
+This product is licensed under the MIT License. See LICENSE.
+
+Third-party software
+--------------------
+None. The compiler, virtual machine and fuzzer depend only on the Rust
+standard library as shipped with rustc 1.75.

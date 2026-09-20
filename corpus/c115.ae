@@ -1,0 +1,6 @@
+// corpus case 115 seed=20260919
+fn main() -> i32 {
+    let mut a = 6;
+    a = a + 6;
+    return a;
+}

@@ -1,0 +1,7 @@
+fn main() -> i32 {
+bb0:
+  %21 = const 21_i32
+  call print_i32(%21)
+  ret %21
+}
+

@@ -21,69 +21,142 @@ impl Liveness {
     }
 }
 
-pub fn analyze_function(f: &IrFunction) -> Liveness {
-    let mut live_in: HashMap<u32, LiveSet> = HashMap::new();
-    let mut live_out: HashMap<u32, LiveSet> = HashMap::new();
-    for bb in &f.blocks {
-        live_in.insert(bb.id.0, HashSet::new());
-        live_out.insert(bb.id.0, HashSet::new());
+fn successors(t: &Terminator) -> Vec<u32> {
+    match t {
+        Terminator::Jump { target } => vec![target.0],
+        Terminator::Branch { then_bb, else_bb, .. } => vec![then_bb.0, else_bb.0],
+        Terminator::Return { .. } | Terminator::Unreachable => Vec::new(),
     }
+}
+
+/// Block indices in CFG postorder from the entry (successors before
+/// predecessors), then every block the DFS did not reach. Sweeping a
+/// backward problem in this order converges in a few sweeps whatever the
+/// layout (lowering often lays a chain out against its control flow, which
+/// made a plain reverse-layout sweep quadratic).
+pub(crate) fn postorder(f: &IrFunction) -> Vec<usize> {
+    let index: HashMap<u32, usize> = f.blocks.iter().enumerate().map(|(i, b)| (b.id.0, i)).collect();
+    let succ: Vec<Vec<usize>> = f
+        .blocks
+        .iter()
+        .map(|b| successors(&b.term).into_iter().filter_map(|s| index.get(&s).copied()).collect())
+        .collect();
+    let n = f.blocks.len();
+    let mut seen = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    for root in 0..n {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            if k < succ[b].len() {
+                top.1 += 1;
+                let s = succ[b][k];
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                order.push(b);
+                stack.pop();
+            }
+        }
+    }
+    order
+}
+
+pub fn analyze_function(f: &IrFunction) -> Liveness {
+    // Per block: `gen` = registers read before any write in the block,
+    // `kill` = registers written. live_in = gen ∪ (live_out − kill); the
+    // backward scan kills the destination before adding the uses, so
+    // `r = call f(r)` keeps `r` live on entry.
+    let n = f.blocks.len();
+    let mut gen: Vec<LiveSet> = Vec::with_capacity(n);
+    let mut kill: Vec<LiveSet> = Vec::with_capacity(n);
+    for bb in &f.blocks {
+        let mut g = LiveSet::new();
+        let mut k = LiveSet::new();
+        if let Terminator::Branch { cond, .. } = &bb.term {
+            g.insert(cond.0);
+        }
+        if let Terminator::Return { value: Some(r) } = &bb.term {
+            g.insert(r.0);
+        }
+        for inst in bb.insts.iter().rev() {
+            if let Some(d) = inst.dest_reg() {
+                g.remove(&d.0);
+                k.insert(d.0);
+            }
+            for u in inst.uses() {
+                g.insert(u.0);
+            }
+        }
+        gen.push(g);
+        kill.push(k);
+    }
+    let index: HashMap<u32, usize> = f.blocks.iter().enumerate().map(|(i, b)| (b.id.0, i)).collect();
+    let succ: Vec<Vec<usize>> = f
+        .blocks
+        .iter()
+        .map(|b| successors(&b.term).into_iter().filter_map(|s| index.get(&s).copied()).collect())
+        .collect();
+    let mut ins: Vec<LiveSet> = vec![LiveSet::new(); n];
+    // A block's own branch condition / returned register counts as live-out
+    // (the terminator reads it after every instruction of the block).
+    let mut outs: Vec<LiveSet> = f
+        .blocks
+        .iter()
+        .map(|bb| {
+            let mut o = LiveSet::new();
+            match &bb.term {
+                Terminator::Branch { cond, .. } => {
+                    o.insert(cond.0);
+                }
+                Terminator::Return { value: Some(r) } => {
+                    o.insert(r.0);
+                }
+                _ => {}
+            }
+            o
+        })
+        .collect();
+    let order = postorder(f);
 
     // Sets only ever grow, so this terminates; a fixed sweep cap would hand
     // DCE an under-approximation (a live register called dead) on CFGs whose
     // layout runs against the control flow.
+    let mut first = true;
     let mut changed = true;
     while changed {
         changed = false;
-        for bb in f.blocks.iter().rev() {
-            let mut out = HashSet::new();
-            match &bb.term {
-                Terminator::Jump { target } => {
-                    if let Some(s) = live_in.get(&target.0) {
-                        out.extend(s.iter().copied());
-                    }
-                }
-                Terminator::Branch {
-                    cond,
-                    then_bb,
-                    else_bb,
-                } => {
-                    out.insert(cond.0);
-                    if let Some(s) = live_in.get(&then_bb.0) {
-                        out.extend(s.iter().copied());
-                    }
-                    if let Some(s) = live_in.get(&else_bb.0) {
-                        out.extend(s.iter().copied());
-                    }
-                }
-                Terminator::Return { value: Some(r) } => {
-                    out.insert(r.0);
-                }
-                _ => {}
-            }
-
-            // live_before = (live_after − def) ∪ uses: kill the destination
-            // first so `r = call f(r)` keeps `r` live on entry.
-            let mut live = out.clone();
-            for inst in bb.insts.iter().rev() {
-                if let Some(d) = inst.dest_reg() {
-                    live.remove(&d.0);
-                }
-                for u in inst.uses() {
-                    live.insert(u.0);
+        for &b in &order {
+            let mut grew = first;
+            for &s in &succ[b] {
+                let add: Vec<u32> = ins[s].iter().copied().filter(|r| !outs[b].contains(r)).collect();
+                if !add.is_empty() {
+                    grew = true;
+                    outs[b].extend(add);
                 }
             }
-
-            let id = bb.id.0;
-            if live_out.get(&id) != Some(&out) {
-                live_out.insert(id, out);
-                changed = true;
-            }
-            if live_in.get(&id) != Some(&live) {
-                live_in.insert(id, live);
-                changed = true;
+            if grew {
+                let mut add: Vec<u32> = gen[b].iter().copied().filter(|r| !ins[b].contains(r)).collect();
+                add.extend(outs[b].iter().copied().filter(|r| !kill[b].contains(r) && !ins[b].contains(r)));
+                if !add.is_empty() {
+                    changed = true;
+                    ins[b].extend(add);
+                }
             }
         }
+        first = false;
+    }
+    let mut live_in: HashMap<u32, LiveSet> = HashMap::with_capacity(n);
+    let mut live_out: HashMap<u32, LiveSet> = HashMap::with_capacity(n);
+    for (i, bb) in f.blocks.iter().enumerate().rev() {
+        live_in.insert(bb.id.0, std::mem::take(&mut ins[i]));
+        live_out.insert(bb.id.0, std::mem::take(&mut outs[i]));
     }
     Liveness { live_in, live_out }
 }

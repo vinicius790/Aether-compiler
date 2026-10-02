@@ -537,6 +537,8 @@ pub enum LliStatus {
     /// Killed by a signal (`abort()` from a failed `assert`, a division by
     /// zero or an out-of-bounds index raises SIGABRT = 6).
     Signaled(i32),
+    /// Still running when the wall-clock limit passed; `lli` was killed.
+    TimedOut,
 }
 
 /// What `lli` printed and how it ended.
@@ -585,6 +587,68 @@ fn pipe_through(
 /// failure. `Err` means the toolchain itself failed (no `lli`, or `opt`
 /// rejecting the module, with its message).
 pub fn run_llvm_ir(ir: &str) -> Result<LliRun, String> {
+    run_llvm_ir_with(ir, None)
+}
+
+/// Feed `input` to `cmd`, collect stdout/stderr on helper threads (so no
+/// pipe can fill up and deadlock) and poll the child; past `timeout` it is
+/// killed and `None` is returned as its status.
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    input: &str,
+    timeout: std::time::Duration,
+) -> Result<(Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
+    let data = input.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+    });
+    let mut out_pipe = child.stdout.take().ok_or("no stdout pipe")?;
+    let mut err_pipe = child.stderr.take().ok_or("no stderr pipe")?;
+    let out_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v);
+        v
+    });
+    let start = Instant::now();
+    let mut nap = std::time::Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(st) => break Some(st),
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => {
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(std::time::Duration::from_millis(25));
+            }
+        }
+    };
+    let _ = writer.join();
+    let out = out_reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    Ok((status, out, err))
+}
+
+/// [`run_llvm_ir`] with a wall-clock limit on `lli` (`None`: no limit):
+/// past it the process is killed and the status is [`LliStatus::TimedOut`],
+/// with whatever it printed so far.
+pub fn run_llvm_ir_with(ir: &str, timeout: Option<std::time::Duration>) -> Result<LliRun, String> {
     let tool = |names: &[&str]| names.iter().find_map(|n| find_on_path(n));
     let lli = tool(&["lli-18", "lli"]).ok_or_else(|| "lli not found on PATH".to_string())?;
     let processed = match tool(&["opt-18", "opt"]) {
@@ -599,7 +663,22 @@ pub fn run_llvm_ir(ir: &str) -> Result<LliRun, String> {
         }
         None => ir.to_string(),
     };
-    let out = pipe_through(std::process::Command::new(lli), &processed)?;
+    let lli_cmd = std::process::Command::new(lli);
+    let (status, stdout, stderr) = match timeout {
+        Some(t) => run_with_deadline(lli_cmd, &processed, t)?,
+        None => {
+            let out = pipe_through(lli_cmd, &processed)?;
+            (Some(out.status), out.stdout, out.stderr)
+        }
+    };
+    let Some(status) = status else {
+        return Ok(LliRun {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            status: LliStatus::TimedOut,
+        });
+    };
+    let out = std::process::Output { status, stdout, stderr };
     let status = match out.status.code() {
         Some(c) => LliStatus::Exited(c),
         None => {

@@ -42,132 +42,132 @@ fn ceil #19 arity=1 regs=1
 
 fn pow_i32 #20 arity=1 regs=1
 
-fn main #21 arity=0 regs=47
-  0000  loadimm r0, F64(4613937818241073152)
-  0001  loadimm r1, F64(4616189618054758400)
-  0002  allocobj r2, 2
-  0003  storefld r2.0, r0
-  0004  storefld r2.1, r1
-  0005  loadimm r3, F64(4607182418800017408)
-  0006  loadimm r4, F64(4611686018427387904)
-  0007  allocobj r5, 2
-  0008  storefld r5.0, r3
-  0009  storefld r5.1, r4
-  0010  call f22 -> Some(6) [2]
+fn main #21 arity=0 regs=17
+  0000  loadimm r6, F64(4613937818241073152)
+  0001  loadimm r7, F64(4616189618054758400)
+  0002  allocobj r8, 2
+  0003  storefld r8.0, r6
+  0004  storefld r8.1, r7
+  0005  loadimm r6, F64(4607182418800017408)
+  0006  loadimm r7, F64(4611686018427387904)
+  0007  allocobj r9, 2
+  0008  storefld r9.0, r6
+  0009  storefld r9.1, r7
+  0010  call f22 -> Some(6) [8]
   0011  native #4 -> None [6]
-  0012  loadfld r7, r2.0
-  0013  loadfld r8, r5.0
-  0014  mulf64 r9, r7, r8
-  0015  loadfld r10, r2.1
-  0016  loadfld r11, r5.1
-  0017  mulf64 r12, r10, r11
-  0018  addf64 r13, r9, r12
-  0019  native #4 -> None [13]
-  0020  allocobj r14, 2
-  0021  loadfld r15, r2.0
-  0022  loadfld r16, r5.0
-  0023  addf64 r17, r15, r16
-  0024  storefld r14.0, r17
-  0025  loadfld r18, r2.1
-  0026  loadfld r19, r5.1
-  0027  addf64 r20, r18, r19
-  0028  storefld r14.1, r20
-  0029  allocobj r21, 2
-  0030  loadfld r22, r14.0
-  0031  loadfld r23, r5.0
-  0032  subf64 r24, r22, r23
-  0033  storefld r21.0, r24
-  0034  loadfld r25, r14.1
-  0035  loadfld r26, r5.1
-  0036  subf64 r27, r25, r26
-  0037  storefld r21.1, r27
-  0038  loadimm r28, F64(4611686018427387904)
-  0039  allocobj r29, 2
-  0040  loadfld r30, r21.0
-  0041  mulf64 r31, r30, r28
-  0042  storefld r29.0, r31
-  0043  loadfld r32, r21.1
-  0044  mulf64 r33, r32, r28
-  0045  storefld r29.1, r33
-  0046  loadfld r34, r29.0
-  0047  native #4 -> None [34]
-  0048  loadfld r35, r29.1
-  0049  native #4 -> None [35]
-  0050  loadimm r36, I32(12345)
-  0051  loadimm r37, I32(0)
-  0052  loadimm r38, I32(0)
+  0012  loadfld r6, r8.0
+  0013  loadfld r7, r9.0
+  0014  mulf64 r10, r6, r7
+  0015  loadfld r6, r8.1
+  0016  loadfld r7, r9.1
+  0017  mulf64 r11, r6, r7
+  0018  addf64 r6, r10, r11
+  0019  native #4 -> None [6]
+  0020  allocobj r12, 2
+  0021  loadfld r6, r8.0
+  0022  loadfld r7, r9.0
+  0023  addf64 r10, r6, r7
+  0024  storefld r12.0, r10
+  0025  loadfld r6, r8.1
+  0026  loadfld r7, r9.1
+  0027  addf64 r10, r6, r7
+  0028  storefld r12.1, r10
+  0029  allocobj r8, 2
+  0030  loadfld r6, r12.0
+  0031  loadfld r7, r9.0
+  0032  subf64 r10, r6, r7
+  0033  storefld r8.0, r10
+  0034  loadfld r6, r12.1
+  0035  loadfld r7, r9.1
+  0036  subf64 r10, r6, r7
+  0037  storefld r8.1, r10
+  0038  loadimm r6, F64(4611686018427387904)
+  0039  allocobj r9, 2
+  0040  loadfld r7, r8.0
+  0041  mulf64 r10, r7, r6
+  0042  storefld r9.0, r10
+  0043  loadfld r7, r8.1
+  0044  mulf64 r10, r7, r6
+  0045  storefld r9.1, r10
+  0046  loadfld r6, r9.0
+  0047  native #4 -> None [6]
+  0048  loadfld r6, r9.1
+  0049  native #4 -> None [6]
+  0050  loadimm r0, I32(12345)
+  0051  loadimm r1, I32(0)
+  0052  loadimm r2, I32(0)
   0053  jmp 54
-  0054  loadimm r39, I32(5)
-  0055  lti32 r40, r37, r39
-  0056  jnz r40, 58
+  0054  loadimm r4, I32(5)
+  0055  lti32 r3, r1, r4
+  0056  jnz r3, 58
   0057  jmp 69
-  0058  call f23 -> Some(39) [36]
-  0059  mov r36, r39
-  0060  loadimm r41, I32(1)
-  0061  loadimm r42, I32(7)
-  0062  call f24 -> Some(43) [39, 41, 42]
-  0063  mov r44, r43
-  0064  loadimm r45, I32(1)
-  0065  gei32 r40, r43, r45
-  0066  mov r46, r40
-  0067  jnz r40, 73
+  0058  call f23 -> Some(13) [0]
+  0059  mov r0, r13
+  0060  loadimm r14, I32(1)
+  0061  loadimm r15, I32(7)
+  0062  call f24 -> Some(16) [13, 14, 15]
+  0063  mov r4, r16
+  0064  loadimm r13, I32(1)
+  0065  gei32 r3, r16, r13
+  0066  mov r5, r3
+  0067  jnz r3, 73
   0068  jmp 77
-  0069  native #2 -> None [36]
-  0070  native #2 -> None [38]
-  0071  loadimm r37, I32(0)
-  0072  ret r37
-  0073  loadimm r39, I32(6)
-  0074  lei32 r40, r44, r39
-  0075  mov r46, r40
+  0069  native #2 -> None [0]
+  0070  native #2 -> None [2]
+  0071  loadimm r1, I32(0)
+  0072  ret r1
+  0073  loadimm r13, I32(6)
+  0074  lei32 r3, r4, r13
+  0075  mov r5, r3
   0076  jmp 77
-  0077  native #7 -> None [46]
-  0078  addi32 r39, r38, r44
-  0079  mov r38, r39
-  0080  loadimm r41, I32(1)
-  0081  addi32 r42, r37, r41
-  0082  mov r37, r42
+  0077  native #7 -> None [5]
+  0078  addi32 r13, r2, r4
+  0079  mov r2, r13
+  0080  loadimm r13, I32(1)
+  0081  addi32 r14, r1, r13
+  0082  mov r1, r14
   0083  jmp 54
 
-fn vec2_length #22 arity=1 regs=9
-  0000  loadfld r1, r0.0
-  0001  loadfld r2, r0.0
-  0002  mulf64 r3, r1, r2
-  0003  loadfld r4, r0.1
-  0004  loadfld r5, r0.1
-  0005  mulf64 r6, r4, r5
-  0006  addf64 r7, r3, r6
-  0007  native #17 -> Some(8) [7]
-  0008  ret r8
+fn vec2_length #22 arity=1 regs=6
+  0000  loadfld r2, r0.0
+  0001  loadfld r3, r0.0
+  0002  mulf64 r4, r2, r3
+  0003  loadfld r2, r0.1
+  0004  loadfld r3, r0.1
+  0005  mulf64 r5, r2, r3
+  0006  addf64 r2, r4, r5
+  0007  native #17 -> Some(1) [2]
+  0008  ret r1
 
-fn rng_next #23 arity=1 regs=14
+fn rng_next #23 arity=1 regs=8
   0000  mov r1, r0
-  0001  loadimm r2, I32(0)
-  0002  eqi32 r3, r0, r2
-  0003  jnz r3, 5
+  0001  loadimm r3, I32(0)
+  0002  eqi32 r2, r0, r3
+  0003  jnz r2, 5
   0004  jmp 7
   0005  loadimm r1, I32(1)
   0006  jmp 7
-  0007  loadimm r2, I32(13)
-  0008  shl r4, r1, r2
-  0009  bxor r5, r1, r4
-  0010  loadimm r6, I32(17)
-  0011  shr r7, r5, r6
-  0012  loadimm r8, I32(32767)
-  0013  band r9, r7, r8
-  0014  bxor r10, r5, r9
-  0015  loadimm r11, I32(5)
-  0016  shl r12, r10, r11
-  0017  bxor r13, r10, r12
-  0018  ret r13
+  0007  loadimm r4, I32(13)
+  0008  shl r5, r1, r4
+  0009  bxor r4, r1, r5
+  0010  loadimm r5, I32(17)
+  0011  shr r6, r4, r5
+  0012  loadimm r5, I32(32767)
+  0013  band r7, r6, r5
+  0014  bxor r5, r4, r7
+  0015  loadimm r4, I32(5)
+  0016  shl r6, r5, r4
+  0017  bxor r3, r5, r6
+  0018  ret r3
 
-fn rng_range #24 arity=3 regs=9
+fn rng_range #24 arity=3 regs=8
   0000  lei32 r3, r2, r1
   0001  jnz r3, 3
   0002  jmp 4
   0003  ret r1
-  0004  loadimm r4, I32(2147483647)
-  0005  band r5, r0, r4
-  0006  subi32 r6, r2, r1
-  0007  remi32 r7, r5, r6
-  0008  addi32 r8, r1, r7
-  0009  ret r8
+  0004  loadimm r5, I32(2147483647)
+  0005  band r6, r0, r5
+  0006  subi32 r5, r2, r1
+  0007  remi32 r7, r6, r5
+  0008  addi32 r4, r1, r7
+  0009  ret r4

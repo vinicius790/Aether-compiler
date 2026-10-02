@@ -9,6 +9,7 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- LLVM backend closer to the VM; VM/opt runtime fixes (broken pipe exits cleanly, instruction-level register allocation)
 - Uninitialised arrays/structs/tuples zero-filled (`let e: E;` is E0232); `[expr; N]`; `[]`/`[T; 0]`; `i64::MIN` literal;
   `t.01` rejected; EOF diagnostics; `pub enum` follows E0281; private items are file-scoped
 - Uninitialised arrays/structs/tuples are zero-filled recursively (`let e: E;` is E0232); array repeat `[expr; N]`;

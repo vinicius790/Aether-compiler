@@ -7,11 +7,161 @@
 
 use crate::backend::bytecode::{BcFunction, BytecodeModule, CmpOp, Immediate, Op, MAX_ARRAY_LEN};
 use crate::ty::Type;
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+/// Immutable, shared string value (`Value::Str`).
+///
+/// `Clone` shares the text (O(1)), so moving a string between registers or
+/// passing it to a function never copies it. `len` and `s[i]` count Unicode
+/// scalar values: for ASCII text (checked once, when the string is built)
+/// both are O(1); otherwise the first indexed access builds a char-offset
+/// table that later accesses reuse (amortised O(1)). Concatenation copies
+/// (O(n)), except that the VM appends in place when the left operand's text
+/// is not shared and the result overwrites it (`s = s + t` in a loop).
+#[derive(Clone)]
+pub struct Str(Rc<StrBuf>);
+
+struct StrBuf {
+    text: String,
+    ascii: bool,
+    /// Byte offset of every char, built lazily for non-ASCII text.
+    offsets: OnceCell<Box<[u32]>>,
+}
+
+impl Str {
+    pub fn new(text: String) -> Str {
+        let ascii = text.is_ascii();
+        Str(Rc::new(StrBuf { text, ascii, offsets: OnceCell::new() }))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0.text
+    }
+
+    /// True when every char is ASCII (so byte and char indices coincide).
+    pub fn is_ascii(&self) -> bool {
+        self.0.ascii
+    }
+
+    fn offsets(&self) -> &[u32] {
+        self.0
+            .offsets
+            .get_or_init(|| self.0.text.char_indices().map(|(i, _)| i as u32).collect())
+    }
+
+    /// Number of chars (Unicode scalar values).
+    pub fn char_len(&self) -> usize {
+        if self.0.ascii {
+            self.0.text.len()
+        } else {
+            self.offsets().len()
+        }
+    }
+
+    /// The `i`-th char, if any.
+    pub fn char_at(&self, i: usize) -> Option<char> {
+        if self.0.ascii {
+            return self.0.text.as_bytes().get(i).map(|b| *b as char);
+        }
+        let off = *self.offsets().get(i)? as usize;
+        self.0.text[off..].chars().next()
+    }
+
+    /// Appends `tail` in place when this handle is the only owner of its
+    /// text; returns `false` (and changes nothing) when the text is shared.
+    fn try_push_str(&mut self, tail: &Str) -> bool {
+        match Rc::get_mut(&mut self.0) {
+            Some(buf) => {
+                buf.text.push_str(&tail.0.text);
+                buf.ascii &= tail.0.ascii;
+                buf.offsets = OnceCell::new();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl Deref for Str {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0.text
+    }
+}
+
+impl AsRef<str> for Str {
+    fn as_ref(&self) -> &str {
+        &self.0.text
+    }
+}
+
+impl From<&str> for Str {
+    fn from(s: &str) -> Str {
+        Str::new(s.to_string())
+    }
+}
+
+impl From<String> for Str {
+    fn from(s: String) -> Str {
+        Str::new(s)
+    }
+}
+
+impl PartialEq for Str {
+    fn eq(&self, other: &Str) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || self.0.text == other.0.text
+    }
+}
+
+impl Eq for Str {}
+
+impl PartialEq<str> for Str {
+    fn eq(&self, other: &str) -> bool {
+        self.0.text == other
+    }
+}
+
+impl PartialEq<&str> for Str {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.text == *other
+    }
+}
+
+impl PartialOrd for Str {
+    fn partial_cmp(&self, other: &Str) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Str {
+    fn cmp(&self, other: &Str) -> std::cmp::Ordering {
+        self.0.text.cmp(&other.0.text)
+    }
+}
+
+impl std::hash::Hash for Str {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.0.text.hash(h)
+    }
+}
+
+impl fmt::Debug for Str {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for Str {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -19,7 +169,8 @@ pub enum Value {
     I64(i64),
     F64(f64),
     Bool(bool),
-    Str(String),
+    /// Shared immutable text; see [`Str`] (clone is O(1)).
+    Str(Str),
     Char(char),
     Unit,
     /// Copy-on-write aggregate: `Clone` shares the buffer (O(1)); writers go
@@ -35,6 +186,9 @@ impl Value {
 
     /// Wraps `fields` as a struct value.
     pub fn object(fields: Vec<Value>) -> Value { Value::Object(Rc::new(fields)) }
+
+    /// Wraps `s` as a string value.
+    pub fn str(s: impl Into<Str>) -> Value { Value::Str(s.into()) }
 
     /// Source-level type name, used in runtime error messages.
     pub fn type_name(&self) -> &'static str {
@@ -153,6 +307,10 @@ pub enum VmError {
     MissingMain,
     Native(String),
     Runtime(String),
+    /// Writing to the program's stdout failed because the reader went away
+    /// (`EPIPE`, e.g. `aether run f.ae | head -1`). The run stops; the CLI
+    /// treats this as a quiet, successful exit.
+    OutputClosed,
 }
 
 impl fmt::Display for VmError {
@@ -162,6 +320,7 @@ impl fmt::Display for VmError {
             VmError::StackOverflow => write!(f, "call stack overflow"),
             VmError::MissingMain => write!(f, "no `main` function in bytecode module"),
             VmError::Native(s) | VmError::Runtime(s) => write!(f, "{s}"),
+            VmError::OutputClosed => write!(f, "stdout was closed"),
         }
     }
 }
@@ -190,6 +349,8 @@ pub struct Vm<'a> {
     host: HashMap<String, HostFn>,
     frames: Vec<Frame>,
     state: State,
+    /// `module.strings` as shared values, so `loadstr` never copies text.
+    strings: Vec<Str>,
 }
 
 struct Frame {
@@ -231,6 +392,7 @@ impl<'a> Vm<'a> {
             host: HashMap::new(),
             frames: Vec::new(),
             state: State::NotStarted,
+            strings: module.strings.iter().map(|s| Str::from(s.as_str())).collect(),
         }
     }
 
@@ -369,11 +531,14 @@ impl<'a> Vm<'a> {
         let module: &'a BytecodeModule = self.module;
         match op {
             Op::LoadImm { dest, imm } => {
-                let v = imm_to_value(imm, module);
+                let v = imm_to_value(imm, &self.strings);
                 set_reg(v, &mut self.frames, *dest);
             }
             Op::LoadStr { dest, idx } => {
-                let s = module.strings.get(*idx as usize).cloned().unwrap_or_default();
+                let s = match self.strings.get(*idx as usize) {
+                    Some(s) => s.clone(),
+                    None => Str::from(""),
+                };
                 set_reg(Value::Str(s), &mut self.frames, *dest);
             }
             Op::Move { dest, src } => copy_reg(&mut self.frames, *dest, *src),
@@ -652,7 +817,7 @@ impl<'a> Vm<'a> {
                         xs[idx as usize].clone()
                     }
                     Value::Str(s) => {
-                        let c = if idx < 0 { None } else { s.chars().nth(idx as usize) };
+                        let c = if idx < 0 { None } else { s.char_at(idx as usize) };
                         match c {
                             Some(c) => Value::Char(c),
                             None => return Err(VmError::Runtime("string index out of bounds".into())),
@@ -710,6 +875,9 @@ impl<'a> Vm<'a> {
                 }
             }
             Op::Concat { dest, lhs, rhs } => {
+                if dest == lhs && lhs != rhs && self.concat_in_place(*lhs, *rhs)? {
+                    return Ok(Flow::Continue);
+                }
                 let s = match (reg(&self.frames, *lhs), reg(&self.frames, *rhs)) {
                     (Value::Str(a), Value::Str(b)) => {
                         let n = a.len().saturating_add(b.len());
@@ -719,7 +887,9 @@ impl<'a> Vm<'a> {
                         let mut s = String::with_capacity(n);
                         s.push_str(a);
                         s.push_str(b);
-                        s
+                        // ASCII-ness is known from the operands: no rescan.
+                        let ascii = a.is_ascii() && b.is_ascii();
+                        Str(Rc::new(StrBuf { text: s, ascii, offsets: OnceCell::new() }))
                     }
                     (a, b) => return Err(concat_err(a, b)),
                 };
@@ -729,6 +899,31 @@ impl<'a> Vm<'a> {
             Op::Nop => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// `r = r + t` on strings: appends to `r`'s text in place when no other
+    /// value shares it (amortised O(len t)). `Ok(false)` means the general
+    /// copying path must run (text shared, or an operand is not a string).
+    fn concat_in_place(&mut self, lhs: u16, rhs: u16) -> Result<bool, VmError> {
+        let Some(frame) = self.frames.last_mut() else { return Ok(false) };
+        let (l, r) = (lhs as usize, rhs as usize);
+        if l >= frame.regs.len() || r >= frame.regs.len() {
+            return Ok(false);
+        }
+        let mut taken = std::mem::replace(&mut frame.regs[l], Value::Unit);
+        let done = match (&mut taken, &frame.regs[r]) {
+            (Value::Str(a), Value::Str(b)) => {
+                let n = a.len().saturating_add(b.len());
+                if n > MAX_STRING_BYTES {
+                    frame.regs[l] = taken;
+                    return Err(string_too_long(n));
+                }
+                a.try_push_str(b)
+            }
+            _ => false,
+        };
+        frame.regs[l] = taken;
+        Ok(done)
     }
 
     /// Runs the host closure bound to an `extern fn` and checks what it
@@ -756,7 +951,13 @@ impl<'a> Vm<'a> {
 
     #[inline(never)]
     fn call_native(&mut self, id: u16, args: &[Value]) -> Result<Value, VmError> {
-        let io_err = |e: io::Error| VmError::Native(e.to_string());
+        let io_err = |e: io::Error| {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                VmError::OutputClosed
+            } else {
+                VmError::Native(e.to_string())
+            }
+        };
         match id {
             0 => {
                 let s = arg_str(id, args, 0)?;
@@ -789,7 +990,7 @@ impl<'a> Vm<'a> {
                 Ok(Value::Unit)
             }
             6 => match args.first() {
-                Some(Value::Str(s)) => Ok(Value::I32(i32::try_from(s.chars().count()).unwrap_or(i32::MAX))),
+                Some(Value::Str(s)) => Ok(Value::I32(i32::try_from(s.char_len()).unwrap_or(i32::MAX))),
                 Some(Value::Array(xs)) => Ok(Value::I32(i32::try_from(xs.len()).unwrap_or(i32::MAX))),
                 other => Err(bad_arg(id, 0, "string or array", other)),
             },
@@ -804,10 +1005,10 @@ impl<'a> Vm<'a> {
                 writeln!(self.stdout, "{c}").map_err(io_err)?;
                 Ok(Value::Unit)
             }
-            9 => Ok(Value::Str(arg_i32(id, args, 0)?.to_string())),
-            10 => Ok(Value::Str(arg_i64(id, args, 0)?.to_string())),
-            11 => Ok(Value::Str(arg_f64(id, args, 0)?.to_string())),
-            12 => Ok(Value::Str(arg_char(id, args, 0)?.to_string())),
+            9 => Ok(Value::str(arg_i32(id, args, 0)?.to_string())),
+            10 => Ok(Value::str(arg_i64(id, args, 0)?.to_string())),
+            11 => Ok(Value::str(arg_f64(id, args, 0)?.to_string())),
+            12 => Ok(Value::str(arg_char(id, args, 0)?.to_string())),
             13 => Ok(Value::I32(arg_i32(id, args, 0)?.wrapping_abs())),
             14 => Ok(Value::I32(arg_i32(id, args, 0)?.min(arg_i32(id, args, 1)?))),
             15 => Ok(Value::I32(arg_i32(id, args, 0)?.max(arg_i32(id, args, 1)?))),
@@ -1117,19 +1318,13 @@ fn cmp_values(op: CmpOp, a: &Value, b: &Value) -> Result<bool, VmError> {
     })
 }
 
-fn imm_to_value(imm: &Immediate, module: &BytecodeModule) -> Value {
+fn imm_to_value(imm: &Immediate, strings: &[Str]) -> Value {
     match imm {
         Immediate::I32(v) => Value::I32(*v),
         Immediate::I64(v) => Value::I64(*v),
         Immediate::F64(bits) => Value::F64(f64::from_bits(*bits)),
         Immediate::Bool(v) => Value::Bool(*v),
-        Immediate::Str(i) => Value::Str(
-            module
-                .strings
-                .get(*i as usize)
-                .cloned()
-                .unwrap_or_default(),
-        ),
+        Immediate::Str(i) => Value::Str(strings.get(*i as usize).cloned().unwrap_or_else(|| Str::from(""))),
         Immediate::Char(c) => Value::Char(char::from_u32(*c).unwrap_or('\0')),
         Immediate::Unit => Value::Unit,
     }
@@ -1196,13 +1391,22 @@ pub fn execute_with_coverage(
 }
 
 pub fn execute_profiled(module: &BytecodeModule) -> Result<(Value, String, ProfileReport), VmError> {
+    let (result, out, report) = execute_profiled_with(module, VmOptions::default());
+    result.map(|val| (val, out, report))
+}
+
+/// One profiled run with explicit limits. Unlike [`execute_profiled`] the
+/// partial stdout and the report (steps and call counts so far) are returned
+/// even when the program fails, so the CLI never re-runs it to recover them.
+/// On failure the digest covers `()` and the partial stdout.
+pub fn execute_profiled_with(
+    module: &BytecodeModule,
+    opts: VmOptions,
+) -> (Result<Value, VmError>, String, ProfileReport) {
     let slot = Arc::new(Mutex::new(Vec::new()));
-    let opts = VmOptions {
-        profile: true,
-        ..VmOptions::default()
-    };
+    let opts = VmOptions { profile: true, ..opts };
     let mut vm = Vm::new(module, opts).with_stdout(Box::new(Sink(slot.clone())));
-    let val = vm.run()?;
+    let result = vm.run();
     let out = String::from_utf8_lossy(&slot.lock().unwrap()).into_owned();
     let functions = module
         .functions
@@ -1212,10 +1416,10 @@ pub fn execute_profiled(module: &BytecodeModule) -> Result<(Value, String, Profi
         .collect();
     let report = ProfileReport {
         steps: vm.steps(),
-        digest: digest(&val, &out),
+        digest: digest(result.as_ref().unwrap_or(&Value::Unit), &out),
         functions,
     };
-    Ok((val, out, report))
+    (result, out, report)
 }
 
 #[cfg(test)]

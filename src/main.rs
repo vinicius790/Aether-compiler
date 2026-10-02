@@ -12,6 +12,39 @@ use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+/// Writes `s` to stdout and flushes. When the reader has gone away (EPIPE,
+/// `aether dump-tokens f.ae | head -1`) the process exits quietly with
+/// status 0, like most command-line tools; any other write error is reported
+/// once and exits 1. Every stdout write of the CLI goes through here, so no
+/// `print!` can panic.
+fn out(s: &str) {
+    let mut o = io::stdout().lock();
+    if let Err(e) = o.write_all(s.as_bytes()).and_then(|()| o.flush()) {
+        stdout_failed(&e);
+    }
+}
+
+fn stdout_failed(e: &io::Error) -> ! {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("aether: cannot write to stdout: {e}");
+    std::process::exit(1);
+}
+
+macro_rules! outp {
+    ($($t:tt)*) => { out(&format!($($t)*)) };
+}
+
+macro_rules! outln {
+    () => { out("\n") };
+    ($($t:tt)*) => {{
+        let mut line = format!($($t)*);
+        line.push('\n');
+        out(&line)
+    }};
+}
+
 /// Stack size for the worker thread that runs every command: deeply nested
 /// programs recurse in the parser, sema and the IR passes, and 64 MiB keeps
 /// them off the (small) main-thread stack.
@@ -25,7 +58,7 @@ USAGE:
 
 COMMANDS:
     check <file>                  type-check only
-    run <file> [-O<n>] [--timings] [--stats] [--backend vm|llvm]
+    run <file> [-O<n>] [--timings] [--stats] [--backend vm|llvm] [--timeout <s>]
     compile <file> [-O<n>] [--emit ir|bytecode|llvm] [-o <path>]
     dump-tokens <file>
     dump-ast <file>
@@ -58,6 +91,8 @@ OPTIONS:
     --max-steps <n>       VM instruction budget (run/profile/digest/bench; default 50000000)
     --max-depth <n>       VM call-depth limit (run/profile/digest/bench; default 10000)
     --backend vm|llvm     `run` on the bytecode VM (default) or through LLVM `lli`
+    --timeout <s>         wall-clock limit for `run` in seconds (default: none on the
+                          VM, 10 with --backend llvm, where --max-steps cannot apply)
     --color, --no-color   force or suppress ANSI colour in diagnostics (default: only
                           when stderr is a terminal and NO_COLOR is unset)
     --timings             per-stage timings on stderr (run)
@@ -71,6 +106,7 @@ OPTIONS:
 
 EXIT CODES:
     0 ok, 1 compile error (or fuzz failure), 2 runtime error
+    (a closed stdout pipe, as in `aether run f.ae | head -1`, ends quietly with 0)
 "
 }
 
@@ -91,6 +127,8 @@ struct Args {
     includes: Vec<String>,
     max_steps: Option<u64>,
     max_depth: Option<usize>,
+    /// Wall-clock limit in seconds for `run` (`--timeout`).
+    timeout: Option<f64>,
     backend: String,
 }
 
@@ -117,6 +155,7 @@ fn parse_args() -> Result<Args, String> {
         includes: Vec::new(),
         max_steps: None,
         max_depth: None,
+        timeout: None,
         backend: "vm".into(),
     };
     let mut color_mode: Option<bool> = None;
@@ -197,6 +236,13 @@ fn parse_args() -> Result<Args, String> {
             i += 1;
             let v = raw.get(i).and_then(|x| x.parse::<usize>().ok()).filter(|v| *v > 0);
             a.max_depth = Some(v.ok_or_else(|| "--max-depth needs a positive integer".to_string())?);
+        } else if s == "--timeout" {
+            i += 1;
+            let v = raw
+                .get(i)
+                .and_then(|x| x.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1e9);
+            a.timeout = Some(v.ok_or_else(|| "--timeout needs a positive number of seconds".to_string())?);
         } else if s == "--backend" {
             let b = operand!("--backend");
             if b != "vm" && b != "llvm" {
@@ -311,11 +357,11 @@ fn check_errors(c: &Compiled, color: bool) -> Option<ExitCode> {
 fn dispatch(a: Args) -> Result<ExitCode, String> {
     match a.cmd.as_str() {
         "help" | "--help" | "-h" => {
-            print!("{}", usage());
+            outp!("{}", usage());
             Ok(ExitCode::SUCCESS)
         }
         "version" | "--version" | "-V" => {
-            println!("aether {}", env!("CARGO_PKG_VERSION"));
+            outln!("aether {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
         "check" => {
@@ -324,7 +370,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if c.diags.has_errors() {
                 Ok(ExitCode::from(1))
             } else {
-                println!("ok");
+                outln!("ok");
                 Ok(ExitCode::SUCCESS)
             }
         }
@@ -336,10 +382,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if a.backend == "llvm" {
                 return run_llvm(&c, &a);
             }
-            match run_compiled_with(&mut c, vm_opts(&a)) {
-                Ok((val, out, steps)) => {
-                    print!("{out}");
-                    let _ = io::stdout().flush();
+            match run_streaming(&mut c, &a) {
+                Ok((val, steps)) => {
                     if a.stats {
                         eprintln!("exit = {val}");
                         eprintln!("vm steps = {steps}");
@@ -353,8 +397,6 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
-                    print!("{}", e.stdout);
-                    let _ = io::stdout().flush();
                     eprintln!("runtime error: {e}");
                     Ok(ExitCode::from(2))
                 }
@@ -373,13 +415,13 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if let Some(out) = a.output {
                 std::fs::write(&out, text).map_err(|e| e.to_string())?;
             } else {
-                print!("{text}");
+                outp!("{text}");
             }
             Ok(ExitCode::SUCCESS)
         }
         "dump-tokens" => {
             let c = compile_input(&a, 0, false)?;
-            print!("{}", dump_tokens(&c));
+            outp!("{}", dump_tokens(&c));
             Ok(ExitCode::SUCCESS)
         }
         "dump-ast" => {
@@ -387,7 +429,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
-            print!("{}", dump_ast(&c));
+            outp!("{}", dump_ast(&c));
             Ok(ExitCode::SUCCESS)
         }
         "dump-ir" => {
@@ -395,7 +437,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
-            print!("{}", dump_ir_text(&c, a.unopt));
+            outp!("{}", dump_ir_text(&c, a.unopt));
             Ok(ExitCode::SUCCESS)
         }
         "dump-bytecode" | "disassemble" => {
@@ -403,7 +445,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
-            print!("{}", dump_bc(&c));
+            outp!("{}", dump_bc(&c));
             Ok(ExitCode::SUCCESS)
         }
         "optimize" => {
@@ -412,7 +454,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                 return Ok(code);
             }
             if let Some(r) = &c.opt_report {
-                print!("{}", r.summary());
+                outp!("{}", r.summary());
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -421,7 +463,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
-            print!("{}", c.llvm.clone().unwrap_or_default());
+            outp!("{}", c.llvm.clone().unwrap_or_default());
             Ok(ExitCode::SUCCESS)
         }
         "fmt" => {
@@ -441,7 +483,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             let main_file = c.file;
             c.program.items.retain(|it| it.span().file == main_file);
             let src = c.session.file(main_file).map_or("", |f| f.source.as_str());
-            print!("{}", aether::comments::format_program(&c.program, main_file, src));
+            outp!("{}", aether::comments::format_program(&c.program, main_file, src));
             Ok(ExitCode::SUCCESS)
         }
         "cfg" => {
@@ -450,7 +492,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                 return Ok(code);
             }
             let ir = c.ir.as_ref().ok_or_else(|| "no IR".to_string())?;
-            print!("{}", aether::ir::cfg::to_dot(ir));
+            outp!("{}", aether::ir::cfg::to_dot(ir));
             Ok(ExitCode::SUCCESS)
         }
         "dump-hir" => {
@@ -459,7 +501,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                 return Ok(code);
             }
             match &c.hir {
-                Some(h) => print!("{h:#?}"),
+                Some(h) => outp!("{h:#?}"),
                 None => eprintln!("no HIR"),
             }
             Ok(ExitCode::SUCCESS)
@@ -470,7 +512,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                 return Ok(code);
             }
             let ir = c.ir.as_ref().ok_or_else(|| "no IR".to_string())?;
-            print!("{}", aether::opt::liveness::render(ir));
+            outp!("{}", aether::opt::liveness::render(ir));
             Ok(ExitCode::SUCCESS)
         }
         "verify" => {
@@ -481,7 +523,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             let ir = c.ir.as_ref().ok_or_else(|| "no IR".to_string())?;
             match aether::ir::verify::verify_module(ir) {
                 Ok(()) => {
-                    println!("verify: ok ({} functions)", ir.functions.len());
+                    outln!("verify: ok ({} functions)", ir.functions.len());
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
@@ -496,50 +538,36 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                 return Ok(code);
             }
             if let Some(r) = &c.opt_report {
-                print!("{}", r.summary());
+                outp!("{}", r.summary());
             }
             if let Some(ir) = &c.ir {
-                println!(
+                outln!(
                     "functions={} blocks={} insts={}",
                     ir.functions.len(),
                     ir.functions.iter().map(|f| f.blocks.len()).sum::<usize>(),
                     ir_inst_count(&c)
                 );
-                print!("{}", aether::opt::liveness::render(ir));
+                outp!("{}", aether::opt::liveness::render(ir));
             }
             Ok(ExitCode::SUCCESS)
         }
         "profile" => {
-            let mut c = compile_input(&a, a.opt, a.color)?;
+            let c = compile_input(&a, a.opt, a.color)?;
             if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
-            if a.max_steps.is_some() || a.max_depth.is_some() {
-                // The profiling VM runs with the default limits; enforce the
-                // requested ones with a plain run first so the limit error
-                // (and the partial stdout) is reported exactly like `run`.
-                if let Err(e) = run_compiled_with(&mut c, vm_opts(&a)) {
-                    print!("{}", e.stdout);
-                    let _ = io::stdout().flush();
-                    eprintln!("runtime error: {e}");
-                    return Ok(ExitCode::from(2));
-                }
-            }
-            let bc = c.bytecode.clone().ok_or_else(|| "no bytecode".to_string())?;
-            match aether::vm::execute_profiled(&bc) {
-                Ok((val, out, report)) => {
-                    print!("{out}");
-                    println!("=> {val}");
-                    print!("{}", report.render());
+            let bc = c.bytecode.as_ref().ok_or_else(|| "no bytecode".to_string())?;
+            // a single profiled run, with the requested limits; on failure
+            // it still hands back the partial stdout
+            let (result, out, report) = aether::vm::execute_profiled_with(bc, vm_opts(&a));
+            outp!("{out}");
+            match result {
+                Ok(val) => {
+                    outln!("=> {val}");
+                    outp!("{}", report.render());
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
-                    // the profiling VM drops the partial output; the run is
-                    // deterministic, so replay it on the plain VM to recover it
-                    if let Err(r) = run_compiled_with(&mut c, vm_opts(&a)) {
-                        print!("{}", r.stdout);
-                        let _ = io::stdout().flush();
-                    }
                     eprintln!("runtime error: {e}");
                     Ok(ExitCode::from(2))
                 }
@@ -552,12 +580,11 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             }
             match run_compiled_with(&mut c, vm_opts(&a)) {
                 Ok((val, out, _)) => {
-                    println!("{:#x}", aether::vm::digest(&val, &out));
+                    outln!("{:#x}", aether::vm::digest(&val, &out));
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
-                    print!("{}", e.stdout);
-                    let _ = io::stdout().flush();
+                    outp!("{}", e.stdout);
                     eprintln!("runtime error: {e}");
                     Ok(ExitCode::from(2))
                 }
@@ -575,19 +602,86 @@ fn need_file(a: &Args) -> Result<&str, String> {
     a.file.as_deref().ok_or_else(|| "missing file operand".into())
 }
 
+/// Default wall-clock limit for `run --backend llvm` (seconds): `lli` has no
+/// instruction budget, so this is what stops a runaway program there.
+const LLVM_DEFAULT_TIMEOUT_SECS: f64 = 10.0;
+
+/// Shared handle to a buffered stdout: the VM writes through one clone and
+/// the CLI flushes through the other once the run is over.
+#[derive(Clone)]
+struct StdoutSink(std::rc::Rc<std::cell::RefCell<Box<dyn Write>>>);
+
+impl Write for StdoutSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+/// `run` on the VM, streaming the program's output to stdout as it is
+/// produced (nothing is held back until the end, and a closed pipe stops the
+/// program at its next write). `--timeout` is checked between slices of
+/// 2^20 instructions.
+fn run_streaming(c: &mut Compiled, a: &Args) -> Result<(aether::vm::Value, u64), String> {
+    use aether::vm::{Step, Vm, VmError};
+    let bc = c.bytecode.as_ref().ok_or_else(|| VmError::MissingMain.to_string())?;
+    // line-buffered on a terminal (output shows up as it is printed),
+    // block-buffered into a pipe or file (one syscall per 8 KiB, not per line)
+    let w: Box<dyn Write> = if io::IsTerminal::is_terminal(&io::stdout()) {
+        Box::new(io::stdout())
+    } else {
+        Box::new(io::BufWriter::new(io::stdout()))
+    };
+    let sink = StdoutSink(std::rc::Rc::new(std::cell::RefCell::new(w)));
+    let deadline = a
+        .timeout
+        .map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t));
+    let t0 = std::time::Instant::now();
+    let mut vm = Vm::new(bc, vm_opts(a)).with_stdout(Box::new(sink.clone()));
+    let result = loop {
+        match vm.run_budget(1 << 20) {
+            Ok(Step::Finished(v)) => break Ok(v),
+            Ok(Step::Yielded) => {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    break Err(VmError::Runtime("time limit exceeded".into()));
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    let exec_us = t0.elapsed().as_micros();
+    let steps = vm.steps();
+    drop(vm);
+    c.timings.exec_us = exec_us;
+    let flushed = sink.0.borrow_mut().flush();
+    match result {
+        Err(VmError::OutputClosed) => std::process::exit(0),
+        _ => {
+            if let Err(e) = flushed {
+                stdout_failed(&e);
+            }
+        }
+    }
+    result.map(|v| (v, steps)).map_err(|e| e.to_string())
+}
+
 /// `run --backend llvm`: hand the textual LLVM IR to `lli` and relay its stdout.
 /// Under `lli` the value `main` returns is the process exit status (mod 256),
 /// so it is the program's result, not a failure: like the VM backend, the
 /// command exits 0 (`--stats` prints it). A signal is a runtime error
 /// (SIGABRT: failed `assert`, division by zero, bad index; exit 2); a
 /// non-zero status together with `lli` diagnostics means `lli` rejected the
-/// module (exit 1).
+/// module (exit 1). `lli` is killed after `--timeout` seconds (default 10):
+/// "runtime error: time limit exceeded", exit 2.
 fn run_llvm(c: &Compiled, a: &Args) -> Result<ExitCode, String> {
     let ir = c
         .llvm
         .as_deref()
         .ok_or_else(|| "no LLVM IR was produced for this program".to_string())?;
-    let run = match aether::driver::run_llvm_ir(ir) {
+    let secs = a.timeout.unwrap_or(LLVM_DEFAULT_TIMEOUT_SECS);
+    let run = match aether::driver::run_llvm_ir_with(ir, Some(std::time::Duration::from_secs_f64(secs))) {
         Ok(r) => r,
         Err(e) if e.contains("not found") => {
             eprintln!(
@@ -601,8 +695,7 @@ fn run_llvm(c: &Compiled, a: &Args) -> Result<ExitCode, String> {
             return Ok(ExitCode::from(1));
         }
     };
-    print!("{}", run.stdout);
-    let _ = io::stdout().flush();
+    outp!("{}", run.stdout);
     match run.status {
         LliStatus::Exited(code) if code == 0 || run.stderr.trim().is_empty() => {
             if a.stats {
@@ -625,6 +718,10 @@ fn run_llvm(c: &Compiled, a: &Args) -> Result<ExitCode, String> {
             eprintln!("llvm backend error: lli was killed by signal {sig}");
             Ok(ExitCode::from(1))
         }
+        LliStatus::TimedOut => {
+            eprintln!("runtime error: time limit exceeded ({secs} s; raise it with --timeout)");
+            Ok(ExitCode::from(2))
+        }
     }
 }
 
@@ -639,12 +736,11 @@ struct ReplItem {
 }
 
 fn repl(a: &Args) -> Result<ExitCode, String> {
-    println!("Aether REPL — blank line to run; :items lists definitions, :reset clears them, :quit exits");
+    outln!("Aether REPL — blank line to run; :items lists definitions, :reset clears them, :quit exits");
     let stdin = io::stdin();
     let mut items: Vec<ReplItem> = Vec::new();
     loop {
-        print!("aether> ");
-        let _ = io::stdout().flush();
+        outp!("aether> ");
         let mut buf = String::new();
         let mut eof = false;
         loop {
@@ -658,17 +754,17 @@ fn repl(a: &Args) -> Result<ExitCode, String> {
                 ":quit" | ":exit" | ":q" => return Ok(ExitCode::SUCCESS),
                 ":reset" => {
                     items.clear();
-                    println!("(definitions cleared)");
+                    outln!("(definitions cleared)");
                 }
                 ":items" => {
                     if items.is_empty() {
-                        println!("(no definitions)");
+                        outln!("(no definitions)");
                     } else {
                         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
-                        println!("{}", names.join(", "));
+                        outln!("{}", names.join(", "));
                     }
                 }
-                ":help" => println!(
+                ":help" => outln!(
                     "statements run inside a fresh `main`; `fn`/`struct`/`extern fn` inputs are kept.\n\
                      :items  list kept definitions\n:reset  forget them\n:quit   exit"
                 ),
@@ -680,7 +776,7 @@ fn repl(a: &Args) -> Result<ExitCode, String> {
             repl_eval(&mut items, buf, a);
         }
         if eof {
-            println!();
+            outln!();
             return Ok(ExitCode::SUCCESS);
         }
     }
@@ -753,7 +849,7 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
             })
             .collect();
         if new_items.is_empty() {
-            println!("(no definitions found)");
+            outln!("(no definitions found)");
             return;
         }
         let names: Vec<String> = new_items.iter().map(|i| i.name.clone()).collect();
@@ -766,12 +862,12 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
         let c = compile_sources_public(files, &opts);
         if c.diags.has_errors() {
             c.diags.emit(&c.session, a.color);
-            println!("(input discarded; previous definitions kept)");
+            outln!("(input discarded; previous definitions kept)");
             return;
         }
         items.retain(|it| !names.contains(&it.name));
         items.extend(new_items);
-        println!("defined {}", names.join(", "));
+        outln!("defined {}", names.join(", "));
     } else {
         // Statements: wrap into a fresh `main` (same line, so line numbers match).
         let kept = repl_files(items, &[]);
@@ -808,13 +904,12 @@ fn repl_run(files: Vec<(String, String)>, opts: &CompileOptions, a: &Args) {
     }
     match run_compiled_with(&mut c, vm_opts(a)) {
         Ok((val, out, _)) => {
-            print!("{out}");
-            println!("=> {val}");
+            outp!("{out}");
+            outln!("=> {val}");
         }
         Err(e) => {
-            print!("{}", e.stdout);
-            let _ = io::stdout().flush();
-            eprintln!("runtime error: {e}");
+            outp!("{}", e.stdout);
+                eprintln!("runtime error: {e}");
         }
     }
 }
@@ -861,8 +956,7 @@ fn bench(a: &Args) -> Result<ExitCode, String> {
                     stdout = out;
                 }
                 Err(e) => {
-                    print!("{}", e.stdout);
-                    let _ = io::stdout().flush();
+                    outp!("{}", e.stdout);
                     eprintln!("runtime error at -O{level}: {e}");
                     return Ok(ExitCode::from(2));
                 }
@@ -884,16 +978,16 @@ fn bench(a: &Args) -> Result<ExitCode, String> {
             stdout,
         });
     }
-    println!("bench {file}  runs={runs}");
+    outln!("bench {file}  runs={runs}");
     for r in &rows {
-        println!(
+        outln!(
             "  -O{}: exec_us min={} median={}  vm_steps={}  ir_insts={}  result={}",
             r.level, r.min_us, r.median_us, r.steps, r.insts, r.value
         );
     }
     let (o0, o2) = (&rows[0], &rows[1]);
     let ratio = |x: u128, y: u128| x as f64 / (y.max(1)) as f64;
-    println!(
+    outln!(
         "  speedup -O2 vs -O0: {:.2}x exec (median), {:.2}x vm steps, {:.2}x ir insts",
         ratio(o0.median_us, o2.median_us),
         ratio(o0.steps as u128, o2.steps as u128),
@@ -913,18 +1007,18 @@ fn benchmark(n: i32) -> Result<ExitCode, String> {
     let mut optc = compile_source("bench.ae", &src, &copts(2, false));
     let (v0, _, s0) = run_compiled(&mut unopt).map_err(|e| e.to_string())?;
     let (v1, _, s1) = run_compiled(&mut optc).map_err(|e| e.to_string())?;
-    println!("fib({n})");
-    println!(
+    outln!("fib({n})");
+    outln!(
         "  result -O0 = {v0}   steps = {s0}   exec_us = {}",
         unopt.timings.exec_us
     );
-    println!(
+    outln!(
         "  result -O2 = {v1}   steps = {s1}   exec_us = {}",
         optc.timings.exec_us
     );
     if let (Some(a), Some(b)) = (&unopt.opt_report, &optc.opt_report) {
-        println!("  IR insts -O0 = {}", a.insts_before);
-        println!("  IR insts -O2 = {}", b.insts_after);
+        outln!("  IR insts -O0 = {}", a.insts_before);
+        outln!("  IR insts -O2 = {}", b.insts_after);
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -942,9 +1036,9 @@ fn run_fuzz_cmd(iters: u32, seed: u64, kind: &str) -> Result<ExitCode, String> {
     let kind = FuzzKind::parse(kind).ok_or_else(|| {
         format!("unknown fuzz kind `{kind}` (use all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox|format|agg)")
     })?;
-    println!("aether fuzz  iters={iters} seed={seed:#x} kind={kind:?}");
+    outln!("aether fuzz  iters={iters} seed={seed:#x} kind={kind:?}");
     let report = run_fuzz(&FuzzConfig { iters, seed, kind });
-    print!("{}", report.summary());
+    outp!("{}", report.summary());
     for f in &report.failures {
         eprintln!(
             "FAIL [{}] seed={} case={}\n{}\n----- source -----\n{}\n",

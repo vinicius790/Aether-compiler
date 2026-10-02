@@ -1628,11 +1628,12 @@ fn assembler_refuses_functions_needing_more_than_65535_registers() {
 
 #[test]
 fn compile_error_for_malformed_programs_is_e0300_not_a_panic() {
-    // 40000 literal elements in one block exceed the VM's register space.
-    let n = 40_000;
-    let mut src = String::from("fn main() -> i32 {\n let mut a = [");
-    src.push_str(&vec!["1"; n].join(", "));
-    src.push_str("];\n return a[0];\n}\n");
+    // 66000 parameters are 66000 simultaneously live registers: more than
+    // the VM's register space at every level.
+    let n = 66_000;
+    let params: Vec<String> = (0..n).map(|i| format!("p{i}: i32")).collect();
+    let src = format!("fn f({}) -> i32 {{ return p0; }}\nfn main() -> i32 {{ return 0; }}\n", params.join(", "));
+    // -O0 only: at -O2 `f` is unreachable from `main` and dead-fn removes it.
     for level in [0u8] {
         let c = compile_source("big.ae", &src, &CompileOptions { opt_level: level, color: false });
         assert!(c.diags.has_errors(), "-O{level}");

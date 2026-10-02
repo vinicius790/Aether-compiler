@@ -42,23 +42,23 @@ fn ceil #19 arity=1 regs=1
 
 fn pow_i32 #20 arity=1 regs=1
 
-fn fib #21 arity=1 regs=9
-  0000  loadimm r1, I32(2)
-  0001  lti32 r2, r0, r1
-  0002  jnz r2, 4
+fn fib #21 arity=1 regs=6
+  0000  loadimm r2, I32(2)
+  0001  lti32 r1, r0, r2
+  0002  jnz r1, 4
   0003  jmp 5
   0004  ret r0
-  0005  loadimm r1, I32(1)
-  0006  subi32 r3, r0, r1
-  0007  call f21 -> Some(4) [3]
-  0008  loadimm r5, I32(2)
-  0009  subi32 r6, r0, r5
-  0010  call f21 -> Some(7) [6]
-  0011  addi32 r8, r4, r7
-  0012  ret r8
+  0005  loadimm r3, I32(1)
+  0006  subi32 r4, r0, r3
+  0007  call f21 -> Some(3) [4]
+  0008  loadimm r4, I32(2)
+  0009  subi32 r5, r0, r4
+  0010  call f21 -> Some(4) [5]
+  0011  addi32 r2, r3, r4
+  0012  ret r2
 
 fn main #22 arity=0 regs=2
-  0000  loadimm r0, I32(10)
-  0001  call f21 -> Some(1) [0]
-  0002  native #2 -> None [1]
-  0003  ret r1
+  0000  loadimm r1, I32(10)
+  0001  call f21 -> Some(0) [1]
+  0002  native #2 -> None [0]
+  0003  ret r0

@@ -5,6 +5,7 @@ use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::span::Span;
 use crate::ty::{binop_result, parse_named_type, unop_result, Type};
 
+mod exhaust;
 mod scope;
 mod visibility;
 pub use scope::{DefKind, ScopeStack, Symbol};
@@ -104,10 +105,19 @@ pub enum HirPattern {
     Binding { name: String, ty: Type },
     /// Compared with `==` at the scrutinee's type.
     Literal { lit: Literal, ty: Type },
-    /// `fields[i]` binds payload slot `i + 1`, or is `None` for `_`.
+    /// `fields[i]` is the sub-pattern for payload slot `i + 1` (`Wildcard`
+    /// for `_`); `tys[i]` is that slot's type for this variant and
+    /// `variants` the number of variants of the enum.
     Variant {
         tag: usize,
-        fields: Vec<Option<(String, Type)>>,
+        variants: usize,
+        fields: Vec<HirPattern>,
+        tys: Vec<Type>,
+    },
+    /// `elems[i]` matches tuple field `i`, of type `tys[i]`.
+    Tuple {
+        elems: Vec<HirPattern>,
+        tys: Vec<Type>,
     },
 }
 
@@ -163,6 +173,12 @@ pub enum HirExprKind {
     Cast {
         expr: Box<HirExpr>,
         to: Type,
+    },
+    /// `match` as a value: each arm's block tail is the result (arms that
+    /// diverge have none). Exhaustive by construction.
+    Match {
+        scrutinee: Box<HirExpr>,
+        arms: Vec<HirArm>,
     },
 }
 
@@ -518,7 +534,7 @@ impl<'a> Analyzer<'a> {
                     },
                 );
             }
-            let hb = self.check_block_with(body, Some(&return_ty));
+            let hb = self.check_block_with(body, Some(&return_ty), true);
             self.scopes.pop();
             if let Some(tail) = &hb.tail {
                 if !return_ty.assignable_from(&tail.ty) {
@@ -556,32 +572,61 @@ impl<'a> Analyzer<'a> {
     /// A nested block: a trailing expression without `;` is evaluated as a
     /// statement. Only a function body (`check_block_with`) keeps it as a tail.
     fn check_block(&mut self, block: &Block) -> HirBlock {
-        self.check_block_with(block, None)
+        self.check_block_with(block, None, false)
     }
 
-    fn check_block_with(&mut self, block: &Block, tail_expected: Option<&Type>) -> HirBlock {
+    /// A block whose tail expression is its value (a `match` arm).
+    fn check_value_block(&mut self, block: &Block, expected: Option<&Type>) -> HirBlock {
+        self.check_block_with(block, expected, true)
+    }
+
+    fn check_block_with(
+        &mut self,
+        block: &Block,
+        tail_expected: Option<&Type>,
+        keep_tail: bool,
+    ) -> HirBlock {
         self.scopes.push();
         let mut stmts = Vec::new();
         for s in &block.stmts {
             if let Stmt::LetTuple {
                 mutable,
-                names,
+                pattern,
                 init,
                 span,
             } = s
             {
-                self.check_let_tuple(*mutable, names, init, *span, &mut stmts);
+                self.check_let_tuple(*mutable, pattern, init, *span, &mut stmts);
             } else {
                 stmts.push(self.check_stmt(s));
             }
         }
-        let mut tail = block
-            .tail
-            .as_ref()
-            .map(|e| self.check_expr(e, tail_expected));
-        if tail_expected.is_none() {
-            if let Some(e) = tail.take() {
-                stmts.push(HirStmt::Expr(e));
+        // A `match` in tail position is only a value where the value is used
+        // (and is not `unit`); otherwise it is the statement it always was.
+        let value_tail = keep_tail && tail_expected != Some(&Type::Unit);
+        let mut tail = None;
+        if let Some(e) = &block.tail {
+            match &e.kind {
+                ExprKind::Match { scrutinee, arms } if !value_tail => {
+                    stmts.push(self.check_match_stmt(scrutinee, arms, e.span));
+                }
+                _ => {
+                    let checked = self.check_expr(e, tail_expected);
+                    if keep_tail && expr_diverges(&checked) {
+                        // every arm leaves the function / loop: no value
+                        if let HirExprKind::Match { scrutinee, arms } = checked.kind {
+                            stmts.push(HirStmt::Match {
+                                scrutinee: *scrutinee,
+                                arms,
+                                span: checked.span,
+                            });
+                        }
+                    } else if keep_tail {
+                        tail = Some(checked);
+                    } else {
+                        stmts.push(HirStmt::Expr(checked));
+                    }
+                }
             }
         }
         self.scopes.pop();
@@ -592,67 +637,103 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// `let (a, b) = t;` → `let $t = t; let a = $t.0; let b = $t.1;`
+    /// `let (a, (b, c)) = t;` → `let $t = t; let a = $t.0; let b = $t.1.0; ...`
     fn check_let_tuple(
         &mut self,
         mutable: bool,
-        names: &[Ident],
+        pattern: &Pattern,
         init: &Expr,
         span: Span,
         out: &mut Vec<HirStmt>,
     ) {
         let init_e = self.check_expr(init, None);
-        let elems: Vec<Type> = match &init_e.ty {
-            Type::Tuple(elems) if elems.len() == names.len() => elems.clone(),
-            Type::Error => vec![Type::Error; names.len()],
-            other => {
-                self.err(
-                    format!(
-                        "cannot destructure `{other}` into {} names",
-                        names.len()
-                    ),
-                    init.span,
-                    "E0269",
-                );
-                vec![Type::Error; names.len()]
-            }
-        };
         let temp = format!("$t{}", self.temp_counter);
         self.temp_counter += 1;
         let tuple_ty = init_e.ty.clone();
+        let base = HirExpr {
+            kind: HirExprKind::Local(temp.clone()),
+            ty: tuple_ty.clone(),
+            span: init.span,
+        };
         out.push(HirStmt::Let {
-            name: temp.clone(),
+            name: temp,
             ty: tuple_ty.clone(),
             mutable: false,
             init: Some(init_e),
             span,
         });
-        for (i, name) in names.iter().enumerate() {
-            if name.name == "_" {
-                continue;
+        let mut bound = Vec::new();
+        self.destructure(pattern, &tuple_ty, base, mutable, out, &mut bound);
+    }
+
+    /// Binds the names of an irrefutable pattern (names, `_`, tuples) to the
+    /// parts of `base`, which has type `ty`.
+    fn destructure(
+        &mut self,
+        pat: &Pattern,
+        ty: &Type,
+        base: HirExpr,
+        mutable: bool,
+        out: &mut Vec<HirStmt>,
+        bound: &mut Vec<String>,
+    ) {
+        match &pat.kind {
+            PatternKind::Wildcard => {}
+            PatternKind::Binding(id) => {
+                self.note_binding(id, bound);
+                self.define_local(id, ty.clone(), mutable);
+                out.push(HirStmt::Let {
+                    name: id.name.clone(),
+                    ty: ty.clone(),
+                    mutable,
+                    init: Some(base),
+                    span: id.span,
+                });
             }
-            let ty = elems[i].clone();
-            self.define_local(name, ty.clone(), mutable);
-            let base = HirExpr {
-                kind: HirExprKind::Local(temp.clone()),
-                ty: tuple_ty.clone(),
-                span: init.span,
-            };
-            out.push(HirStmt::Let {
-                name: name.name.clone(),
-                ty: ty.clone(),
-                mutable,
-                init: Some(HirExpr {
-                    kind: HirExprKind::Field {
-                        base: Box::new(base),
-                        field: i.to_string(),
-                        index: i,
-                    },
-                    ty,
-                    span: name.span,
-                }),
-                span: name.span,
-            });
+            PatternKind::Tuple(elems) => {
+                let tys: Vec<Type> = match ty {
+                    Type::Tuple(ts) if ts.len() == elems.len() => ts.clone(),
+                    Type::Error => vec![Type::Error; elems.len()],
+                    other => {
+                        self.err(
+                            format!("cannot destructure `{other}` into {} names", elems.len()),
+                            pat.span,
+                            "E0269",
+                        );
+                        vec![Type::Error; elems.len()]
+                    }
+                };
+                for (i, (e, ety)) in elems.iter().zip(tys).enumerate() {
+                    let sub = HirExpr {
+                        kind: HirExprKind::Field {
+                            base: Box::new(base.clone()),
+                            field: i.to_string(),
+                            index: i,
+                        },
+                        ty: ety.clone(),
+                        span: e.span,
+                    };
+                    self.destructure(e, &ety, sub, mutable, out, bound);
+                }
+            }
+            _ => self.err(
+                "refutable pattern in `let`: only names, `_` and tuples can be destructured here",
+                pat.span,
+                "E0268",
+            ),
+        }
+    }
+
+    /// One name bound twice in the same pattern is an error (E0274).
+    fn note_binding(&mut self, id: &Ident, bound: &mut Vec<String>) {
+        if bound.contains(&id.name) {
+            self.err(
+                format!("`{}` is bound more than once in the same pattern", id.name),
+                id.span,
+                "E0274",
+            );
+        } else {
+            bound.push(id.name.clone());
         }
     }
 
@@ -678,74 +759,9 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn check_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> HirStmt {
-        let s = self.check_expr(scrutinee, None);
-        let sty = s.ty.clone();
-        let mut seen_tags: Vec<usize> = Vec::new();
-        let mut catch_all = false;
-        let mut out = Vec::new();
-        for arm in arms {
-            self.scopes.push();
-            let pattern = self.check_pattern(&arm.pattern, &sty);
-            match &pattern {
-                HirPattern::Variant { tag, .. } => {
-                    if seen_tags.contains(tag) {
-                        self.err(
-                            "duplicate match arm: this variant is already covered",
-                            arm.pattern.span,
-                            "E0271",
-                        );
-                    } else {
-                        seen_tags.push(*tag);
-                    }
-                }
-                HirPattern::Wildcard | HirPattern::Binding { .. } => catch_all = true,
-                HirPattern::Literal { .. } => {}
-            }
-            let body = self.check_block(&arm.body);
-            self.scopes.pop();
-            out.push(HirArm {
-                pattern,
-                body,
-                span: arm.span,
-            });
-        }
-        if !catch_all {
-            match &sty {
-                Type::Enum { variants, .. } => {
-                    let missing: Vec<&str> = variants
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !seen_tags.contains(i))
-                        .map(|(_, (n, _))| n.as_str())
-                        .collect();
-                    if !missing.is_empty() {
-                        self.diags.push(
-                            Diagnostic::error(
-                                format!(
-                                    "non-exhaustive match: variant(s) `{}` not covered",
-                                    missing.join("`, `")
-                                ),
-                                span,
-                            )
-                            .with_code("E0270")
-                            .with_help("add the missing arms or a `_ => { ... }` arm"),
-                        );
-                    }
-                }
-                Type::Error => {}
-                _ => {
-                    self.diags.push(
-                        Diagnostic::error(
-                            format!("non-exhaustive match on `{sty}`"),
-                            span,
-                        )
-                        .with_code("E0270")
-                        .with_help("a match on a scalar needs a `_` or binding arm"),
-                    );
-                }
-            }
-        }
+    /// `match` at statement position: arm values are discarded.
+    fn check_match_stmt(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> HirStmt {
+        let (s, out) = self.check_match_arms(scrutinee, arms, span, None);
         HirStmt::Match {
             scrutinee: s,
             arms: out,
@@ -753,12 +769,184 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// `match` as a value: every arm yields the same type (E0273), except
+    /// arms that diverge (`return` / `break` / `continue`).
+    fn check_match_expr(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        expected: Option<&Type>,
+        span: Span,
+    ) -> HirExpr {
+        let (s, mut out) = self.check_match_arms(scrutinee, arms, span, Some(expected));
+        // The reference type: the context's, else the first arm that has a
+        // value. Bare integer literals wait for it so `match e { A => 1, B => n64 }`
+        // is an `i64`.
+        let mut reference: Option<Type> = expected.cloned();
+        for (arm, hir) in arms.iter().zip(out.iter_mut()) {
+            if is_simple_literal_arm(arm) {
+                continue;
+            }
+            if let Some(t) = arm_value_type(&hir.body) {
+                if reference.is_none() && !t.is_error() {
+                    reference = Some(t);
+                }
+            }
+        }
+        for (arm, hir) in arms.iter().zip(out.iter_mut()) {
+            if is_simple_literal_arm(arm) && !hir_is_checked(hir) {
+                self.scopes.push();
+                hir.body = self.check_value_block(&arm.body, reference.as_ref());
+                self.scopes.pop();
+                if reference.is_none() {
+                    reference = arm_value_type(&hir.body);
+                }
+            }
+        }
+        let mut result: Option<Type> = None;
+        for (arm, hir) in arms.iter().zip(out.iter()) {
+            let Some(t) = arm_value_type(&hir.body) else {
+                continue; // diverges: has type `never`
+            };
+            let want = reference.clone().unwrap_or_else(|| t.clone());
+            if !want.assignable_from(&t) && !t.is_error() && !want.is_error() {
+                let at = hir.body.tail.as_ref().map(|e| e.span).unwrap_or(arm.span);
+                let mut d = Diagnostic::error(
+                    format!("match arms have incompatible types: expected `{want}`, found `{t}`"),
+                    at,
+                )
+                .with_code("E0273");
+                if t == Type::Unit {
+                    d = d.with_help("give the arm a value, or make it `return` / `break` / `continue`");
+                }
+                self.diags.push(d);
+            }
+            if result.is_none() {
+                result = Some(want);
+            }
+        }
+        // All arms diverge: the value is never produced, so any type serves.
+        let ty = result
+            .or(reference)
+            .unwrap_or(Type::Unit);
+        HirExpr {
+            kind: HirExprKind::Match {
+                scrutinee: Box::new(s),
+                arms: out,
+            },
+            ty,
+            span,
+        }
+    }
+
+    /// Shared by both forms: checks the scrutinee, the patterns (nested
+    /// ones included) and exhaustiveness. `value` is `Some(hint)` when the
+    /// arm blocks are values; arms that are bare integer literals are then
+    /// left unchecked (empty) for the caller to fill in with a known type.
+    fn check_match_arms(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        span: Span,
+        value: Option<Option<&Type>>,
+    ) -> (HirExpr, Vec<HirArm>) {
+        let s = self.check_expr(scrutinee, None);
+        let sty = s.ty.clone();
+        let mut out = Vec::new();
+        let mut pattern_errors = false;
+        for arm in arms {
+            self.scopes.push();
+            let before = self.diags.error_count();
+            let mut bound = Vec::new();
+            let pattern = self.check_pattern(&arm.pattern, &sty, &mut bound);
+            pattern_errors |= self.diags.error_count() > before;
+            let body = match value {
+                None => self.check_block(&arm.body),
+                Some(_) if is_simple_literal_arm(arm) => HirBlock {
+                    stmts: Vec::new(),
+                    tail: None,
+                    span: arm.body.span,
+                },
+                Some(hint) => self.check_value_block(&arm.body, hint),
+            };
+            self.scopes.pop();
+            out.push(HirArm {
+                pattern,
+                body,
+                span: arm.span,
+            });
+        }
+        if !pattern_errors && !sty.is_error() {
+            self.check_coverage(arms, &out, &sty, span);
+        }
+        (s, out)
+    }
+
+    /// Exhaustiveness (E0270), duplicate arms (E0271), unreachable arms (W0272).
+    fn check_coverage(&mut self, arms: &[MatchArm], hir: &[HirArm], sty: &Type, span: Span) {
+        let pats: Vec<exhaust::Pat> = hir.iter().map(|a| exhaust::simplify(&a.pattern)).collect();
+        // Reachability is a courtesy: past its work budget it is skipped.
+        let mut ck = exhaust::Checker::new();
+        for i in 1..pats.len() {
+            match ck.useful(&pats[..i], &pats[i], sty) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if arms[i].generated {
+                        continue;
+                    }
+                    let dup = exhaust::has_variant(&pats[i]) && pats[..i].contains(&pats[i]);
+                    if dup {
+                        self.err(
+                            "duplicate match arm: an earlier arm has the same pattern",
+                            arms[i].pattern.span,
+                            "E0271",
+                        );
+                    } else {
+                        self.diags.push(
+                            Diagnostic::warning(
+                                "unreachable match arm: earlier arms already cover every value it matches",
+                                arms[i].pattern.span,
+                            )
+                            .with_code("W0272"),
+                        );
+                    }
+                }
+                Err(()) => break,
+            }
+        }
+        let mut ck = exhaust::Checker::new();
+        match ck.missing(&pats, sty) {
+            Ok(None) => {}
+            Ok(Some(example)) => {
+                let help = if matches!(sty, Type::Enum { .. } | Type::Tuple(_) | Type::Bool) {
+                    "add an arm for it, or a `_ => ...` arm"
+                } else {
+                    "a match on this type needs a `_` or binding arm"
+                };
+                self.diags.push(
+                    Diagnostic::error(
+                        format!("non-exhaustive match on `{sty}`: pattern `{example}` not covered"),
+                        span,
+                    )
+                    .with_code("E0270")
+                    .with_help(help),
+                );
+            }
+            Err(()) => self.err(
+                "match is too large to check for exhaustiveness",
+                span,
+                "E0270",
+            ),
+        }
+    }
+
     /// Checks a pattern against the scrutinee type and defines its bindings
-    /// in the current scope.
-    fn check_pattern(&mut self, pat: &Pattern, sty: &Type) -> HirPattern {
+    /// in the current scope. `bound` collects the names bound so far.
+    fn check_pattern(&mut self, pat: &Pattern, sty: &Type, bound: &mut Vec<String>) -> HirPattern {
         match &pat.kind {
             PatternKind::Wildcard => HirPattern::Wildcard,
             PatternKind::Binding(id) => {
+                self.note_binding(id, bound);
                 self.define_local(id, sty.clone(), false);
                 HirPattern::Binding {
                     name: id.name.clone(),
@@ -799,6 +987,33 @@ impl<'a> Analyzer<'a> {
                     ty: sty.clone(),
                 }
             }
+            PatternKind::Tuple(elems) => {
+                let tys: Vec<Type> = match sty {
+                    Type::Tuple(ts) if ts.len() == elems.len() => ts.clone(),
+                    other => {
+                        if !other.is_error() {
+                            self.err(
+                                format!(
+                                    "a tuple pattern of {} elements cannot match a value of type `{other}`",
+                                    elems.len()
+                                ),
+                                pat.span,
+                                "E0269",
+                            );
+                        }
+                        vec![Type::Error; elems.len()]
+                    }
+                };
+                let sub: Vec<HirPattern> = elems
+                    .iter()
+                    .zip(&tys)
+                    .map(|(e, t)| self.check_pattern(e, t, bound))
+                    .collect();
+                if tys.iter().any(Type::is_error) && !sty.is_error() {
+                    return HirPattern::Wildcard;
+                }
+                HirPattern::Tuple { elems: sub, tys }
+            }
             PatternKind::Variant {
                 enum_name,
                 variant,
@@ -812,6 +1027,7 @@ impl<'a> Analyzer<'a> {
                             enum_name.span,
                             "E0265",
                         );
+                        self.check_subpatterns_as_error(fields, bound);
                         return HirPattern::Wildcard;
                     }
                 };
@@ -830,6 +1046,7 @@ impl<'a> Analyzer<'a> {
                             variant.span,
                             "E0266",
                         );
+                        self.check_subpatterns_as_error(fields, bound);
                         return HirPattern::Wildcard;
                     }
                 };
@@ -849,25 +1066,31 @@ impl<'a> Analyzer<'a> {
                 let mut out = Vec::new();
                 for (i, f) in fields.iter().enumerate() {
                     let fty = payload.get(i).cloned().unwrap_or(Type::Error);
-                    match &f.kind {
-                        PatternKind::Wildcard => out.push(None),
-                        PatternKind::Binding(id) => {
-                            self.define_local(id, fty.clone(), false);
-                            out.push(Some((id.name.clone(), fty)));
-                        }
-                        _ => {
-                            self.err(
-                                "nested patterns are not supported; use a name or `_`",
-                                f.span,
-                                "E0268",
-                            );
-                            out.push(None);
-                        }
-                    }
+                    out.push(self.check_pattern(f, &fty, bound));
                 }
                 out.truncate(payload.len());
-                HirPattern::Variant { tag, fields: out }
+                while out.len() < payload.len() {
+                    out.push(HirPattern::Wildcard);
+                }
+                let variants = match &ety {
+                    Type::Enum { variants, .. } => variants.len(),
+                    _ => 1,
+                };
+                HirPattern::Variant {
+                    tag,
+                    variants,
+                    fields: out,
+                    tys: payload,
+                }
             }
+        }
+    }
+
+    /// After an error in a pattern's head, its sub-patterns are still
+    /// checked (against `Error`) so their names exist and no cascade starts.
+    fn check_subpatterns_as_error(&mut self, fields: &[Pattern], bound: &mut Vec<String>) {
+        for f in fields {
+            self.check_pattern(f, &Type::Error, bound);
         }
     }
 
@@ -1088,17 +1311,17 @@ impl<'a> Analyzer<'a> {
                 scrutinee,
                 arms,
                 span,
-            } => self.check_match(scrutinee, arms, *span),
+            } => self.check_match_stmt(scrutinee, arms, *span),
             // Normally expanded by `check_block_with`; a stray one (not
             // directly in a block) is scoped to itself.
             Stmt::LetTuple {
                 mutable,
-                names,
+                pattern,
                 init,
                 span,
             } => {
                 let mut stmts = Vec::new();
-                self.check_let_tuple(*mutable, names, init, *span, &mut stmts);
+                self.check_let_tuple(*mutable, pattern, init, *span, &mut stmts);
                 HirStmt::Block(HirBlock {
                     stmts,
                     tail: None,
@@ -1209,6 +1432,9 @@ impl<'a> Analyzer<'a> {
             } => self.check_enum_lit(enum_name, variant, args, expr.span),
             ExprKind::Cast { expr: inner, ty } => self.check_cast(inner, ty, expr.span),
             ExprKind::Group(inner) => self.check_expr(inner, expected),
+            ExprKind::Match { scrutinee, arms } => {
+                self.check_match_expr(scrutinee, arms, expected, expr.span)
+            }
         }
     }
 
@@ -1760,6 +1986,59 @@ fn is_int_literal_expr(e: &Expr) -> bool {
         ExprKind::Binary { op, lhs, rhs } if !op.is_cmp() && !op.is_logical() => {
             is_int_literal_expr(lhs) && is_int_literal_expr(rhs)
         }
+        _ => false,
+    }
+}
+
+/// A match arm of the form `Pattern => 123` (a lone integer literal
+/// expression), whose type waits for the other arms.
+fn is_simple_literal_arm(arm: &MatchArm) -> bool {
+    arm.body.stmts.is_empty()
+        && arm.body.tail.as_deref().map_or(false, is_int_literal_expr)
+}
+
+/// A simple-literal arm that has been filled in already.
+fn hir_is_checked(arm: &HirArm) -> bool {
+    arm.body.tail.is_some()
+}
+
+/// The type of a match arm's value: `None` when the arm cannot complete
+/// (it `return`s / `break`s / `continue`s), `unit` when it has no tail.
+fn arm_value_type(body: &HirBlock) -> Option<Type> {
+    match &body.tail {
+        Some(t) if expr_diverges(t) => None,
+        Some(t) => Some(t.ty.clone()),
+        None if block_diverges(body) => None,
+        None => Some(Type::Unit),
+    }
+}
+
+fn expr_diverges(e: &HirExpr) -> bool {
+    match &e.kind {
+        HirExprKind::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|a| arm_value_type(&a.body).is_none())
+        }
+        _ => false,
+    }
+}
+
+/// The block never completes normally (ends in `return` / `break` /
+/// `continue` on every path).
+fn block_diverges(block: &HirBlock) -> bool {
+    block.stmts.iter().any(stmt_diverges) || block.tail.as_ref().map_or(false, expr_diverges)
+}
+
+fn stmt_diverges(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Return { .. } | HirStmt::Break(_) | HirStmt::Continue(_) => true,
+        HirStmt::If {
+            then_block,
+            else_block,
+            ..
+        } => block_diverges(then_block) && else_block.as_ref().map_or(false, block_diverges),
+        HirStmt::Block(b) => block_diverges(b),
+        HirStmt::Match { arms, .. } => !arms.is_empty() && arms.iter().all(|a| block_diverges(&a.body)),
+        HirStmt::Expr(e) => expr_diverges(e),
         _ => false,
     }
 }

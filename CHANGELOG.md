@@ -9,6 +9,14 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- Nested variant/literal/tuple patterns, `let (a, (b, c)) = t;`; `match` as an expression
+  (arm values, E0273, never-typed diverging arms); matrix exhaustiveness with a witness in
+  E0270; warning W0272 (unreachable arm); E0274 (name bound twice in a pattern); `==` on arrays
+- E0271 now only for identical variant patterns; E0268 only for float / refutable `let` patterns;
+  unknown string escapes (E0006) and `''` (E0003) are errors
+- Fixed: `for` bound re-read each iteration; liveness fixpoint capped at 64 rounds (DCE dropped
+  live values in deep expressions); DCE removed unused trapping ops (`5 / z`, `a[5]`) at -O1/-O2;
+  quadratic IR emission (40k-arm match 17 s → 0.6 s)
 - `pub` is enforced across files (`E0281 ... is private to FILE`); stdlib API marked `pub`;
   `driver::compile_sources_public` for hosts such as the REPL
 - `run --backend llvm` treats `main`'s value as the result (`driver::run_llvm_ir`, `LliStatus`)

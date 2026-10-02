@@ -176,171 +176,172 @@ bb0:
   %22 = const 0_i32
   %21 = mov %22
   %23 = const 4_i32
+  %24 = mov %23
   jmp bb1
 bb1:
-  %24 = <.i32 %21, %23
-  br %24, bb2, bb4
+  %25 = <.i32 %21, %24
+  br %25, bb2, bb4
 bb2:
-  %26 = load %0[%21]
-  %25 = mov %26
-  %27 = call describe(%25)
-  call println(%27)
-  %28 = const ()
-  %29 = call area(%25)
-  call print_f64(%29)
-  %30 = const ()
-  %31 = call area(%25)
-  %32 = +.f64 %19, %31
-  %19 = mov %32
+  %27 = load %0[%21]
+  %26 = mov %27
+  %28 = call describe(%26)
+  call println(%28)
+  %29 = const ()
+  %30 = call area(%26)
+  call print_f64(%30)
+  %31 = const ()
+  %32 = call area(%26)
+  %33 = +.f64 %19, %32
+  %19 = mov %33
   jmp bb3
 bb3:
-  %33 = const 1_i32
-  %21 = +.i32 %21, %33
+  %34 = const 1_i32
+  %21 = +.i32 %21, %34
   jmp bb1
 bb4:
   call print_f64(%19)
-  %34 = const ()
-  %36 = alloc Named
-  %37 = const "box"
-  store %36.0 = %37
-  %38 = alloc Shape
-  %39 = const 1_i32
-  store %38.0 = %39
-  %40 = const 2_f64
-  store %38.1 = %40
-  %41 = const 8_f64
-  store %38.2 = %41
-  store %36.1 = %38
-  %35 = mov %36
-  %42 = field %35.1
-  %43 = mov %42
-  %44 = field %43.0
-  %45 = const 1_i32
-  %46 = ==.i32 %44, %45
-  br %46, bb6, bb7
+  %35 = const ()
+  %37 = alloc Named
+  %38 = const "box"
+  store %37.0 = %38
+  %39 = alloc Shape
+  %40 = const 1_i32
+  store %39.0 = %40
+  %41 = const 2_f64
+  store %39.1 = %41
+  %42 = const 8_f64
+  store %39.2 = %42
+  store %37.1 = %39
+  %36 = mov %37
+  %43 = field %36.1
+  %44 = mov %43
+  %45 = field %44.0
+  %46 = const 1_i32
+  %47 = ==.i32 %45, %46
+  br %47, bb6, bb7
 bb5:
-  %56 = const 9_i32
-  %57 = const 4_i32
-  %58 = call min_max(%56, %57)
-  %55 = mov %58
-  %60 = field %55.0
-  %59 = mov %60
-  %62 = field %55.1
-  %61 = mov %62
-  %64 = alloc (i32, i32)
-  store %64.0 = %59
-  store %64.1 = %61
-  %63 = mov %64
-  %65 = field %63.0
-  call print_i32(%65)
-  %66 = const ()
-  %67 = field %63.1
-  call print_i32(%67)
-  %68 = const ()
-  %69 = alloc (i32, i32)
-  %70 = const 4_i32
-  store %69.0 = %70
-  %71 = const 9_i32
-  store %69.1 = %71
-  %72 = const true
-  %73 = field %63.0
-  %74 = field %69.0
-  %75 = ==.i32 %73, %74
-  %72 = mov %75
-  br %75, bb10, bb9
+  %57 = const 9_i32
+  %58 = const 4_i32
+  %59 = call min_max(%57, %58)
+  %56 = mov %59
+  %61 = field %56.0
+  %60 = mov %61
+  %63 = field %56.1
+  %62 = mov %63
+  %65 = alloc (i32, i32)
+  store %65.0 = %60
+  store %65.1 = %62
+  %64 = mov %65
+  %66 = field %64.0
+  call print_i32(%66)
+  %67 = const ()
+  %68 = field %64.1
+  call print_i32(%68)
+  %69 = const ()
+  %70 = alloc (i32, i32)
+  %71 = const 4_i32
+  store %70.0 = %71
+  %72 = const 9_i32
+  store %70.1 = %72
+  %73 = const true
+  %74 = field %64.0
+  %75 = field %70.0
+  %76 = ==.i32 %74, %75
+  %73 = mov %76
+  br %76, bb10, bb9
 bb6:
-  %47 = field %43.1
-  %48 = field %43.2
-  %49 = field %35.0
-  call println(%49)
-  %50 = const ()
-  %51 = *.f64 %47, %48
-  call print_f64(%51)
-  %52 = const ()
+  %48 = field %44.1
+  %49 = field %44.2
+  %50 = field %36.0
+  call println(%50)
+  %51 = const ()
+  %52 = *.f64 %48, %49
+  call print_f64(%52)
+  %53 = const ()
   jmp bb5
 bb7:
-  %53 = const "not a box"
-  call println(%53)
-  %54 = const ()
+  %54 = const "not a box"
+  call println(%54)
+  %55 = const ()
   jmp bb5
 bb8:
   jmp bb5
 bb9:
-  br %72, bb12, bb13
+  br %73, bb12, bb13
 bb10:
-  %76 = field %63.1
-  %77 = field %69.1
-  %78 = ==.i32 %76, %77
-  %72 = mov %78
-  br %78, bb11, bb9
+  %77 = field %64.1
+  %78 = field %70.1
+  %79 = ==.i32 %77, %78
+  %73 = mov %79
+  br %79, bb11, bb9
 bb11:
   jmp bb9
 bb12:
-  %79 = const "pair ok"
-  call println(%79)
-  %80 = const ()
+  %80 = const "pair ok"
+  call println(%80)
+  %81 = const ()
   jmp bb14
 bb13:
   jmp bb14
 bb14:
-  %81 = const 0_i32
-  %82 = load %0[%81]
-  %83 = alloc Shape
-  %84 = const 0_i32
-  store %83.0 = %84
-  %85 = const 2_f64
-  store %83.1 = %85
-  %87 = field %82.0
+  %82 = const 0_i32
+  %83 = load %0[%82]
+  %84 = alloc Shape
+  %85 = const 0_i32
+  store %84.0 = %85
+  %86 = const 2_f64
+  store %84.1 = %86
   %88 = field %83.0
-  %86 = ==.i32 %87, %88
-  br %86, bb16, bb15
+  %89 = field %84.0
+  %87 = ==.i32 %88, %89
+  br %87, bb16, bb15
 bb15:
-  %102 = !.bool %86
-  br %102, bb24, bb25
+  %103 = !.bool %87
+  br %103, bb24, bb25
 bb16:
-  %89 = const 0_i32
-  %90 = ==.i32 %87, %89
-  br %90, bb17, bb18
+  %90 = const 0_i32
+  %91 = ==.i32 %88, %90
+  br %91, bb17, bb18
 bb17:
-  %91 = field %82.1
   %92 = field %83.1
-  %93 = ==.f64 %91, %92
-  %86 = mov %93
-  br %93, bb19, bb15
+  %93 = field %84.1
+  %94 = ==.f64 %92, %93
+  %87 = mov %94
+  br %94, bb19, bb15
 bb18:
-  %94 = const 1_i32
-  %95 = ==.i32 %87, %94
-  br %95, bb20, bb21
+  %95 = const 1_i32
+  %96 = ==.i32 %88, %95
+  br %96, bb20, bb21
 bb19:
   jmp bb15
 bb20:
-  %96 = field %82.1
   %97 = field %83.1
-  %98 = ==.f64 %96, %97
-  %86 = mov %98
-  br %98, bb22, bb15
+  %98 = field %84.1
+  %99 = ==.f64 %97, %98
+  %87 = mov %99
+  br %99, bb22, bb15
 bb21:
   jmp bb15
 bb22:
-  %99 = field %82.2
   %100 = field %83.2
-  %101 = ==.f64 %99, %100
-  %86 = mov %101
-  br %101, bb23, bb15
+  %101 = field %84.2
+  %102 = ==.f64 %100, %101
+  %87 = mov %102
+  br %102, bb23, bb15
 bb23:
   jmp bb15
 bb24:
-  %103 = const 1_i32
-  ret %103
+  %104 = const 1_i32
+  ret %104
 bb25:
   jmp bb26
 bb26:
-  %104 = call code_for(%61)
-  ret %104
+  %105 = call code_for(%62)
+  ret %105
 bb27:
   jmp bb26
 bb28:
-  %105 = const 0_i32
-  ret %105
+  %106 = const 0_i32
+  ret %106
 }
 

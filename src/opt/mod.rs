@@ -679,9 +679,21 @@ pub fn pass_dce(module: &mut IrModule) {
             let mut keep = vec![false; bb.insts.len()];
             for i in (0..bb.insts.len()).rev() {
                 let inst = &bb.insts[i];
+                // Besides calls and stores, an instruction that can trap at
+                // run time is observable even when its result is unused:
+                // integer `/` and `%` (division by zero) and indexing
+                // (bounds). Removing them would make -O1/-O2 succeed where
+                // -O0 reports the error.
                 let effect = matches!(
                     inst,
-                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Yield
+                    Inst::Call { .. }
+                        | Inst::IndexStore { .. }
+                        | Inst::FieldStore { .. }
+                        | Inst::IndexLoad { .. }
+                        | Inst::Yield
+                ) || matches!(
+                    inst,
+                    Inst::Bin { op: BinOp::Div | BinOp::Rem, ty, .. } if ty.is_integer()
                 );
                 let dest_live = inst
                     .dest_reg()

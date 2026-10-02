@@ -135,8 +135,8 @@ impl Parser {
         let start = self.expect(TokenKind::Use)?.span;
         let tok = self.expect(TokenKind::String)?;
         let (path, bad) = unescape_string(&tok.lexeme);
-        if bad {
-            self.bad_unicode_escape(tok.span);
+        if let Some(e) = bad {
+            self.bad_escape(e, tok.span);
         }
         let end = self.expect(TokenKind::Semicolon)?.span;
         Some(UseDecl {
@@ -300,7 +300,21 @@ impl Parser {
         let mut tail = None;
         while !self.check(TokenKind::RBrace) && !self.is_eof() {
             let before = self.pos;
-            if self.is_stmt_start() {
+            if self.check(TokenKind::Match) {
+                // A `match` last in the block is its tail expression (the
+                // block's value); anywhere else it is a statement.
+                match self.parse_match_expr() {
+                    Some(e) if self.check(TokenKind::RBrace) => {
+                        tail = Some(Box::new(e));
+                        break;
+                    }
+                    Some(e) => {
+                        self.eat(TokenKind::Semicolon);
+                        stmts.push(match_stmt(e));
+                    }
+                    None => self.synchronize_stmt(),
+                }
+            } else if self.is_stmt_start() {
                 if let Some(stmt) = self.parse_stmt() {
                     stmts.push(stmt);
                 } else {
@@ -408,7 +422,7 @@ impl Parser {
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             TokenKind::Break | TokenKind::Continue | TokenKind::Yield => self.parse_jump(),
-            TokenKind::Match => self.parse_match(),
+            TokenKind::Match => self.parse_match_expr().map(match_stmt),
             TokenKind::LBrace => self.parse_block_stmt(),
             _ => self.parse_expr_stmt(),
         }
@@ -498,19 +512,11 @@ impl Parser {
 
     /// `let (a, b, ...) = expr;`
     fn parse_let_tuple(&mut self, start: Span, mutable: bool) -> Option<Stmt> {
-        let open = self.expect(TokenKind::LParen)?.span;
-        let mut names = Vec::new();
-        while !self.check(TokenKind::RParen) && !self.is_eof() {
-            names.push(self.parse_ident()?);
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-        }
-        let close = self.expect(TokenKind::RParen)?.span;
-        if names.len() < 2 {
+        let pattern = self.parse_pattern()?;
+        if !matches!(pattern.kind, PatternKind::Tuple(_)) {
             self.error_at(
                 "tuple patterns need at least two names",
-                open.merge(close),
+                pattern.span,
                 Some("write `let (a, b) = t;`"),
             );
         }
@@ -519,21 +525,21 @@ impl Parser {
         self.expect(TokenKind::Semicolon)?;
         Some(Stmt::LetTuple {
             mutable,
-            names,
+            pattern,
             init,
             span: start.merge(self.prev_span()),
         })
     }
 
-    /// `match expr { Pattern => Block ,? ... }`
-    fn parse_match(&mut self) -> Option<Stmt> {
+    /// `match expr { Pattern => (Block | Expr | return/break/continue) ,? ... }`
+    fn parse_match_expr(&mut self) -> Option<Expr> {
         self.enter_nesting()?;
         let result = self.parse_match_inner();
         self.leave_nesting();
         result
     }
 
-    fn parse_match_inner(&mut self) -> Option<Stmt> {
+    fn parse_match_inner(&mut self) -> Option<Expr> {
         let start = self.expect(TokenKind::Match)?.span;
         let scrutinee = self.parse_expr()?;
         self.expect(TokenKind::LBrace)?;
@@ -541,20 +547,112 @@ impl Parser {
         while !self.check(TokenKind::RBrace) && !self.is_eof() {
             let pattern = self.parse_pattern()?;
             self.expect(TokenKind::FatArrow)?;
-            let body = self.parse_block()?;
+            let (body, braced) = self.parse_arm_body()?;
             let span = pattern.span.merge(body.span);
             arms.push(MatchArm {
                 pattern,
                 body,
                 span,
+                generated: false,
             });
-            self.eat(TokenKind::Comma);
+            if !self.eat(TokenKind::Comma) && !braced && !self.check(TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
         }
         let end = self.expect(TokenKind::RBrace)?.span;
-        Some(Stmt::Match {
-            scrutinee,
-            arms,
+        Some(Expr {
+            kind: ExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms,
+            },
             span: start.merge(end),
+        })
+    }
+
+    /// The body of a match arm and whether it was a `{ ... }` block (whose
+    /// trailing comma is optional). A bare expression becomes the tail of a
+    /// one-expression block; `return` / `break` / `continue` (no `;`) a
+    /// block holding that statement.
+    fn parse_arm_body(&mut self) -> Option<(Block, bool)> {
+        match self.peek_kind() {
+            TokenKind::LBrace => Some((self.parse_block()?, true)),
+            TokenKind::Return | TokenKind::Break | TokenKind::Continue => {
+                let tok = self.bump();
+                let stmt = match tok.kind {
+                    TokenKind::Return => {
+                        let value = if self.check(TokenKind::Comma) || self.check(TokenKind::RBrace)
+                        {
+                            None
+                        } else {
+                            Some(self.parse_expr()?)
+                        };
+                        Stmt::Return {
+                            value,
+                            span: tok.span.merge(self.prev_span()),
+                        }
+                    }
+                    TokenKind::Break => Stmt::Break { span: tok.span },
+                    _ => Stmt::Continue { span: tok.span },
+                };
+                let span = tok.span.merge(self.prev_span());
+                Some((
+                    Block {
+                        stmts: vec![stmt],
+                        tail: None,
+                        span,
+                    },
+                    false,
+                ))
+            }
+            _ => {
+                let e = self.parse_expr()?;
+                let span = e.span;
+                Some((
+                    Block {
+                        stmts: Vec::new(),
+                        tail: Some(Box::new(e)),
+                        span,
+                    },
+                    false,
+                ))
+            }
+        }
+    }
+
+    /// `()` (the unit literal), `(p)` (just `p`) or `(p, q, ...)`.
+    fn parse_paren_pattern(&mut self) -> Option<Pattern> {
+        let open = self.expect(TokenKind::LParen)?.span;
+        if self.check(TokenKind::RParen) {
+            let end = self.bump().span;
+            return Some(Pattern {
+                kind: PatternKind::Literal(Literal::Unit),
+                span: open.merge(end),
+            });
+        }
+        let first = self.parse_pattern()?;
+        if !self.check(TokenKind::Comma) {
+            self.expect(TokenKind::RParen)?;
+            return Some(first);
+        }
+        let mut elems = vec![first];
+        while self.eat(TokenKind::Comma) {
+            if self.check(TokenKind::RParen) {
+                break;
+            }
+            elems.push(self.parse_pattern()?);
+        }
+        let end = self.expect(TokenKind::RParen)?.span;
+        let span = open.merge(end);
+        if elems.len() < 2 {
+            self.error_at(
+                "tuple patterns need at least two elements",
+                span,
+                Some("write `(p, q)`; `(p)` is just `p`"),
+            );
+        }
+        Some(Pattern {
+            kind: PatternKind::Tuple(elems),
+            span,
         })
     }
 
@@ -568,6 +666,7 @@ impl Parser {
 
     fn parse_pattern_inner(&mut self) -> Option<Pattern> {
         match self.peek_kind() {
+            TokenKind::LParen => self.parse_paren_pattern(),
             TokenKind::Ident => {
                 let id = self.parse_ident()?;
                 if id.name == "_" {
@@ -639,7 +738,7 @@ impl Parser {
                 self.error_at(
                     format!("expected pattern, found `{}`", tok.lexeme),
                     tok.span,
-                    Some("patterns: `_`, a name, a literal, or `Enum::Variant(a, _)`"),
+                    Some("patterns: `_`, a name, a literal, `Enum::Variant(p, ...)` or `(p, q)`"),
                 );
                 None
             }
@@ -715,6 +814,7 @@ impl Parser {
                 span: pattern.span.merge(then_block.span),
                 pattern,
                 body: then_block,
+                generated: false,
             },
             MatchArm {
                 pattern: Pattern {
@@ -723,6 +823,7 @@ impl Parser {
                 },
                 span: else_body.span,
                 body: else_body,
+                generated: true,
             },
         ];
         Some(Stmt::Match {
@@ -837,6 +938,7 @@ impl Parser {
             TokenKind::Ident => self.parse_ident_expr(),
             TokenKind::LParen => self.parse_paren(),
             TokenKind::LBracket => self.parse_array_lit(),
+            TokenKind::Match => self.parse_match_expr(),
             TokenKind::Minus => self.parse_unary(UnOp::Neg),
             TokenKind::Bang => self.parse_unary(UnOp::Not),
             _ => self.parse_prefix_error(),
@@ -862,15 +964,15 @@ impl Parser {
             TokenKind::False => Literal::Bool(false),
             TokenKind::String => {
                 let (s, bad) = unescape_string(&tok.lexeme);
-                if bad {
-                    self.bad_unicode_escape(tok.span);
+                if let Some(e) = bad {
+                    self.bad_escape(e, tok.span);
                 }
                 Literal::String(s)
             }
             _ => {
                 let (c, bad) = unescape_char(&tok.lexeme);
-                if bad {
-                    self.bad_unicode_escape(tok.span);
+                if let Some(e) = bad {
+                    self.bad_escape(e, tok.span);
                 }
                 Literal::Char(c)
             }
@@ -1330,12 +1432,19 @@ impl Parser {
         self.diags.push(d);
     }
 
-    fn bad_unicode_escape(&mut self, span: Span) {
-        self.diags.push(
-            Diagnostic::error("invalid unicode escape", span)
-                .with_code("E0005")
-                .with_help("write `\\u{XXXX}` with 1 to 6 hex digits naming a Unicode scalar value"),
-        );
+    fn bad_escape(&mut self, e: Esc, span: Span) {
+        match e {
+            Esc::Unicode => self.diags.push(
+                Diagnostic::error("invalid unicode escape", span)
+                    .with_code("E0005")
+                    .with_help("write `\\u{XXXX}` with 1 to 6 hex digits naming a Unicode scalar value"),
+            ),
+            Esc::Unknown(c) => self.diags.push(
+                Diagnostic::error(format!("unknown escape sequence `\\{c}`"), span)
+                    .with_code("E0006")
+                    .with_help("escapes: \\n \\t \\r \\0 \\\\ \\\" \\' and \\u{XXXX}"),
+            ),
+        }
     }
 }
 
@@ -1374,6 +1483,19 @@ fn infix_info(kind: TokenKind) -> Option<(u8, bool, BinOp)> {
 }
 
 /// The binary operator behind a compound-assignment token (`+=` → `+`).
+/// A statement-position `match` expression as a `Stmt::Match`.
+fn match_stmt(e: Expr) -> Stmt {
+    let span = e.span;
+    match e.kind {
+        ExprKind::Match { scrutinee, arms } => Stmt::Match {
+            scrutinee: *scrutinee,
+            arms,
+            span,
+        },
+        _ => Stmt::Expr { expr: e, span },
+    }
+}
+
 fn compound_assign_op(kind: TokenKind) -> Option<BinOp> {
     Some(match kind {
         TokenKind::PlusEq => BinOp::Add,
@@ -1425,8 +1547,17 @@ fn parse_float(lexeme: &str) -> Option<f64> {
     digits.parse::<f64>().ok()
 }
 
-/// Returns the decoded string and whether an invalid `\u{...}` was seen.
-fn unescape_string(lexeme: &str) -> (String, bool) {
+/// A malformed escape sequence in a string or character literal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Esc {
+    /// `\u{...}` that is not 1-6 hex digits naming a scalar value.
+    Unicode,
+    /// `\q`, or `\u` without braces.
+    Unknown(char),
+}
+
+/// Returns the decoded string and the first malformed escape, if any.
+fn unescape_string(lexeme: &str) -> (String, Option<Esc>) {
     let inner = if lexeme.len() >= 2 && lexeme.starts_with('"') && lexeme.ends_with('"') {
         &lexeme[1..lexeme.len() - 1]
     } else if lexeme.starts_with('"') {
@@ -1437,7 +1568,7 @@ fn unescape_string(lexeme: &str) -> (String, bool) {
     unescape(inner)
 }
 
-fn unescape_char(lexeme: &str) -> (char, bool) {
+fn unescape_char(lexeme: &str) -> (char, Option<Esc>) {
     let inner = if lexeme.len() >= 2 && lexeme.starts_with('\'') && lexeme.ends_with('\'') {
         &lexeme[1..lexeme.len() - 1]
     } else {
@@ -1447,13 +1578,13 @@ fn unescape_char(lexeme: &str) -> (char, bool) {
     (s.chars().next().unwrap_or('\0'), bad)
 }
 
-/// Escapes: `\n \t \r \0 \\ \" \'` and `\u{XXXX}` (1–6 hex digits naming a
-/// Unicode scalar value). A malformed `\u{...}` decodes to U+FFFD and sets
-/// the flag so the parser can report E0005 and carry on. Unknown escapes
-/// are kept verbatim.
-fn unescape(s: &str) -> (String, bool) {
+/// Escapes: `\n \t \r \0 \\ \" \'` and `\u{XXXX}` (1-6 hex digits naming a
+/// Unicode scalar value). A malformed `\u{...}` decodes to U+FFFD and an
+/// unknown escape keeps its characters; both are reported (E0005 / E0006)
+/// so the parser can carry on.
+fn unescape(s: &str) -> (String, Option<Esc>) {
     let mut out = String::new();
-    let mut bad = false;
+    let mut bad = None;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -1485,16 +1616,20 @@ fn unescape(s: &str) -> (String, bool) {
                     match decoded {
                         Some(ch) => out.push(ch),
                         None => {
-                            bad = true;
+                            bad.get_or_insert(Esc::Unicode);
                             out.push('\u{FFFD}');
                         }
                     }
                 }
                 Some(other) => {
+                    bad.get_or_insert(Esc::Unknown(other));
                     out.push('\\');
                     out.push(other);
                 }
-                None => out.push('\\'),
+                None => {
+                    bad.get_or_insert(Esc::Unknown(' '));
+                    out.push('\\');
+                }
             }
         } else {
             out.push(c);
@@ -1829,9 +1964,23 @@ mod tests {
             );
             assert_eq!(prog.items.len(), 1, "{src}");
         }
-        // `\u` without a brace is an unknown escape, kept verbatim as before
-        let e = return_expr(r#"fn main() -> i32 { return "\u41"; }"#);
-        assert_eq!(e.kind, ExprKind::Literal(Literal::String("\\u41".into())));
+        // `\u` without a brace, and any other escape, is E0006 (the text is kept)
+        for src in [
+            r#"fn main() -> i32 { return "\u41"; }"#,
+            r#"fn main() -> i32 { return "a\qb"; }"#,
+            r"fn main() -> i32 { return '\d'; }",
+        ] {
+            let (prog, diags) = parse_src(src);
+            assert_eq!(
+                diags.iter().filter(|d| d.code == Some("E0006")).count(),
+                1,
+                "{src}: {}",
+                render(&diags)
+            );
+            assert_eq!(prog.items.len(), 1, "{src}");
+        }
+        let (_, diags) = parse_src("fn main() -> i32 { return ''; }");
+        assert!(diags.iter().any(|d| d.code == Some("E0003")), "{}", render(&diags));
     }
 
     #[test]
@@ -1860,7 +2009,7 @@ mod tests {
         let Item::Fn(f) = &prog.items[1] else { panic!() };
         let stmts = &f.body.as_ref().unwrap().stmts;
         assert!(matches!(&stmts[0], Stmt::Let { init: Some(Expr { kind: ExprKind::Tuple { elements }, .. }), .. } if elements.len() == 2));
-        assert!(matches!(&stmts[1], Stmt::LetTuple { names, .. } if names.len() == 2));
+        assert!(matches!(&stmts[1], Stmt::LetTuple { pattern: Pattern { kind: PatternKind::Tuple(names), .. }, .. } if names.len() == 2));
         // `t.1.1` lexes as the float `1.1` and is split into two field accesses
         let Stmt::Let { init: Some(Expr { kind: ExprKind::EnumLit { args, .. }, .. }), .. } = &stmts[2] else { panic!() };
         assert!(matches!(&args[1].kind, ExprKind::Field { base, field } if field.name == "1"

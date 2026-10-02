@@ -86,6 +86,9 @@ Atribuição exige igualdade de tipo. Não há promoção implícita `i32 → i6
 Conversões explícitas usam `e as T` e só as pares listadas em `ty.rs`
 (`can_cast_to`) são legais: `i32 ↔ i64`, `i32`/`i64 → f64`, `f64 → i32`/`i64`,
 `bool → i32`/`i64`, `char → i32` e `i32 → char`. Todas executam na VM.
+`f64 → inteiro` trunca para zero e **satura** nos limites do tipo (NaN dá
+`0`); `i64 → i32` mantém os 32 bits baixos (wrapping); `i32 → char` fora do
+domínio dos valores escalares Unicode dá U+FFFD.
 
 ### Inferência
 
@@ -108,7 +111,11 @@ separar dígitos em qualquer forma (`1_000_000`, `0xFFFF_FFFF`) e também na
 mantissa de um `f64` (`1_000.5`). Os prefixos são minúsculos e denotam
 *valores*, não padrões de bits: `0xFFFF_FFFF` é 4294967295 e só cabe em
 `i64`; para a máscara `i32` de 32 uns escreva `-1` ou `!0`. O valor tem de
-caber em `i64` ("invalid integer literal" caso contrário).
+caber em `i64` ("invalid integer literal" caso contrário), pelo que o
+mínimo de `i64` não tem literal: escreva `-9223372036854775807 - 1`. Um
+`f64` escreve-se `1.5`, `1_000.5`, `2e10` ou `1.5e-3` (o expoente dispensa a
+parte fraccionária; sem expoente o `.` e um dígito depois dele são
+obrigatórios, de modo que `1.` e `.5` não são literais).
 
 ## Operadores e precedência
 
@@ -189,8 +196,10 @@ let [mut] nome [: tipo] [= expr];
 ```
 
 Reatribuição só é permitida em bindings `mut` e em elementos de array /
-campos de struct obtidos por indexação, também aninhados
-(`a[i][j] = v`, `o.inner.x = v`).
+campos de struct / campos de tupla obtidos por indexação, também aninhados
+(`a[i][j] = v`, `o.inner.x = v`, `t.0 = v`). Esta segunda forma **não exige**
+que o binding seja `mut` (nem que seja um parâmetro): como arrays, structs
+e tuplas têm semântica de valor, só a própria variável vê a alteração.
 
 ## Funções
 
@@ -215,7 +224,9 @@ Chamar uma `extern fn` que a VM não implementa é erro de runtime.
 - `if expr { ... } [else { ... }]` — `expr: bool`
 - `while expr { ... }`
 - `for nome in expr .. expr { ... }` — intervalo semiaberto `[start, end)`
-  em `i32` (os limites têm de ser `i32`, E0238); a variável de iteração é
+  em `i32` (os limites têm de ser `i32`, E0238), ambos avaliados **uma só
+  vez** antes do laço (reatribuir a variável usada como limite dentro do
+  corpo não muda o número de iterações); a variável de iteração é
   `mut i32` e só existe no corpo do laço
 - `break` / `continue` apenas dentro de laço
 - `return [expr];`
@@ -250,7 +261,7 @@ elementos (`N`) como `i32`.
 ```
 let t: (i32, bool) = (1, true);
 t.0            // 1
-t.1 = false;   // campos são atribuíveis (t: mut)
+t.1 = false;   // campos são atribuíveis, como elementos de array e campos de struct
 let (a, b) = t;
 ```
 
@@ -258,8 +269,10 @@ Tipo `(T1, T2, ...)` e expressão `(e1, e2, ...)` com **dois ou mais**
 elementos (`()` continua a ser `unit`, `(e)` é só `e`). Acesso posicional
 `t.0`, `t.1`, ... (`t.0.1` acede ao elemento 1 do elemento 0). A
 desestruturação `let [mut] (a, b, ...) = expr;` exige tantos nomes quantos
-elementos (E0269); `_` descarta um elemento. Tuplas têm semântica de valor
-como structs. `==` / `!=` comparam elemento a elemento (todos os elementos
+elementos (E0269); `_` descarta um elemento. A desestruturação pode ser
+aninhada: `let (a, (b, c)) = t;` (só nomes, `_` e tuplas; qualquer outro
+padrão é E0268 e um nome repetido no mesmo padrão E0274). Tuplas têm
+semântica de valor como structs. `==` / `!=` comparam elemento a elemento (todos os elementos
 têm de suportar `==`); `<` etc. não existem.
 
 ## Enums
@@ -294,39 +307,71 @@ match s {
     Shape::Rect(w, _) => { ... }
     _ => { ... }
 }
+let area = match s { Shape::Circle(r) => 3 * r * r, Shape::Rect(w, h) => w * h, Shape::Empty => 0 };
 ```
 
-`match` é uma **instrução** (como `if`): cada braço é `Padrão => Bloco`
-(vírgula opcional entre braços) e os blocos podem `return` / `break` /
-`continue`. Os braços são testados por ordem. Padrões:
+Cada braço é `Padrão => Bloco` ou `Padrão => expressão` (vírgula opcional
+depois de um bloco, obrigatória entre braços de expressão; um `,` final é
+aceite). Os braços são testados por ordem; o escrutinador é avaliado uma só
+vez. `return`, `break` e `continue` são aceites como corpo de braço sem
+`;` (`0 => return 1,`).
 
-- `Enum::Variante(p1, ..., pn)` com um nome (vincula a carga, imutável) ou
-  `_` por posição (padrões aninhados não são suportados, E0268);
+### Padrões
+
+- `Enum::Variante(p1, ..., pn)` com **padrões quaisquer** por posição:
+  nomes, `_`, literais, tuplas e outras variantes (`Out::W(In::A(x))`,
+  `E::A(1)`, `E::P((a, 0))`);
+- `(p1, p2, ...)` — tupla com dois ou mais elementos; `()` casa o valor
+  `unit` e `(p)` é só `p`;
 - literal `i32` / `i64` (também negativo), `bool`, `char`, `string`, para
-  escrutinador do mesmo tipo (E0269; floats não são padrões);
-- `nome` — vincula o escrutinador inteiro e apanha tudo;
+  escrutinador do mesmo tipo (E0269); literais `f64` não são padrões (E0268);
+- `nome` — vincula o valor inteiro (imutável) e apanha tudo;
 - `_` — apanha tudo.
 
-Exaustividade (E0270): um `match` sobre enum cobre todas as variantes ou
-tem um braço `_`/nome; sobre escalares exige sempre um braço `_`/nome. Uma
-variante repetida é erro (E0271). Um `match` cujos braços todos retornam
-conta como caminho de retorno da função.
+Um padrão que não corresponde ao tipo é E0269, aridade errada de variante
+E0267, variante/enum desconhecidos E0266/E0265, um nome vinculado duas
+vezes no mesmo padrão E0274. Os vínculos de um braço só existem nesse braço
+(e sombreiam nomes exteriores, com o aviso W0232).
 
-## `if let`
+### Exaustividade e alcançabilidade
 
-```
-if let Shape::Rect(w, h) = s { ... } else { ... }
-```
+A verificação é por matriz de padrões (especialização recursiva, estilo
+Maranget) e vê através de aninhamento: `E::A(1)` + `E::A(_)` + `E::B` é
+exaustivo. Um `match` não exaustivo é E0270 e a mensagem dá um exemplo de
+valor por cobrir (`pattern `E::A(_)` not covered`, `(_, false)`,
+`Out::W(In::B)`). Enums, tuplas e `bool` têm assinatura finita (`true` e
+`false` bastam, sem `_`); inteiros, `char` e `string` pedem sempre um braço
+`_` ou nome. Um braço que nunca pode casar porque os anteriores já cobrem
+tudo é o aviso **W0272** (não erro); um braço com um padrão de variante
+idêntico a um anterior é o erro **E0271**. Os braços `else` de `if let` não
+geram W0272. Um `match` demasiado grande para a verificação (limite de
+trabalho interno) é E0270 "too large".
 
-Açúcar para um `match` de dois braços: o padrão dado e `_ => { else }`
-(bloco vazio sem `else`). Vale qualquer padrão de `match`.
+### `match` como expressão
+
+`match` pode ser usado onde se espera um valor: `let a = match e { ... };`,
+`return match ...;`, argumento, operando, condição, limite de `for`. O valor
+de um braço de bloco é a sua expressão final sem `;`. Todos os braços têm o
+mesmo tipo (E0273); um braço que não termina (`return` / `break` /
+`continue` em todos os caminhos) tem tipo *never* e não conta. Um literal
+inteiro nu num braço adopta o tipo dos restantes (`match k { 1 => 2, _ => n64 }`
+é `i64`); um braço de bloco sem expressão final tem tipo `unit`.
+
+Na posição de instrução (`match` seguido de mais código, ou como última
+coisa de um bloco que não é corpo de função com valor) continua a ser uma
+**instrução**: os valores dos braços são descartados e não têm de ter o
+mesmo tipo. Um `match` que é a última coisa do corpo de uma função com tipo
+de retorno ≠ `unit` é o valor devolvido; se todos os braços retornam,
+conta como caminho de retorno (e não é preciso `return` depois dele).
 
 ## Strings
 
 Literais `"..."` com escapes `\n \t \r \0 \\ \" \'` e `\u{XXXX}` (1 a 6
 dígitos hexadecimais de um valor escalar Unicode; `\u{41}` é `'A'`). Um
-`\u{...}` malformado é erro E0005 e vale U+FFFD. Os mesmos escapes valem em
-literais `'c'`. Concatenação `+`.
+`\u{...}` malformado é erro E0005 e vale U+FFFD; qualquer outra sequência
+`\x` (e `\u` sem chavetas) é E0006 `unknown escape sequence`. Os mesmos
+escapes valem em literais `'c'`; `''` é E0003. Um BOM UTF-8 no início do
+ficheiro é ignorado. Concatenação `+`.
 `len(s)` devolve `i32` e conta valores escalares Unicode (chars), como a
 indexação, não bytes. Indexação devolve `char`.
 

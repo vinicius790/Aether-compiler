@@ -19,11 +19,13 @@ pub struct Lexer<'src> {
 
 impl<'src> Lexer<'src> {
     pub fn new(file: FileId, src: &'src str) -> Self {
+        // A UTF-8 byte order mark is not part of the program.
+        let bom = if src.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
         Lexer {
             file,
             src,
             bytes: src.as_bytes(),
-            pos: 0,
+            pos: bom,
             line: 1,
             column: 1,
             diags: Diagnostics::new(),
@@ -300,6 +302,15 @@ impl<'src> Lexer<'src> {
 
     fn char_lit(&mut self, start: usize, line: u32, column: u32) -> Token {
         self.bump();
+        if self.peek_char() == '\'' {
+            // `''`: report it, and let the closing quote below end the token
+            let span = self.span_from(start, line, column);
+            self.diags.push(
+                Diagnostic::error("empty character literal", Span::new(self.file, span.start.0, span.end.0 + 1, line, column))
+                    .with_code("E0003")
+                    .with_help("write one character between the quotes, e.g. `'a'`"),
+            );
+        }
         if self.peek_char() == '\\' {
             self.bump();
             let esc = self.peek_char();

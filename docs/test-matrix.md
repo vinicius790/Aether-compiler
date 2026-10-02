@@ -108,3 +108,4 @@ têm de concordar e coincidir com o stdout/valor esperado.
 | shrink a apagar helper chamado | `uses_in_expr` no sketch |
 | overflow do pretty wrap | `map_leaves` post-order |
 | `check_ir` ids após retain | existência por id, não índice |
+| A1 | `tests/audit_match.rs` | match/enum/tuplas/padrões aninhados: -O0 = -O2 = esperado |

@@ -274,6 +274,9 @@ struct Builder {
     next_reg: u32,
     next_block: u32,
     locals: Vec<(String, Reg, Type)>,
+    /// `break` / `continue` targets of the innermost loop, for `match`
+    /// expressions whose arms may contain them.
+    loop_ctx: (Option<BlockId>, Option<BlockId>),
 }
 
 impl Builder {
@@ -289,6 +292,7 @@ impl Builder {
             next_reg: 0,
             next_block: 1,
             locals: Vec::new(),
+            loop_ctx: (None, None),
         }
     }
 
@@ -310,13 +314,14 @@ impl Builder {
     }
 
     fn emit(&mut self, inst: Inst) {
-        if let Some(bb) = self.blocks.iter_mut().find(|b| b.id == self.current) {
+        // block ids are indices: `new_block` pushes in id order
+        if let Some(bb) = self.blocks.get_mut(self.current.0 as usize) {
             bb.insts.push(inst);
         }
     }
 
     fn set_term(&mut self, term: Terminator) {
-        if let Some(bb) = self.blocks.iter_mut().find(|b| b.id == self.current) {
+        if let Some(bb) = self.blocks.get_mut(self.current.0 as usize) {
             bb.term = term;
         }
     }
@@ -353,7 +358,7 @@ fn lower_fn(f: &HirFn) -> IrFunction {
     if let Some(body) = &f.body {
         let tail = lower_block(&mut b, body, None, None);
         // implicit return: the block's tail expression, unit, or a default
-        match &b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term) {
+        match &b.blocks.get(b.current.0 as usize).map(|bb| &bb.term) {
             Some(Terminator::Unreachable) | Some(Terminator::Jump { .. }) | None => {
                 if let (Some(r), false) = (tail, f.return_ty == Type::Unit) {
                     b.set_term(Terminator::Return { value: Some(r) });
@@ -394,10 +399,13 @@ fn lower_block(
     continue_bb: Option<BlockId>,
 ) -> Option<Reg> {
     let mark = b.locals.len();
+    let saved = b.loop_ctx;
+    b.loop_ctx = (break_bb, continue_bb);
     for stmt in &block.stmts {
         lower_stmt(b, stmt, break_bb, continue_bb);
     }
     let tail = block.tail.as_ref().map(|tail| lower_expr(b, tail));
+    b.loop_ctx = saved;
     b.unbind_to(mark);
     tail
 }
@@ -454,7 +462,7 @@ fn lower_stmt(
             b.switch(then_bb);
             lower_block(b, then_block, break_bb, continue_bb);
             if matches!(
-                b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term),
+                b.blocks.get(b.current.0 as usize).map(|bb| &bb.term),
                 Some(Terminator::Unreachable)
             ) {
                 b.set_term(Terminator::Jump { target: join });
@@ -464,7 +472,7 @@ fn lower_stmt(
                 lower_block(b, eb, break_bb, continue_bb);
             }
             if matches!(
-                b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term),
+                b.blocks.get(b.current.0 as usize).map(|bb| &bb.term),
                 Some(Terminator::Unreachable)
             ) {
                 b.set_term(Terminator::Jump { target: join });
@@ -486,7 +494,7 @@ fn lower_stmt(
             b.switch(body_bb);
             lower_block(b, body, Some(exit), Some(header));
             if matches!(
-                b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term),
+                b.blocks.get(b.current.0 as usize).map(|bb| &bb.term),
                 Some(Terminator::Unreachable)
             ) {
                 b.set_term(Terminator::Jump { target: header });
@@ -503,7 +511,14 @@ fn lower_stmt(
             let i = b.alloc_reg();
             let s = lower_expr(b, start);
             b.emit(Inst::Move { dest: i, src: s });
-            let limit = lower_expr(b, end);
+            // The bound is evaluated once: copy it, since a plain local's
+            // register would follow later writes to that variable.
+            let end_reg = lower_expr(b, end);
+            let limit = b.alloc_reg();
+            b.emit(Inst::Move {
+                dest: limit,
+                src: end_reg,
+            });
             // the loop variable is scoped to the loop
             let mark = b.locals.len();
             b.bind(var.clone(), i, Type::I32);
@@ -529,7 +544,7 @@ fn lower_stmt(
             b.switch(body_bb);
             lower_block(b, body, Some(exit), Some(incr));
             if matches!(
-                b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term),
+                b.blocks.get(b.current.0 as usize).map(|bb| &bb.term),
                 Some(Terminator::Unreachable)
             ) {
                 b.set_term(Terminator::Jump { target: incr });
@@ -571,26 +586,30 @@ fn lower_stmt(
         }
         HirStmt::Match {
             scrutinee, arms, ..
-        } => lower_match(b, scrutinee, arms, break_bb, continue_bb),
+        } => {
+            lower_match(b, scrutinee, arms, None, break_bb, continue_bb);
+        }
     }
 }
 
 /// True when the current block has no terminator yet (fell through).
 fn current_is_open(b: &Builder) -> bool {
     matches!(
-        b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term),
+        b.blocks.get(b.current.0 as usize).map(|bb| &bb.term),
         Some(Terminator::Unreachable)
     )
 }
 
-/// `match`: the enum tag (field 0) or the scalar itself is compared against
-/// each arm in order, as a chain of `Branch`es; payload bindings are
-/// `FieldLoad`s of slots `1..` into fresh registers scoped to the arm. All
-/// arms jump to a common join block.
+/// `match`: arms are tried in order. Each arm's pattern is lowered to a
+/// chain of tests (`Branch`es to the next arm on failure) and bindings
+/// (`FieldLoad`s into fresh registers scoped to the arm); all arms jump to a
+/// common join block. With `result` (a `match` expression) every arm moves
+/// its tail value there.
 fn lower_match(
     b: &mut Builder,
     scrutinee: &HirExpr,
     arms: &[HirArm],
+    result: Option<Reg>,
     break_bb: Option<BlockId>,
     continue_bb: Option<BlockId>,
 ) {
@@ -599,8 +618,8 @@ fn lower_match(
     // register when it is a plain local.
     let value = b.alloc_reg();
     b.emit(Inst::Move { dest: value, src: s });
-    let is_enum = matches!(scrutinee.ty, Type::Enum { .. });
-    let tag = if is_enum {
+    // The tag of an enum scrutinee is read once for all the arms.
+    let tag = if matches!(scrutinee.ty, Type::Enum { .. }) {
         let t = b.alloc_reg();
         b.emit(Inst::FieldLoad {
             dest: t,
@@ -615,90 +634,20 @@ fn lower_match(
     let join = b.new_block();
     for arm in arms {
         let mark = b.locals.len();
-        let next = match &arm.pattern {
-            HirPattern::Wildcard => None,
-            HirPattern::Binding { name, ty } => {
-                let r = b.alloc_reg();
-                b.emit(Inst::Move { dest: r, src: value });
-                b.bind(name.clone(), r, ty.clone());
-                None
-            }
-            HirPattern::Literal { lit, ty } => {
-                let c = b.alloc_reg();
-                b.emit(Inst::LoadConst {
-                    dest: c,
-                    value: lit_to_const(lit, ty),
-                });
-                let cond = b.alloc_reg();
-                b.emit(Inst::Bin {
-                    dest: cond,
-                    op: BinOp::Eq,
-                    ty: ty.clone(),
-                    lhs: value,
-                    rhs: c,
-                });
-                let arm_bb = b.new_block();
-                let next = b.new_block();
-                b.set_term(Terminator::Branch {
-                    cond,
-                    then_bb: arm_bb,
-                    else_bb: next,
-                });
-                b.switch(arm_bb);
-                Some(next)
-            }
-            HirPattern::Variant { tag: want, fields } => {
-                let next = match tag {
-                    Some(tag) => {
-                        let c = b.alloc_reg();
-                        b.emit(Inst::LoadConst {
-                            dest: c,
-                            value: ConstValue::I32(*want as i32),
-                        });
-                        let cond = b.alloc_reg();
-                        b.emit(Inst::Bin {
-                            dest: cond,
-                            op: BinOp::Eq,
-                            ty: Type::I32,
-                            lhs: tag,
-                            rhs: c,
-                        });
-                        let arm_bb = b.new_block();
-                        let next = b.new_block();
-                        b.set_term(Terminator::Branch {
-                            cond,
-                            then_bb: arm_bb,
-                            else_bb: next,
-                        });
-                        b.switch(arm_bb);
-                        Some(next)
-                    }
-                    None => None,
-                };
-                for (i, field) in fields.iter().enumerate() {
-                    if let Some((name, ty)) = field {
-                        let r = b.alloc_reg();
-                        b.emit(Inst::FieldLoad {
-                            dest: r,
-                            base: value,
-                            index: i + 1,
-                            ty: ty.clone(),
-                        });
-                        b.bind(name.clone(), r, ty.clone());
-                    }
-                }
-                next
-            }
-        };
-        lower_block(b, &arm.body, break_bb, continue_bb);
+        let mut next = None;
+        lower_pattern(b, &arm.pattern, value, tag, &mut next);
+        let tail = lower_block(b, &arm.body, break_bb, continue_bb);
         b.unbind_to(mark);
+        if let (Some(dest), Some(src)) = (result, tail) {
+            b.emit(Inst::Move { dest, src });
+        }
         if current_is_open(b) {
             b.set_term(Terminator::Jump { target: join });
         }
         match next {
             Some(next) => b.switch(next),
             None => {
-                // catch-all arm: the remaining arms are unreachable
+                // irrefutable arm: the remaining arms are unreachable
                 let dead = b.new_block();
                 b.switch(dead);
                 break;
@@ -712,10 +661,148 @@ fn lower_match(
     b.switch(join);
 }
 
+/// Lowers a `match` used as a value; its arms may `break` / `continue` the
+/// enclosing loop.
+fn lower_match_expr(b: &mut Builder, expr: &HirExpr, scrutinee: &HirExpr, arms: &[HirArm]) -> Reg {
+    let dest = b.alloc_reg();
+    // Defined on every path, including the unreachable fall-through.
+    b.emit(Inst::LoadConst {
+        dest,
+        value: default_const(&expr.ty),
+    });
+    let (brk, cont) = b.loop_ctx;
+    lower_match(b, scrutinee, arms, Some(dest), brk, cont);
+    dest
+}
+
+/// Emits the tests and bindings of `pat` against the value in `value`
+/// (of type `ty`). A failing test branches to `*next`, created on first use;
+/// it stays `None` when the pattern cannot fail.
+fn lower_pattern(
+    b: &mut Builder,
+    pat: &HirPattern,
+    value: Reg,
+    known_tag: Option<Reg>,
+    next: &mut Option<BlockId>,
+) {
+    match pat {
+        HirPattern::Wildcard => {}
+        HirPattern::Binding { name, ty } => {
+            let r = b.alloc_reg();
+            b.emit(Inst::Move { dest: r, src: value });
+            b.bind(name.clone(), r, ty.clone());
+        }
+        HirPattern::Literal { lit, ty } => {
+            if *lit == Literal::Unit {
+                return;
+            }
+            let c = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest: c,
+                value: lit_to_const(lit, ty),
+            });
+            let cond = b.alloc_reg();
+            b.emit(Inst::Bin {
+                dest: cond,
+                op: BinOp::Eq,
+                ty: ty.clone(),
+                lhs: value,
+                rhs: c,
+            });
+            branch_or_next(b, cond, next);
+        }
+        HirPattern::Variant {
+            tag,
+            variants,
+            fields,
+            tys,
+        } => {
+            if *variants > 1 {
+                let t = known_tag.unwrap_or_else(|| {
+                    let t = b.alloc_reg();
+                    b.emit(Inst::FieldLoad {
+                        dest: t,
+                        base: value,
+                        index: 0,
+                        ty: Type::I32,
+                    });
+                    t
+                });
+                let c = b.alloc_reg();
+                b.emit(Inst::LoadConst {
+                    dest: c,
+                    value: ConstValue::I32(*tag as i32),
+                });
+                let cond = b.alloc_reg();
+                b.emit(Inst::Bin {
+                    dest: cond,
+                    op: BinOp::Eq,
+                    ty: Type::I32,
+                    lhs: t,
+                    rhs: c,
+                });
+                branch_or_next(b, cond, next);
+            }
+            lower_subpatterns(b, fields, tys, 1, value, next);
+        }
+        HirPattern::Tuple { elems, tys } => {
+            lower_subpatterns(b, elems, tys, 0, value, next);
+        }
+    }
+}
+
+/// Sub-patterns of an aggregate: the one for field `first + i` is loaded
+/// only when it tests or binds something.
+fn lower_subpatterns(
+    b: &mut Builder,
+    pats: &[HirPattern],
+    tys: &[Type],
+    first: usize,
+    value: Reg,
+    next: &mut Option<BlockId>,
+) {
+    for (i, (p, fty)) in pats.iter().zip(tys).enumerate() {
+        if matches!(p, HirPattern::Wildcard) {
+            continue;
+        }
+        let r = b.alloc_reg();
+        b.emit(Inst::FieldLoad {
+            dest: r,
+            base: value,
+            index: first + i,
+            ty: fty.clone(),
+        });
+        match p {
+            // bind the loaded register itself, no copy
+            HirPattern::Binding { name, ty } => b.bind(name.clone(), r, ty.clone()),
+            _ => lower_pattern(b, p, r, None, next),
+        }
+    }
+}
+
+/// Continues in a fresh block when `cond` holds, else goes to `*next`.
+fn branch_or_next(b: &mut Builder, cond: Reg, next: &mut Option<BlockId>) {
+    let ok = b.new_block();
+    let fail = match *next {
+        Some(n) => n,
+        None => {
+            let n = b.new_block();
+            *next = Some(n);
+            n
+        }
+    };
+    b.set_term(Terminator::Branch {
+        cond,
+        then_bb: ok,
+        else_bb: fail,
+    });
+    b.switch(ok);
+}
+
 /// `==` on tuples, enums and structs is elementwise: a short-circuit chain
 /// that compares the tag (enums) and each payload slot / element / field
 /// with the comparison of its own type, recursively. (The VM has no
-/// object comparison opcode; arrays keep the backend's own `==`.)
+/// object comparison opcode; arrays compare with an index loop.)
 fn lower_agg_eq(b: &mut Builder, lhs: Reg, rhs: Reg, ty: &Type) -> Reg {
     let dest = b.alloc_reg();
     match ty {
@@ -799,6 +886,74 @@ fn lower_agg_eq(b: &mut Builder, lhs: Reg, rhs: Reg, ty: &Type) -> Reg {
             }
             // payload-less variant: tags were equal, so the values are equal
             b.set_term(Terminator::Jump { target: join });
+            b.switch(join);
+        }
+        Type::Array { elem, len } => {
+            // a loop over the index: stops at the first differing element
+            b.emit(Inst::LoadConst {
+                dest,
+                value: ConstValue::Bool(true),
+            });
+            let i = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest: i,
+                value: ConstValue::I32(0),
+            });
+            let limit = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest: limit,
+                value: ConstValue::I32(*len as i32),
+            });
+            let header = b.new_block();
+            let body = b.new_block();
+            let step = b.new_block();
+            let join = b.new_block();
+            b.set_term(Terminator::Jump { target: header });
+            b.switch(header);
+            let more = b.alloc_reg();
+            b.emit(Inst::Bin {
+                dest: more,
+                op: BinOp::Lt,
+                ty: Type::I32,
+                lhs: i,
+                rhs: limit,
+            });
+            b.set_term(Terminator::Branch {
+                cond: more,
+                then_bb: body,
+                else_bb: join,
+            });
+            b.switch(body);
+            let (l, r) = (b.alloc_reg(), b.alloc_reg());
+            for (d, base) in [(l, lhs), (r, rhs)] {
+                b.emit(Inst::IndexLoad {
+                    dest: d,
+                    base,
+                    index: i,
+                    elem: (**elem).clone(),
+                });
+            }
+            let eq = lower_agg_eq(b, l, r, elem);
+            b.emit(Inst::Move { dest, src: eq });
+            b.set_term(Terminator::Branch {
+                cond: eq,
+                then_bb: step,
+                else_bb: join,
+            });
+            b.switch(step);
+            let one = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest: one,
+                value: ConstValue::I32(1),
+            });
+            b.emit(Inst::Bin {
+                dest: i,
+                op: BinOp::Add,
+                ty: Type::I32,
+                lhs: i,
+                rhs: one,
+            });
+            b.set_term(Terminator::Jump { target: header });
             b.switch(join);
         }
         other => {
@@ -897,6 +1052,45 @@ fn write_back(b: &mut Builder, base: &HirExpr, reg: Reg) {
     }
 }
 
+/// Lowers operands left to right. A bare local's register is the variable
+/// itself, so when a later operand contains a `match` (whose arms may assign
+/// that variable) the value is copied first.
+fn lower_seq(b: &mut Builder, es: &[&HirExpr]) -> Vec<Reg> {
+    let mut regs = Vec::with_capacity(es.len());
+    for (i, e) in es.iter().enumerate() {
+        let mut r = lower_expr(b, e);
+        if matches!(e.kind, HirExprKind::Local(_)) && es[i + 1..].iter().any(|x| contains_match(x)) {
+            let t = b.alloc_reg();
+            b.emit(Inst::Move { dest: t, src: r });
+            r = t;
+        }
+        regs.push(r);
+    }
+    regs
+}
+
+fn lower_pair(b: &mut Builder, l: &HirExpr, r: &HirExpr) -> (Reg, Reg) {
+    let regs = lower_seq(b, &[l, r]);
+    (regs[0], regs[1])
+}
+
+fn contains_match(e: &HirExpr) -> bool {
+    match &e.kind {
+        HirExprKind::Match { .. } => true,
+        HirExprKind::Literal(_) | HirExprKind::Local(_) => false,
+        HirExprKind::Binary { lhs, rhs, .. } => contains_match(lhs) || contains_match(rhs),
+        HirExprKind::Unary { expr, .. } | HirExprKind::Cast { expr, .. } => contains_match(expr),
+        HirExprKind::Call { args, .. } => args.iter().any(contains_match),
+        HirExprKind::Index { base, index } => contains_match(base) || contains_match(index),
+        HirExprKind::Field { base, .. } => contains_match(base),
+        HirExprKind::Array { elements } | HirExprKind::Tuple { elements } => {
+            elements.iter().any(contains_match)
+        }
+        HirExprKind::StructLit { fields, .. } => fields.iter().any(|(_, e)| contains_match(e)),
+        HirExprKind::EnumLit { args, .. } => args.iter().any(contains_match),
+    }
+}
+
 fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
     match &expr.kind {
         HirExprKind::Literal(lit) => {
@@ -946,10 +1140,12 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
         }
         HirExprKind::Binary { op, lhs, rhs }
             if matches!(op, BinOp::Eq | BinOp::Ne)
-                && matches!(lhs.ty, Type::Tuple(_) | Type::Enum { .. } | Type::Struct { .. }) =>
+                && matches!(
+                    lhs.ty,
+                    Type::Tuple(_) | Type::Enum { .. } | Type::Struct { .. } | Type::Array { .. }
+                ) =>
         {
-            let l = lower_expr(b, lhs);
-            let r = lower_expr(b, rhs);
+            let (l, r) = lower_pair(b, lhs, rhs);
             let eq = lower_agg_eq(b, l, r, &lhs.ty);
             if *op == BinOp::Eq {
                 eq
@@ -965,8 +1161,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
             }
         }
         HirExprKind::Binary { op, lhs, rhs } => {
-            let l = lower_expr(b, lhs);
-            let r = lower_expr(b, rhs);
+            let (l, r) = lower_pair(b, lhs, rhs);
             let dest = b.alloc_reg();
             b.emit(Inst::Bin {
                 dest,
@@ -989,7 +1184,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
             dest
         }
         HirExprKind::Call { name, args } => {
-            let regs: Vec<Reg> = args.iter().map(|a| lower_expr(b, a)).collect();
+            let regs = lower_seq(b, &args.iter().collect::<Vec<_>>());
             let dest = if expr.ty == Type::Unit {
                 None
             } else {
@@ -1010,8 +1205,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
             })
         }
         HirExprKind::Index { base, index } => {
-            let br = lower_expr(b, base);
-            let ir = lower_expr(b, index);
+            let (br, ir) = lower_pair(b, base, index);
             let dest = b.alloc_reg();
             b.emit(Inst::IndexLoad {
                 dest,
@@ -1123,6 +1317,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
             }
             dest
         }
+        HirExprKind::Match { scrutinee, arms } => lower_match_expr(b, expr, scrutinee, arms),
         HirExprKind::Cast { expr: inner, to } => {
             let s = lower_expr(b, inner);
             let dest = b.alloc_reg();

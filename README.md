@@ -67,6 +67,9 @@ Binary: `target/release/aether`.
 
 ```bash
 aether run examples/fib.ae -O2 --stats --timings
+aether run examples/fib.ae --include stdlib/prelude.ae   # multi-file (also AETHER_INCLUDE=a.ae:b.ae)
+aether run examples/loops.ae --max-steps 100000 --max-depth 512
+aether run examples/hello.ae --backend llvm              # needs `lli` on PATH
 aether check examples/hello.ae
 aether dump-ir examples/opt_demo.ae --unopt
 aether dump-ir examples/opt_demo.ae -O2
@@ -80,7 +83,8 @@ aether profile examples/fib.ae -O2
 aether digest examples/fib.ae -O2
 aether dump-hir examples/hello.ae
 aether dump-liveness examples/fib.ae -O2
-aether repl
+aether bench examples/fib.ae --n 5                       # -O0 vs -O2 on a file
+aether repl                                              # stateful: :items :reset :quit
 aether benchmark --n 20
 aether fuzz --kind diff --iters 200
 aether fuzz --kind agg --iters 200
@@ -88,8 +92,9 @@ aether fuzz --kind greybox --iters 40
 aether fuzz --kind format --iters 80
 ```
 
-Exit codes: `0` ok, `1` compile error, `2` runtime error. On a runtime error
-the stdout produced so far is printed before `runtime error: ...`.
+Exit codes: `0` ok, `1` compile error, `2` runtime error (including an
+exceeded `--max-steps` / `--max-depth`). On a runtime error the stdout
+produced so far is printed before `runtime error: ...`.
 
 Full tool list: [`docs/tools.md`](docs/tools.md) · [`docs/cli.md`](docs/cli.md).
 

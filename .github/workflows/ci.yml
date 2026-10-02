@@ -17,6 +17,7 @@ jobs:
         run: |
           cargo run --quiet -- run examples/hello.ae
           cargo run --quiet -- run examples/fib.ae
+          cargo run --quiet -- run examples/fib.ae --include stdlib/prelude.ae
           cargo run --quiet -- run examples/opaque.ae -O2
           cargo run --quiet -- run stdlib/math.ae
           cargo run --quiet -- optimize examples/opt_demo.ae
@@ -26,3 +27,4 @@ jobs:
           cargo run --quiet -- fuzz --iters 40 --kind all --seed 1
           cargo run --quiet -- fuzz --iters 20 --kind format --seed 2
           cargo run --quiet -- fuzz --iters 16 --kind greybox --seed 3
+          cargo run --quiet -- fuzz --iters 40 --kind agg --seed 4

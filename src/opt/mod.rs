@@ -189,6 +189,9 @@ fn fold_cmp<T: PartialOrd>(op: BinOp, a: T, b: T) -> Option<ConstValue> {
 
 /// Integer arithmetic wraps, exactly like the VM (`i32::MIN / -1` included).
 /// Division by zero is left to the VM, which reports it at runtime.
+/// Shift amounts are masked to the bit width (`b & 31` for `i32`, `b & 63`
+/// for `i64`), so shifting by the width or by a negative amount never traps;
+/// `>>` is arithmetic (sign-filling). The VM must do the same.
 fn fold_bin(op: BinOp, _ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option<ConstValue> {
     use ConstValue::*;
     match (op, lhs, rhs) {
@@ -197,11 +200,21 @@ fn fold_bin(op: BinOp, _ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option
         (BinOp::Mul, I32(a), I32(b)) => Some(I32(a.wrapping_mul(*b))),
         (BinOp::Div, I32(a), I32(b)) if *b != 0 => Some(I32(a.wrapping_div(*b))),
         (BinOp::Rem, I32(a), I32(b)) if *b != 0 => Some(I32(a.wrapping_rem(*b))),
+        (BinOp::BitAnd, I32(a), I32(b)) => Some(I32(a & b)),
+        (BinOp::BitOr, I32(a), I32(b)) => Some(I32(a | b)),
+        (BinOp::BitXor, I32(a), I32(b)) => Some(I32(a ^ b)),
+        (BinOp::Shl, I32(a), I32(b)) => Some(I32(a.wrapping_shl((*b & 31) as u32))),
+        (BinOp::Shr, I32(a), I32(b)) => Some(I32(a.wrapping_shr((*b & 31) as u32))),
         (BinOp::Add, I64(a), I64(b)) => Some(I64(a.wrapping_add(*b))),
         (BinOp::Sub, I64(a), I64(b)) => Some(I64(a.wrapping_sub(*b))),
         (BinOp::Mul, I64(a), I64(b)) => Some(I64(a.wrapping_mul(*b))),
         (BinOp::Div, I64(a), I64(b)) if *b != 0 => Some(I64(a.wrapping_div(*b))),
         (BinOp::Rem, I64(a), I64(b)) if *b != 0 => Some(I64(a.wrapping_rem(*b))),
+        (BinOp::BitAnd, I64(a), I64(b)) => Some(I64(a & b)),
+        (BinOp::BitOr, I64(a), I64(b)) => Some(I64(a | b)),
+        (BinOp::BitXor, I64(a), I64(b)) => Some(I64(a ^ b)),
+        (BinOp::Shl, I64(a), I64(b)) => Some(I64(a.wrapping_shl((*b & 63) as u32))),
+        (BinOp::Shr, I64(a), I64(b)) => Some(I64(a.wrapping_shr((*b & 63) as u32))),
         (BinOp::Add, F64(a), F64(b)) => Some(F64(a + b)),
         (BinOp::Sub, F64(a), F64(b)) => Some(F64(a - b)),
         (BinOp::Mul, F64(a), F64(b)) => Some(F64(a * b)),
@@ -227,6 +240,9 @@ fn fold_un(op: UnOp, src: &ConstValue) -> Option<ConstValue> {
         (UnOp::Neg, ConstValue::I64(v)) => Some(ConstValue::I64(v.wrapping_neg())),
         (UnOp::Neg, ConstValue::F64(v)) => Some(ConstValue::F64(-v)),
         (UnOp::Not, ConstValue::Bool(v)) => Some(ConstValue::Bool(!v)),
+        // `!` on integers is bitwise not
+        (UnOp::Not, ConstValue::I32(v)) => Some(ConstValue::I32(!v)),
+        (UnOp::Not, ConstValue::I64(v)) => Some(ConstValue::I64(!v)),
         _ => None,
     }
 }
@@ -358,6 +374,34 @@ pub fn pass_algebraic(module: &mut IrModule) {
                                 dest,
                                 value: ConstValue::Bool(false),
                             })
+                        }
+                        // x ^ x → 0; x & x → x; x | x → x
+                        (BinOp::BitXor, _, _) if same && is_int => {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::BitAnd, _, _) | (BinOp::BitOr, _, _) if same && is_int => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        // x & 0 → 0; x | 0 → x; x ^ 0 → x; x << 0 → x; x >> 0 → x
+                        (BinOp::BitAnd, _, Some(c)) | (BinOp::BitAnd, Some(c), _)
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::BitOr, _, Some(c)) | (BinOp::BitXor, _, Some(c))
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::BitOr, Some(c), _) | (BinOp::BitXor, Some(c), _)
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::Move { dest, src: rhs })
+                        }
+                        (BinOp::Shl, _, Some(c)) | (BinOp::Shr, _, Some(c))
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::Move { dest, src: lhs })
                         }
                         (BinOp::Add, _, Some(c)) if is_int && is_int_const(c, 0) => {
                             Some(Inst::Move { dest, src: lhs })
@@ -696,6 +740,75 @@ mod tests {
         let text = dump_ir(&opt);
         assert!(text.contains("const 3_i32"), "{text}\n{}", report.summary());
         assert!(!text.contains("add.i32"), "{text}");
+    }
+
+    #[test]
+    fn folds_bitwise_and_shift_constants() {
+        for (expr, want) in [
+            ("0xFF & 0b1010", "10_i32"),
+            ("0xF0 | 0x0F", "255_i32"),
+            ("0xFF ^ 0x0F", "240_i32"),
+            ("1 << 4", "16_i32"),
+            ("-16 >> 2", "-4_i32"),
+            ("!0", "-1_i32"),
+            ("1 << 32", "1_i32"),  // amount masked to 5 bits
+            ("1 << -1", "-2147483648_i32"),  // -1 & 31 == 31
+            ("1 << 31", "-2147483648_i32"),
+            ("(0 - 1) >> 31", "-1_i32"),
+        ] {
+            let ir = compile_ir(&format!("fn main() -> i32 {{ return {expr}; }}"));
+            let (opt, _) = optimize(ir, 2);
+            let text = dump_ir(&opt);
+            assert!(text.contains(&format!("const {want}")), "{expr}:\n{text}");
+        }
+        for (expr, want) in [
+            ("1 << 40", "1099511627776_i64"),
+            ("1 << 64", "1_i64"),
+            ("!0", "-1_i64"),
+            ("0x7FFF_FFFF_FFFF_FFFF & 0xFF", "255_i64"),
+        ] {
+            let ir = compile_ir(&format!(
+                "fn main() -> i32 {{ let x: i64 = {expr}; print_i64(x); return 0; }}"
+            ));
+            let (opt, _) = optimize(ir, 2);
+            let text = dump_ir(&opt);
+            assert!(text.contains(&format!("const {want}")), "{expr}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn algebraic_bitwise_identities() {
+        // `x` comes from an extern call, so it is neither constant nor
+        // inlinable: the Bin must disappear through the identity alone.
+        for (body, op_text) in [
+            ("x & 0", "&.i32"),
+            ("0 & x", "&.i32"),
+            ("x | 0", "|.i32"),
+            ("0 | x", "|.i32"),
+            ("x ^ 0", "^.i32"),
+            ("x ^ x", "^.i32"),
+            ("x & x", "&.i32"),
+            ("x | x", "|.i32"),
+            ("x << 0", "<<.i32"),
+            ("x >> 0", ">>.i32"),
+        ] {
+            let ir = compile_ir(&format!(
+                "extern fn opaque() -> i32;\nfn main() -> i32 {{ let x = opaque(); return {body}; }}"
+            ));
+            let (opt, _) = optimize(ir, 2);
+            let text = dump_ir(&opt);
+            assert!(!text.contains(op_text), "{body}:\n{text}");
+        }
+        // not an identity: `x & 1`, `x ^ 1`, `x << 1` stay
+        let ir = compile_ir(
+            "extern fn opaque() -> i32;\nfn main() -> i32 { let x = opaque(); return (x & 1) + (x ^ 1) + (x << 1); }",
+        );
+        let (opt, _) = optimize(ir, 2);
+        let text = dump_ir(&opt);
+        assert!(
+            text.contains("&.i32") && text.contains("^.i32") && text.contains("<<.i32"),
+            "{text}"
+        );
     }
 
     #[test]

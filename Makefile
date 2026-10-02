@@ -1,4 +1,4 @@
-.PHONY: test fuzz examples verify release
+.PHONY: test fuzz examples verify release bench
 
 test:
 	cargo test --offline
@@ -6,6 +6,7 @@ test:
 examples:
 	cargo run --quiet -- run examples/hello.ae
 	cargo run --quiet -- run examples/fib.ae
+	cargo run --quiet -- run examples/fib.ae --include stdlib/prelude.ae
 	cargo run --quiet -- run examples/opaque.ae -O2
 	cargo run --quiet -- run stdlib/math.ae
 	cargo run --quiet -- optimize examples/opt_demo.ae
@@ -20,3 +21,7 @@ verify:
 
 release:
 	cargo build --release
+
+# -O0 vs -O2 on every benchmark program (release build for meaningful µs).
+bench:
+	@for f in benchmarks/*.ae; do cargo run --quiet --release -- bench $$f --n 5 || exit 1; done

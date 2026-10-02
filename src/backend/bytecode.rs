@@ -128,6 +128,17 @@ pub enum Op {
     LoadField { dest: u16, base: u16, field: u8 },
     StoreField { base: u16, field: u8, value: u16 },
     Concat { dest: u16, lhs: u16, rhs: u16 },
+    /// Cooperative scheduling point: `Vm::run_budget` returns `Step::Yielded`
+    /// right after this instruction; `Vm::run` treats it as a no-op.
+    Yield,
+    /// Integer bit operations; the operand kind (i32/i64) is the register's.
+    BitAnd { dest: u16, lhs: u16, rhs: u16 },
+    BitOr { dest: u16, lhs: u16, rhs: u16 },
+    BitXor { dest: u16, lhs: u16, rhs: u16 },
+    /// Shift amount masked to the width (`& 31` / `& 63`); `Shr` is arithmetic.
+    Shl { dest: u16, lhs: u16, rhs: u16 },
+    Shr { dest: u16, lhs: u16, rhs: u16 },
+    NotInt { dest: u16, src: u16 },
     Nop,
 }
 
@@ -239,6 +250,13 @@ impl fmt::Display for Op {
                 write!(f, "storefld r{base}.{field}, r{value}")
             }
             Op::Concat { dest, lhs, rhs } => write!(f, "concat r{dest}, r{lhs}, r{rhs}"),
+            Op::Yield => write!(f, "yield"),
+            Op::BitAnd { dest, lhs, rhs } => write!(f, "band r{dest}, r{lhs}, r{rhs}"),
+            Op::BitOr { dest, lhs, rhs } => write!(f, "bor r{dest}, r{lhs}, r{rhs}"),
+            Op::BitXor { dest, lhs, rhs } => write!(f, "bxor r{dest}, r{lhs}, r{rhs}"),
+            Op::Shl { dest, lhs, rhs } => write!(f, "shl r{dest}, r{lhs}, r{rhs}"),
+            Op::Shr { dest, lhs, rhs } => write!(f, "shr r{dest}, r{lhs}, r{rhs}"),
+            Op::NotInt { dest, src } => write!(f, "bnot r{dest}, r{src}"),
             Op::Nop => write!(f, "nop"),
         }
     }
@@ -258,20 +276,16 @@ pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
         }
     };
 
-    // built-in natives first so user functions follow
-    let natives: &[(&str, u16)] = &[
-        ("print", 0),
-        ("println", 1),
-        ("print_i32", 2),
-        ("print_i64", 3),
-        ("print_f64", 4),
-        ("print_bool", 5),
-        ("len", 6),
-        ("assert", 7),
-    ];
+    // built-in natives first so user functions follow; the id is the index
+    // in `runtime::NATIVES`
+    let natives: Vec<(&str, u16)> = crate::runtime::NATIVES
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (*n, i as u16))
+        .collect();
 
     let mut functions: Vec<BcFunction> = Vec::new();
-    for (name, id) in natives {
+    for (name, id) in &natives {
         functions.push(BcFunction {
             name: name.to_string(),
             arity: 1,
@@ -286,10 +300,8 @@ pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
     for (i, f) in functions.iter().enumerate() {
         name_to_idx.insert(f.name.clone(), i as u32);
     }
+    // A user function with a built-in's name shadows the native (sema agrees).
     for f in &module.functions {
-        if name_to_idx.contains_key(&f.name) {
-            continue;
-        }
         let idx = functions.len() as u32;
         name_to_idx.insert(f.name.clone(), idx);
         functions.push(BcFunction {
@@ -484,6 +496,11 @@ fn emit_inst(
                 (BinOp::Eq, Type::Bool) => Op::CmpEqBool { dest: d, lhs: l, rhs: r },
                 (BinOp::And, Type::Bool) => Op::AndBool { dest: d, lhs: l, rhs: r },
                 (BinOp::Or, Type::Bool) => Op::OrBool { dest: d, lhs: l, rhs: r },
+                (BinOp::BitAnd, Type::I32 | Type::I64) => Op::BitAnd { dest: d, lhs: l, rhs: r },
+                (BinOp::BitOr, Type::I32 | Type::I64) => Op::BitOr { dest: d, lhs: l, rhs: r },
+                (BinOp::BitXor, Type::I32 | Type::I64) => Op::BitXor { dest: d, lhs: l, rhs: r },
+                (BinOp::Shl, Type::I32 | Type::I64) => Op::Shl { dest: d, lhs: l, rhs: r },
+                (BinOp::Shr, Type::I32 | Type::I64) => Op::Shr { dest: d, lhs: l, rhs: r },
                 // Remaining comparisons sema accepts: i64/f64 Ne/Le/Gt/Ge,
                 // bool Ne, every char ordering, string Eq/Ne.
                 (BinOp::Ne | BinOp::Le | BinOp::Gt | BinOp::Ge, Type::I64 | Type::F64)
@@ -507,6 +524,7 @@ fn emit_inst(
                 (UnOp::Neg, Type::I64) => code.push(Op::NegI64 { dest: d, src: s }),
                 (UnOp::Neg, Type::F64) => code.push(Op::NegF64 { dest: d, src: s }),
                 (UnOp::Not, Type::Bool) => code.push(Op::NotBool { dest: d, src: s }),
+                (UnOp::Not, Type::I32 | Type::I64) => code.push(Op::NotInt { dest: d, src: s }),
                 _ => {
                     return Err(format!(
                         "unsupported operation `{}` on `{ty}`",
@@ -527,7 +545,7 @@ fn emit_inst(
                 Some(r) => Some(reg(*r, fname)?),
                 None => None,
             };
-            if idx < 8 {
+            if (idx as usize) < crate::runtime::NATIVES.len() {
                 code.push(Op::CallNative {
                     id: idx as u16,
                     dest: dest_opt,

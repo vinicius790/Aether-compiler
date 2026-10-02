@@ -5,14 +5,15 @@ Tudo vive no binário `aether` ou em `src/fuzz`. Não há crates extra.
 | Comando | Função |
 |---------|--------|
 | `check` | só semântica |
-| `run` | compila e executa na VM |
+| `run [--backend vm\|llvm]` | compila e executa na VM (ou via `lli`) |
 | `compile --emit ir\|bytecode\|llvm` | artefactos |
 | `dump-tokens / dump-ast / dump-ir / dump-bytecode / dump-llvm` | inspecção |
 | `optimize` | relatório antes/depois dos passes |
 | `fmt` | pretty-print a partir da AST |
 | `cfg` | Graphviz DOT do CFG da IR |
 | `verify` | verificador estrutural da IR |
-| `repl` | ciclo ler–compilar–correr |
+| `repl` | ciclo ler–compilar–correr com definições persistentes (`:items`, `:reset`, `:quit`) |
+| `bench FILE [--n N]` | `-O0` vs `-O2` sobre um ficheiro: µs min/mediana, passos da VM, instruções IR, speedup |
 | `benchmark` | `fib(n)` O0 vs O2 |
 | `fuzz` | propriedades, mutação, greybox, formato |
 | `dump-hir FILE` | HIR tipada |
@@ -21,6 +22,17 @@ Tudo vive no binário `aether` ou em `src/fuzz`. Não há crates extra.
 | `profile FILE [-On]` | contagem de chamadas + digest da execução |
 | `digest FILE [-On]` | impressão digital determinística de stdout + valor |
 
-Códigos de saída: `0` ok, `1` erro de compilação, `2` erro de runtime.
+Opções transversais (detalhe em [`cli.md`](cli.md)):
+
+| Opção | Efeito |
+|-------|--------|
+| `--include FILE` (repetível) / `AETHER_INCLUDE=a.ae:b.ae` | vários ficheiros num só programa |
+| `--max-steps N` / `--max-depth N` | limites da VM em `run`, `profile`, `digest`, `bench` |
+| `--backend vm\|llvm` | motor de `run` |
+
+Códigos de saída: `0` ok, `1` erro de compilação, `2` erro de runtime
+(incluindo limites da VM excedidos).
+
+`make bench` corre `aether bench` sobre `benchmarks/*.ae`.
 
 Fuzz kinds: `all`, `lexer`, `parser`, `pipeline`, `gen`, `diff`, `agg` (alias `aggregate`), `mut`, `struct`, `aspect`, `mir`, `greybox`, `format`. `all` inclui `agg`.

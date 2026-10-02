@@ -9,10 +9,19 @@ use crate::opt::{optimize, OptReport};
 use crate::parser::parse;
 use crate::sema::{analyze, HirProgram};
 use crate::span::{FileId, Session, Span};
-use crate::token::Token;
-use crate::vm::{run_captured, Value, VmError};
+use crate::token::{Token, TokenKind};
+use crate::vm::{Value, Vm, VmError, VmOptions};
 use std::fmt;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Environment variable holding a colon-separated list of files that are
+/// included in every compilation (same effect as repeating `--include`).
+pub const INCLUDE_ENV: &str = "AETHER_INCLUDE";
+
+/// Largest source file the driver accepts, per file.
+pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -57,6 +66,7 @@ impl StageTimings {
 
 pub struct Compiled {
     pub session: Session,
+    /// The main (first) source file; included files follow it in the session.
     pub file: FileId,
     pub tokens: Vec<Token>,
     pub program: Program,
@@ -92,21 +102,48 @@ impl fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// Compile a single in-memory source file.
 pub fn compile_source(name: &str, source: &str, opts: &CompileOptions) -> Compiled {
+    compile_sources(vec![(name.to_string(), source.to_string())], opts)
+}
+
+/// Compile several in-memory files as one program. The first entry is the
+/// main file; every file gets its own [`FileId`] in the session and is lexed
+/// separately so diagnostics point at the right file, then the token streams
+/// are concatenated (dropping every `Eof` but the last) and parsed once.
+/// Duplicate item names across files surface through the usual sema errors.
+pub fn compile_sources(files: Vec<(String, String)>, opts: &CompileOptions) -> Compiled {
+    let mut files = files;
+    if files.is_empty() {
+        files.push(("<empty>".to_string(), String::new()));
+    }
     let mut session = Session::new();
-    let file = session.add_file(name.to_string(), source.to_string());
     let mut timings = StageTimings::default();
+    let mut diags = Diagnostics::new();
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut file = FileId::DUMMY;
 
     let t0 = Instant::now();
-    let (tokens, lex_diags) = tokenize(file, source);
+    let last = files.len() - 1;
+    for (i, (name, source)) in files.into_iter().enumerate() {
+        let id = session.add_file(name, source);
+        if i == 0 {
+            file = id;
+        }
+        let src = &session.file(id).expect("file just added").source;
+        let (mut toks, lex_diags) = tokenize(id, src);
+        if i != last {
+            toks.retain(|t| t.kind != TokenKind::Eof);
+        }
+        tokens.extend(toks);
+        diags.extend(lex_diags);
+    }
     timings.lex_us = t0.elapsed().as_micros();
 
     let t1 = Instant::now();
     let (program, parse_diags) = parse(tokens.clone());
     timings.parse_us = t1.elapsed().as_micros();
 
-    let mut diags = Diagnostics::new();
-    diags.extend(lex_diags);
     diags.extend(parse_diags);
 
     if diags.has_errors() {
@@ -197,17 +234,80 @@ fn assemble_error_span(ir: &IrModule, msg: &str) -> Span {
         .unwrap_or(Span::DUMMY)
 }
 
+/// Compile one file from disk (no includes).
 pub fn compile_file(path: &str, opts: &CompileOptions) -> Result<Compiled, String> {
+    compile_files(path, &[], opts)
+}
+
+/// Compile `main` together with `includes` (all paths on disk) as one
+/// program. Files are read in order; a missing or oversized file is an
+/// error before anything is compiled.
+pub fn compile_files(
+    main: &str,
+    includes: &[String],
+    opts: &CompileOptions,
+) -> Result<Compiled, String> {
+    let mut files = Vec::with_capacity(includes.len() + 1);
+    files.push((main.to_string(), read_source(main)?));
+    for inc in includes {
+        files.push((inc.clone(), read_source(inc)?));
+    }
+    Ok(compile_sources(files, opts))
+}
+
+fn read_source(path: &str) -> Result<String, String> {
     let source = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    if source.len() > 8 * 1024 * 1024 {
+    if source.len() > MAX_FILE_BYTES {
         return Err(format!(
             "refusing to compile {path}: file is larger than 8 MiB"
         ));
     }
-    Ok(compile_source(path, &source, opts))
+    Ok(source)
 }
 
+/// Include paths taken from the `AETHER_INCLUDE` environment variable
+/// (colon-separated; empty entries are skipped).
+pub fn default_includes() -> Vec<String> {
+    std::env::var(INCLUDE_ENV)
+        .map(|v| parse_include_list(&v))
+        .unwrap_or_default()
+}
+
+/// Split a colon-separated include list, dropping blank entries.
+pub fn parse_include_list(list: &str) -> Vec<String> {
+    list.split(':')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// Thread-safe byte sink for the VM's stdout; the buffer stays readable
+/// after the VM is dropped so partial output survives a runtime error.
+struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Run the compiled program on the VM with default limits.
 pub fn run_compiled(c: &mut Compiled) -> Result<(Value, String, u64), RunError> {
+    run_compiled_with(c, VmOptions::default())
+}
+
+/// Run the compiled program on the VM with explicit [`VmOptions`] (step and
+/// call-depth limits, tracing). Stdout is captured; on failure the partial
+/// output and the step count are returned inside [`RunError`].
+pub fn run_compiled_with(
+    c: &mut Compiled,
+    vm_opts: VmOptions,
+) -> Result<(Value, String, u64), RunError> {
     let Some(bc) = c.bytecode.as_ref() else {
         return Err(RunError {
             error: VmError::MissingMain,
@@ -215,9 +315,13 @@ pub fn run_compiled(c: &mut Compiled) -> Result<(Value, String, u64), RunError> 
             steps: 0,
         });
     };
+    let slot = Arc::new(Mutex::new(Vec::new()));
     let t = Instant::now();
-    let (result, stdout, steps) = run_captured(bc);
+    let mut vm = Vm::new(bc, vm_opts).with_stdout(Box::new(SharedSink(slot.clone())));
+    let result = vm.run();
+    let steps = vm.steps();
     c.timings.exec_us = t.elapsed().as_micros();
+    let stdout = String::from_utf8_lossy(&slot.lock().unwrap()).into_owned();
     match result {
         Ok(val) => Ok((val, stdout, steps)),
         Err(error) => Err(RunError {
@@ -226,6 +330,19 @@ pub fn run_compiled(c: &mut Compiled) -> Result<(Value, String, u64), RunError> 
             steps,
         }),
     }
+}
+
+/// Number of IR instructions in the optimized module (0 without IR).
+pub fn ir_inst_count(c: &Compiled) -> usize {
+    c.ir
+        .as_ref()
+        .map(|m| {
+            m.functions
+                .iter()
+                .map(|f| f.blocks.iter().map(|b| b.insts.len()).sum::<usize>())
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 pub fn dump_tokens(c: &Compiled) -> String {
@@ -289,6 +406,97 @@ mod tests {
         let e = run_compiled(&mut c).unwrap_err();
         assert!(e.to_string().contains("extern"), "{e}");
         assert_eq!(e.stdout, "");
+    }
+
+    #[test]
+    fn compile_sources_links_items_across_files() {
+        let files = vec![
+            (
+                "main.ae".to_string(),
+                "fn main() -> i32 { print_i32(twice(21)); return 0; }".to_string(),
+            ),
+            (
+                "lib.ae".to_string(),
+                "fn twice(x: i32) -> i32 { return x * 2; }".to_string(),
+            ),
+        ];
+        let mut c = compile_sources(files, &CompileOptions::default());
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        assert_eq!(c.file, FileId(0));
+        assert_eq!(c.session.files().len(), 2);
+        // exactly one Eof survives the concatenation, and it is last
+        let eofs = c.tokens.iter().filter(|t| t.kind == TokenKind::Eof).count();
+        assert_eq!(eofs, 1);
+        assert_eq!(c.tokens.last().unwrap().kind, TokenKind::Eof);
+        let (v, out, _) = run_compiled(&mut c).unwrap();
+        assert_eq!(out, "42\n");
+        assert_eq!(v, Value::I32(0));
+    }
+
+    #[test]
+    fn compile_sources_diagnostics_name_the_right_file() {
+        let files = vec![
+            ("main.ae".to_string(), "fn main() -> i32 { return 0; }".to_string()),
+            (
+                "lib.ae".to_string(),
+                "fn broken() -> i32 { return \"s\"; }".to_string(),
+            ),
+        ];
+        let c = compile_sources(files, &CompileOptions::default());
+        assert!(c.diags.has_errors());
+        let text = c.diags.render(&c.session, false);
+        assert!(text.contains("lib.ae"), "{text}");
+        assert!(!text.contains("main.ae"), "{text}");
+    }
+
+    #[test]
+    fn compile_sources_reports_duplicates_across_files() {
+        let files = vec![
+            ("a.ae".to_string(), "fn f() -> i32 { return 1; }\nfn main() -> i32 { return f(); }".to_string()),
+            ("b.ae".to_string(), "fn f() -> i32 { return 2; }".to_string()),
+        ];
+        let c = compile_sources(files, &CompileOptions::default());
+        let text = c.diags.render(&c.session, false);
+        assert!(text.contains("duplicate function `f`"), "{text}");
+        assert!(text.contains("b.ae"), "{text}");
+    }
+
+    #[test]
+    fn run_compiled_with_honours_step_limit_and_keeps_stdout() {
+        let src = "fn main() -> i32 { print_i32(7); let mut i = 0; while i < 100000 { i = i + 1; } return 0; }";
+        let mut c = compile_source("t.ae", src, &CompileOptions::default());
+        assert!(c.ok());
+        let opts = VmOptions {
+            max_steps: 10,
+            ..VmOptions::default()
+        };
+        let e = run_compiled_with(&mut c, opts).unwrap_err();
+        assert!(matches!(e.error, VmError::StepLimit), "{e}");
+        assert_eq!(e.stdout, "7\n");
+        assert_eq!(e.steps, 11);
+    }
+
+    #[test]
+    fn run_compiled_with_honours_depth_limit() {
+        let src = "fn down(n: i32) -> i32 { if n == 0 { return 0; } return down(n - 1); }\nfn main() -> i32 { return down(100); }";
+        let mut c = compile_source("t.ae", src, &CompileOptions::default());
+        assert!(c.ok());
+        let opts = VmOptions {
+            max_call_depth: 5,
+            ..VmOptions::default()
+        };
+        let e = run_compiled_with(&mut c, opts).unwrap_err();
+        assert!(matches!(e.error, VmError::StackOverflow), "{e}");
+        assert!(ir_inst_count(&c) > 0);
+    }
+
+    #[test]
+    fn include_list_splits_on_colons() {
+        assert_eq!(
+            parse_include_list("a.ae::b.ae: "),
+            vec!["a.ae".to_string(), "b.ae".to_string()]
+        );
+        assert!(parse_include_list("").is_empty());
     }
 
     #[test]

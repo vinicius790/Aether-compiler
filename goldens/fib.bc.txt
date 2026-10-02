@@ -16,7 +16,33 @@ fn len #6 arity=1 regs=1
 
 fn assert #7 arity=1 regs=1
 
-fn fib #8 arity=1 regs=9
+fn print_char #8 arity=1 regs=1
+
+fn to_string #9 arity=1 regs=1
+
+fn i64_to_string #10 arity=1 regs=1
+
+fn f64_to_string #11 arity=1 regs=1
+
+fn char_to_string #12 arity=1 regs=1
+
+fn abs #13 arity=1 regs=1
+
+fn min #14 arity=1 regs=1
+
+fn max #15 arity=1 regs=1
+
+fn clamp #16 arity=1 regs=1
+
+fn sqrt #17 arity=1 regs=1
+
+fn floor #18 arity=1 regs=1
+
+fn ceil #19 arity=1 regs=1
+
+fn pow_i32 #20 arity=1 regs=1
+
+fn fib #21 arity=1 regs=9
   0000  loadimm r1, I32(2)
   0001  lti32 r2, r0, r1
   0002  jz r2, 4
@@ -24,15 +50,15 @@ fn fib #8 arity=1 regs=9
   0004  ret r0
   0005  loadimm r1, I32(1)
   0006  subi32 r3, r0, r1
-  0007  call f8 -> Some(4) [3]
+  0007  call f21 -> Some(4) [3]
   0008  loadimm r5, I32(2)
   0009  subi32 r6, r0, r5
-  0010  call f8 -> Some(7) [6]
+  0010  call f21 -> Some(7) [6]
   0011  addi32 r8, r4, r7
   0012  ret r8
 
-fn main #9 arity=0 regs=2
+fn main #22 arity=0 regs=2
   0000  loadimm r0, I32(10)
-  0001  call f8 -> Some(1) [0]
+  0001  call f21 -> Some(1) [0]
   0002  native #2 -> None [1]
   0003  ret r1

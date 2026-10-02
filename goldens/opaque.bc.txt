@@ -16,7 +16,33 @@ fn len #6 arity=1 regs=1
 
 fn assert #7 arity=1 regs=1
 
-fn main #8 arity=0 regs=1
+fn print_char #8 arity=1 regs=1
+
+fn to_string #9 arity=1 regs=1
+
+fn i64_to_string #10 arity=1 regs=1
+
+fn f64_to_string #11 arity=1 regs=1
+
+fn char_to_string #12 arity=1 regs=1
+
+fn abs #13 arity=1 regs=1
+
+fn min #14 arity=1 regs=1
+
+fn max #15 arity=1 regs=1
+
+fn clamp #16 arity=1 regs=1
+
+fn sqrt #17 arity=1 regs=1
+
+fn floor #18 arity=1 regs=1
+
+fn ceil #19 arity=1 regs=1
+
+fn pow_i32 #20 arity=1 regs=1
+
+fn main #21 arity=0 regs=1
   0000  jmp 1
   0001  loadimm r0, I32(1)
   0002  ret r0

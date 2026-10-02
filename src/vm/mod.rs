@@ -1,7 +1,12 @@
 //! Register virtual machine for Aether bytecode.
+//!
+//! The VM owns its frame stack, so execution can be sliced into budgets
+//! ([`Vm::run_budget`]) and resumed; [`Vm::run`] is the "run to completion"
+//! wrapper. `extern fn` declarations are bound at runtime through
+//! [`Vm::with_host_fn`] / [`HostFn`].
 
 use crate::backend::bytecode::{BytecodeModule, CmpOp, Immediate, Op};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -150,6 +155,19 @@ impl fmt::Display for VmError {
     }
 }
 
+/// Host implementation of an `extern fn` declared in the script. Arguments
+/// were already type-checked by sema against the extern signature.
+pub type HostFn = Box<dyn FnMut(&[Value]) -> Result<Value, VmError>>;
+
+/// Outcome of one [`Vm::run_budget`] call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    /// `main` returned this value; the VM will not run further.
+    Finished(Value),
+    /// Budget exhausted or [`Op::Yield`] hit; state kept, call again to resume.
+    Yielded,
+}
+
 pub struct Vm<'a> {
     module: &'a BytecodeModule,
     opts: VmOptions,
@@ -158,6 +176,9 @@ pub struct Vm<'a> {
     prev_site: u64,
     edges: HashSet<u64>,
     calls: Vec<u64>,
+    host: HashMap<String, HostFn>,
+    frames: Vec<Frame>,
+    state: State,
 }
 
 struct Frame {
@@ -166,6 +187,24 @@ struct Frame {
     regs: Vec<Value>,
     ret_reg: Option<u16>,
 }
+
+enum State {
+    NotStarted,
+    Running,
+    Finished(Value),
+    /// A runtime error was returned; the frame stack is no longer coherent.
+    Halted,
+}
+
+/// What an instruction asks the dispatch loop to do next.
+enum Flow {
+    Continue,
+    Return(Value),
+    Yield,
+}
+
+/// Read target for out-of-range registers (never written to).
+static UNIT: Value = Value::Unit;
 
 impl<'a> Vm<'a> {
     pub fn new(module: &'a BytecodeModule, opts: VmOptions) -> Self {
@@ -177,6 +216,9 @@ impl<'a> Vm<'a> {
             prev_site: 0,
             edges: HashSet::new(),
             calls: vec![0; module.functions.len()],
+            host: HashMap::new(),
+            frames: Vec::new(),
+            state: State::NotStarted,
         }
     }
 
@@ -185,7 +227,59 @@ impl<'a> Vm<'a> {
         self
     }
 
+    /// Bind `extern fn NAME` to a host closure. Re-binding replaces.
+    pub fn with_host_fn(mut self, name: &str, f: HostFn) -> Self {
+        self.host.insert(name.to_string(), f);
+        self
+    }
+
+    /// True once `main` has returned (not after an error).
+    pub fn is_finished(&self) -> bool {
+        matches!(self.state, State::Finished(_))
+    }
+
+    /// Run to completion. `Op::Yield` is a no-op here; the total
+    /// `opts.max_steps` limit still yields `VmError::StepLimit`.
     pub fn run(&mut self) -> Result<Value, VmError> {
+        loop {
+            match self.run_budget(u64::MAX)? {
+                Step::Finished(v) => return Ok(v),
+                Step::Yielded => {}
+            }
+        }
+    }
+
+    /// Execute at most `max_steps` instructions, then return `Yielded` if
+    /// the program has not finished. State is kept between calls; the next
+    /// call resumes exactly where this one stopped. `Op::Yield` returns
+    /// `Yielded` early. Once finished, every call returns the same
+    /// `Finished` value; after an error every call returns an error.
+    pub fn run_budget(&mut self, max_steps: u64) -> Result<Step, VmError> {
+        if let State::Finished(v) = &self.state {
+            return Ok(Step::Finished(v.clone()));
+        }
+        match self.state {
+            State::Halted => {
+                return Err(VmError::Runtime("vm halted after a previous error".into()))
+            }
+            State::NotStarted => self.start()?,
+            _ => {}
+        }
+        match self.step_loop(max_steps) {
+            Ok(Step::Finished(v)) => {
+                self.frames.clear();
+                self.state = State::Finished(v.clone());
+                Ok(Step::Finished(v))
+            }
+            Ok(Step::Yielded) => Ok(Step::Yielded),
+            Err(e) => {
+                self.state = State::Halted;
+                Err(e)
+            }
+        }
+    }
+
+    fn start(&mut self) -> Result<(), VmError> {
         let entry = self.module.entry as usize;
         if entry >= self.module.functions.len() {
             return Err(VmError::MissingMain);
@@ -198,35 +292,50 @@ impl<'a> Vm<'a> {
         if self.opts.profile && entry < self.calls.len() {
             self.calls[entry] += 1;
         }
-        let mut frames = vec![Frame {
+        self.frames.clear();
+        self.frames.push(Frame {
             func: entry,
             pc: 0,
             regs: vec![Value::Unit; nregs],
             ret_reg: None,
-        }];
+        });
+        self.state = State::Running;
+        Ok(())
+    }
 
+    fn step_loop(&mut self, budget: u64) -> Result<Step, VmError> {
+        // Copy the shared module reference out so instructions can be
+        // borrowed from it while `self.frames` is mutated.
+        let module: &'a BytecodeModule = self.module;
+        let mut used: u64 = 0;
         loop {
-            if frames.len() > self.opts.max_call_depth {
+            if used >= budget {
+                return Ok(Step::Yielded);
+            }
+            used += 1;
+            if self.frames.len() > self.opts.max_call_depth {
                 return Err(VmError::StackOverflow);
             }
             self.steps += 1;
             if self.steps > self.opts.max_steps {
                 return Err(VmError::StepLimit);
             }
-            let fi = frames.last().unwrap().func;
-            let pc = frames.last().unwrap().pc;
-            let func = &self.module.functions[fi];
+            let (fi, pc) = {
+                let f = self.frames.last().expect("running vm has a frame");
+                (f.func, f.pc)
+            };
+            let func = &module.functions[fi];
             if pc >= func.code.len() {
-                if frames.len() == 1 {
-                    return Ok(Value::I32(0));
+                if self.frames.len() == 1 {
+                    return Ok(Step::Finished(Value::I32(0)));
                 }
-                let finished = frames.pop().unwrap();
+                let finished = self.frames.pop().expect("frame");
                 if let Some(d) = finished.ret_reg {
-                    set_reg(Value::Unit, &mut frames, d);
+                    set_reg(Value::Unit, &mut self.frames, d);
                 }
                 continue;
             }
-            let op = func.code[pc].clone();
+            let op = &func.code[pc];
             if self.opts.coverage {
                 let site = ((fi as u64) << 32) | (pc as u64);
                 self.edges.insert(self.prev_site.rotate_left(17) ^ site);
@@ -235,138 +344,196 @@ impl<'a> Vm<'a> {
             if self.opts.trace {
                 let _ = writeln!(self.stdout, "[{fi}:{pc}] {op}");
             }
-            frames.last_mut().unwrap().pc += 1;
-            if let Some(result) = self.exec_op(&mut frames, op)? {
-                return Ok(result);
+            self.frames.last_mut().expect("frame").pc += 1;
+            match self.exec_op(op)? {
+                Flow::Continue => {}
+                Flow::Return(v) => return Ok(Step::Finished(v)),
+                Flow::Yield => return Ok(Step::Yielded),
             }
         }
     }
 
-    fn exec_op(&mut self, frames: &mut Vec<Frame>, op: Op) -> Result<Option<Value>, VmError> {
+    fn exec_op(&mut self, op: &Op) -> Result<Flow, VmError> {
+        let module: &'a BytecodeModule = self.module;
         match op {
-            Op::LoadImm { dest, imm } => set_reg(imm_to_value(&imm, self.module), frames, dest),
-            Op::LoadStr { dest, idx } => {
-                let s = self
-                    .module
-                    .strings
-                    .get(idx as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                set_reg(Value::Str(s), frames, dest);
+            Op::LoadImm { dest, imm } => {
+                let v = imm_to_value(imm, module);
+                set_reg(v, &mut self.frames, *dest);
             }
-            Op::Move { dest, src } => copy_reg(frames, dest, src),
-            Op::AddI32 { dest, lhs, rhs } => bin_i32(frames, dest, lhs, rhs, i32::wrapping_add),
-            Op::SubI32 { dest, lhs, rhs } => bin_i32(frames, dest, lhs, rhs, i32::wrapping_sub),
-            Op::MulI32 { dest, lhs, rhs } => bin_i32(frames, dest, lhs, rhs, i32::wrapping_mul),
+            Op::LoadStr { dest, idx } => {
+                let s = module.strings.get(*idx as usize).cloned().unwrap_or_default();
+                set_reg(Value::Str(s), &mut self.frames, *dest);
+            }
+            Op::Move { dest, src } => copy_reg(&mut self.frames, *dest, *src),
+            Op::AddI32 { dest, lhs, rhs } => {
+                bin_i32(&mut self.frames, *dest, *lhs, *rhs, i32::wrapping_add)
+            }
+            Op::SubI32 { dest, lhs, rhs } => {
+                bin_i32(&mut self.frames, *dest, *lhs, *rhs, i32::wrapping_sub)
+            }
+            Op::MulI32 { dest, lhs, rhs } => {
+                bin_i32(&mut self.frames, *dest, *lhs, *rhs, i32::wrapping_mul)
+            }
             Op::DivI32 { dest, lhs, rhs } => {
-                let b = read_i32(frames, rhs);
+                let b = read_i32(&self.frames, *rhs);
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I32(read_i32(frames, lhs).wrapping_div(b)), frames, dest);
+                let a = read_i32(&self.frames, *lhs);
+                set_reg(Value::I32(a.wrapping_div(b)), &mut self.frames, *dest);
             }
             Op::RemI32 { dest, lhs, rhs } => {
-                let b = read_i32(frames, rhs);
+                let b = read_i32(&self.frames, *rhs);
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I32(read_i32(frames, lhs).wrapping_rem(b)), frames, dest);
+                let a = read_i32(&self.frames, *lhs);
+                set_reg(Value::I32(a.wrapping_rem(b)), &mut self.frames, *dest);
             }
             Op::NegI32 { dest, src } => {
-                set_reg(Value::I32(read_i32(frames, src).wrapping_neg()), frames, dest);
+                let v = read_i32(&self.frames, *src).wrapping_neg();
+                set_reg(Value::I32(v), &mut self.frames, *dest);
             }
-            Op::AddI64 { dest, lhs, rhs } => bin_i64(frames, dest, lhs, rhs, i64::wrapping_add),
-            Op::SubI64 { dest, lhs, rhs } => bin_i64(frames, dest, lhs, rhs, i64::wrapping_sub),
-            Op::MulI64 { dest, lhs, rhs } => bin_i64(frames, dest, lhs, rhs, i64::wrapping_mul),
+            Op::AddI64 { dest, lhs, rhs } => {
+                bin_i64(&mut self.frames, *dest, *lhs, *rhs, i64::wrapping_add)
+            }
+            Op::SubI64 { dest, lhs, rhs } => {
+                bin_i64(&mut self.frames, *dest, *lhs, *rhs, i64::wrapping_sub)
+            }
+            Op::MulI64 { dest, lhs, rhs } => {
+                bin_i64(&mut self.frames, *dest, *lhs, *rhs, i64::wrapping_mul)
+            }
             Op::DivI64 { dest, lhs, rhs } => {
-                let b = read_i64(frames, rhs);
+                let b = read_i64(&self.frames, *rhs);
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I64(read_i64(frames, lhs).wrapping_div(b)), frames, dest);
+                let a = read_i64(&self.frames, *lhs);
+                set_reg(Value::I64(a.wrapping_div(b)), &mut self.frames, *dest);
             }
             Op::RemI64 { dest, lhs, rhs } => {
-                let b = read_i64(frames, rhs);
+                let b = read_i64(&self.frames, *rhs);
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I64(read_i64(frames, lhs).wrapping_rem(b)), frames, dest);
+                let a = read_i64(&self.frames, *lhs);
+                set_reg(Value::I64(a.wrapping_rem(b)), &mut self.frames, *dest);
             }
             Op::NegI64 { dest, src } => {
-                set_reg(Value::I64(read_i64(frames, src).wrapping_neg()), frames, dest);
+                let v = read_i64(&self.frames, *src).wrapping_neg();
+                set_reg(Value::I64(v), &mut self.frames, *dest);
             }
-            Op::AddF64 { dest, lhs, rhs } => bin_f64(frames, dest, lhs, rhs, |a, b| a + b),
-            Op::SubF64 { dest, lhs, rhs } => bin_f64(frames, dest, lhs, rhs, |a, b| a - b),
-            Op::MulF64 { dest, lhs, rhs } => bin_f64(frames, dest, lhs, rhs, |a, b| a * b),
-            Op::DivF64 { dest, lhs, rhs } => bin_f64(frames, dest, lhs, rhs, |a, b| a / b),
+            Op::AddF64 { dest, lhs, rhs } => bin_f64(&mut self.frames, *dest, *lhs, *rhs, |a, b| a + b),
+            Op::SubF64 { dest, lhs, rhs } => bin_f64(&mut self.frames, *dest, *lhs, *rhs, |a, b| a - b),
+            Op::MulF64 { dest, lhs, rhs } => bin_f64(&mut self.frames, *dest, *lhs, *rhs, |a, b| a * b),
+            Op::DivF64 { dest, lhs, rhs } => bin_f64(&mut self.frames, *dest, *lhs, *rhs, |a, b| a / b),
             Op::NegF64 { dest, src } => {
-                set_reg(Value::F64(-read_f64(frames, src)), frames, dest);
+                let v = -read_f64(&self.frames, *src);
+                set_reg(Value::F64(v), &mut self.frames, *dest);
             }
-            Op::CmpEqI32 { dest, lhs, rhs } => cmp_i32(frames, dest, lhs, rhs, |a, b| a == b),
-            Op::CmpNeI32 { dest, lhs, rhs } => cmp_i32(frames, dest, lhs, rhs, |a, b| a != b),
-            Op::CmpLtI32 { dest, lhs, rhs } => cmp_i32(frames, dest, lhs, rhs, |a, b| a < b),
-            Op::CmpLeI32 { dest, lhs, rhs } => cmp_i32(frames, dest, lhs, rhs, |a, b| a <= b),
-            Op::CmpGtI32 { dest, lhs, rhs } => cmp_i32(frames, dest, lhs, rhs, |a, b| a > b),
-            Op::CmpGeI32 { dest, lhs, rhs } => cmp_i32(frames, dest, lhs, rhs, |a, b| a >= b),
+            Op::CmpEqI32 { dest, lhs, rhs } => cmp_i32(&mut self.frames, *dest, *lhs, *rhs, |a, b| a == b),
+            Op::CmpNeI32 { dest, lhs, rhs } => cmp_i32(&mut self.frames, *dest, *lhs, *rhs, |a, b| a != b),
+            Op::CmpLtI32 { dest, lhs, rhs } => cmp_i32(&mut self.frames, *dest, *lhs, *rhs, |a, b| a < b),
+            Op::CmpLeI32 { dest, lhs, rhs } => cmp_i32(&mut self.frames, *dest, *lhs, *rhs, |a, b| a <= b),
+            Op::CmpGtI32 { dest, lhs, rhs } => cmp_i32(&mut self.frames, *dest, *lhs, *rhs, |a, b| a > b),
+            Op::CmpGeI32 { dest, lhs, rhs } => cmp_i32(&mut self.frames, *dest, *lhs, *rhs, |a, b| a >= b),
             Op::CmpEqI64 { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_i64(frames, lhs) == read_i64(frames, rhs)), frames, dest);
+                let r = read_i64(&self.frames, *lhs) == read_i64(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::CmpLtI64 { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_i64(frames, lhs) < read_i64(frames, rhs)), frames, dest);
+                let r = read_i64(&self.frames, *lhs) < read_i64(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::CmpEqF64 { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_f64(frames, lhs) == read_f64(frames, rhs)), frames, dest);
+                let r = read_f64(&self.frames, *lhs) == read_f64(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::CmpLtF64 { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_f64(frames, lhs) < read_f64(frames, rhs)), frames, dest);
+                let r = read_f64(&self.frames, *lhs) < read_f64(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::CmpEqBool { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_bool(frames, lhs) == read_bool(frames, rhs)), frames, dest);
+                let r = read_bool(&self.frames, *lhs) == read_bool(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
-            Op::Cmp { op, dest, lhs, rhs } => {
-                let r = cmp_values(op, &get_reg(frames, lhs), &get_reg(frames, rhs))?;
-                set_reg(Value::Bool(r), frames, dest);
+            Op::Cmp { op: cmp, dest, lhs, rhs } => {
+                let r = cmp_values(*cmp, reg(&self.frames, *lhs), reg(&self.frames, *rhs))?;
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::AndBool { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_bool(frames, lhs) && read_bool(frames, rhs)), frames, dest);
+                let r = read_bool(&self.frames, *lhs) && read_bool(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::OrBool { dest, lhs, rhs } => {
-                set_reg(Value::Bool(read_bool(frames, lhs) || read_bool(frames, rhs)), frames, dest);
+                let r = read_bool(&self.frames, *lhs) || read_bool(&self.frames, *rhs);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
             Op::NotBool { dest, src } => {
-                set_reg(Value::Bool(!read_bool(frames, src)), frames, dest);
+                let r = !read_bool(&self.frames, *src);
+                set_reg(Value::Bool(r), &mut self.frames, *dest);
             }
-            Op::Jump { target } => frames.last_mut().unwrap().pc = target as usize,
+            Op::BitAnd { dest, lhs, rhs } => bit_op(&mut self.frames, *dest, *lhs, *rhs, |a, b| a & b, |a, b| a & b),
+            Op::BitOr { dest, lhs, rhs } => bit_op(&mut self.frames, *dest, *lhs, *rhs, |a, b| a | b, |a, b| a | b),
+            Op::BitXor { dest, lhs, rhs } => bit_op(&mut self.frames, *dest, *lhs, *rhs, |a, b| a ^ b, |a, b| a ^ b),
+            Op::Shl { dest, lhs, rhs } => bit_op(
+                &mut self.frames,
+                *dest,
+                *lhs,
+                *rhs,
+                |a, b| a.wrapping_shl((b & 31) as u32),
+                |a, b| a.wrapping_shl((b & 63) as u32),
+            ),
+            Op::Shr { dest, lhs, rhs } => bit_op(
+                &mut self.frames,
+                *dest,
+                *lhs,
+                *rhs,
+                |a, b| a.wrapping_shr((b & 31) as u32),
+                |a, b| a.wrapping_shr((b & 63) as u32),
+            ),
+            Op::NotInt { dest, src } => {
+                let v = match reg(&self.frames, *src) {
+                    Value::I64(x) => Value::I64(!x),
+                    other => Value::I32(!other.as_i32()),
+                };
+                set_reg(v, &mut self.frames, *dest);
+            }
+            Op::Jump { target } => self.frames.last_mut().expect("frame").pc = *target as usize,
             Op::JumpIf { cond, target } => {
-                if get_reg(frames, cond).as_bool() {
-                    frames.last_mut().unwrap().pc = target as usize;
+                if reg(&self.frames, *cond).as_bool() {
+                    self.frames.last_mut().expect("frame").pc = *target as usize;
                 }
             }
             Op::JumpIfNot { cond, target } => {
-                if !get_reg(frames, cond).as_bool() {
-                    frames.last_mut().unwrap().pc = target as usize;
+                if !reg(&self.frames, *cond).as_bool() {
+                    self.frames.last_mut().expect("frame").pc = *target as usize;
                 }
             }
             Op::Call { func, dest, args } => {
-                let callee = func as usize;
-                if callee >= self.module.functions.len() {
+                let callee = *func as usize;
+                let Some(callee_fn) = module.functions.get(callee) else {
                     return Err(VmError::Runtime(format!("invalid function index {func}")));
-                }
-                if self.module.functions[callee].is_native {
-                    let argv: Vec<Value> = args.iter().map(|r| get_reg(frames, *r)).collect();
-                    let Some(nid) = self.module.functions[callee].native_id else {
-                        let name = &self.module.functions[callee].name;
-                        return Err(VmError::Native(format!(
-                            "extern function `{name}` has no implementation in the VM"
-                        )));
+                };
+                let argv: Vec<Value> = args.iter().map(|r| reg(&self.frames, *r).clone()).collect();
+                if callee_fn.is_native {
+                    let result = match callee_fn.native_id {
+                        Some(nid) => self.call_native(nid, &argv)?,
+                        None => match self.host.get_mut(callee_fn.name.as_str()) {
+                            Some(f) => f(&argv)?,
+                            None => {
+                                return Err(VmError::Native(format!(
+                                    "extern function `{}` has no implementation in the VM",
+                                    callee_fn.name
+                                )))
+                            }
+                        },
                     };
-                    let result = self.call_native(nid, &argv)?;
                     if let Some(d) = dest {
-                        set_reg(result, frames, d);
+                        set_reg(result, &mut self.frames, *d);
                     }
                 } else {
-                    let argv: Vec<Value> = args.iter().map(|r| get_reg(frames, *r)).collect();
-                    let nregs = (self.module.functions[callee].nregs as usize).max(args.len());
+                    let nregs = (callee_fn.nregs as usize).max(args.len());
                     let mut regs = vec![Value::Unit; nregs.max(1)];
                     for (i, v) in argv.into_iter().enumerate() {
                         if i < regs.len() {
@@ -376,84 +543,98 @@ impl<'a> Vm<'a> {
                     if self.opts.profile && callee < self.calls.len() {
                         self.calls[callee] += 1;
                     }
-                    frames.push(Frame {
+                    self.frames.push(Frame {
                         func: callee,
                         pc: 0,
                         regs,
-                        ret_reg: dest,
+                        ret_reg: *dest,
                     });
                 }
             }
             Op::CallNative { id, dest, args } => {
-                let argv: Vec<Value> = args.iter().map(|r| get_reg(frames, *r)).collect();
-                let result = self.call_native(id, &argv)?;
+                let argv: Vec<Value> = args.iter().map(|r| reg(&self.frames, *r).clone()).collect();
+                let result = self.call_native(*id, &argv)?;
                 if let Some(d) = dest {
-                    set_reg(result, frames, d);
+                    set_reg(result, &mut self.frames, *d);
                 }
             }
             Op::Ret { src } => {
-                let v = get_reg(frames, src);
-                if frames.len() == 1 {
-                    return Ok(Some(v));
+                // The returning frame is discarded, so the value can be
+                // moved out instead of cloned (same observable result).
+                let v = self
+                    .frames
+                    .last_mut()
+                    .and_then(|f| f.regs.get_mut(*src as usize))
+                    .map(|slot| std::mem::replace(slot, Value::Unit))
+                    .unwrap_or(Value::Unit);
+                if self.frames.len() == 1 {
+                    return Ok(Flow::Return(v));
                 }
-                let finished = frames.pop().unwrap();
+                let finished = self.frames.pop().expect("frame");
                 if let Some(d) = finished.ret_reg {
-                    set_reg(v, frames, d);
+                    set_reg(v, &mut self.frames, d);
                 }
             }
             Op::RetVoid => {
-                if frames.len() == 1 {
-                    return Ok(Some(Value::Unit));
+                if self.frames.len() == 1 {
+                    return Ok(Flow::Return(Value::Unit));
                 }
-                let finished = frames.pop().unwrap();
+                let finished = self.frames.pop().expect("frame");
                 if let Some(d) = finished.ret_reg {
-                    set_reg(Value::Unit, frames, d);
+                    set_reg(Value::Unit, &mut self.frames, d);
                 }
             }
             Op::CastI32ToI64 { dest, src } => {
-                set_reg(Value::I64(read_i32(frames, src) as i64), frames, dest);
+                let v = read_i32(&self.frames, *src) as i64;
+                set_reg(Value::I64(v), &mut self.frames, *dest);
             }
             Op::CastI64ToI32 { dest, src } => {
-                set_reg(Value::I32(read_i64(frames, src) as i32), frames, dest);
+                let v = read_i64(&self.frames, *src) as i32;
+                set_reg(Value::I32(v), &mut self.frames, *dest);
             }
             Op::CastI32ToF64 { dest, src } => {
-                set_reg(Value::F64(read_i32(frames, src) as f64), frames, dest);
+                let v = read_i32(&self.frames, *src) as f64;
+                set_reg(Value::F64(v), &mut self.frames, *dest);
             }
             Op::CastF64ToI32 { dest, src } => {
-                set_reg(Value::I32(read_f64(frames, src) as i32), frames, dest);
+                let v = read_f64(&self.frames, *src) as i32;
+                set_reg(Value::I32(v), &mut self.frames, *dest);
             }
             Op::CastBoolToI32 { dest, src } => {
-                set_reg(Value::I32(i32::from(read_bool(frames, src))), frames, dest);
+                let v = i32::from(read_bool(&self.frames, *src));
+                set_reg(Value::I32(v), &mut self.frames, *dest);
             }
             Op::CastI64ToF64 { dest, src } => {
-                set_reg(Value::F64(read_i64(frames, src) as f64), frames, dest);
+                let v = read_i64(&self.frames, *src) as f64;
+                set_reg(Value::F64(v), &mut self.frames, *dest);
             }
             Op::CastF64ToI64 { dest, src } => {
-                set_reg(Value::I64(read_f64(frames, src) as i64), frames, dest);
+                let v = read_f64(&self.frames, *src) as i64;
+                set_reg(Value::I64(v), &mut self.frames, *dest);
             }
             Op::CastBoolToI64 { dest, src } => {
-                set_reg(Value::I64(i64::from(read_bool(frames, src))), frames, dest);
+                let v = i64::from(read_bool(&self.frames, *src));
+                set_reg(Value::I64(v), &mut self.frames, *dest);
             }
             Op::CastCharToI32 { dest, src } => {
-                let v = match get_reg(frames, src) {
-                    Value::Char(c) => c as i32,
-                    other => other.as_i32(),
-                };
-                set_reg(Value::I32(v), frames, dest);
+                // `as_i32` already maps `Char(c)` to `c as i32`.
+                let v = read_i32(&self.frames, *src);
+                set_reg(Value::I32(v), &mut self.frames, *dest);
             }
             Op::CastI32ToChar { dest, src } => {
-                let c = u32::try_from(read_i32(frames, src))
+                let c = u32::try_from(read_i32(&self.frames, *src))
                     .ok()
                     .and_then(char::from_u32)
                     .unwrap_or('\u{FFFD}');
-                set_reg(Value::Char(c), frames, dest);
+                set_reg(Value::Char(c), &mut self.frames, *dest);
             }
             Op::AllocArr { dest, len } => {
-                set_reg(Value::Array(vec![Value::I32(0); len as usize]), frames, dest);
+                set_reg(Value::Array(vec![Value::I32(0); *len as usize]), &mut self.frames, *dest);
             }
             Op::LoadIdx { dest, base, index } => {
-                let idx = get_reg(frames, index).as_i32();
-                let v = match get_reg(frames, base) {
+                let idx = reg(&self.frames, *index).as_i32();
+                // Only the element is cloned, never the container.
+                let v = match reg(&self.frames, *base) {
                     Value::Array(xs) => {
                         if idx < 0 || idx as usize >= xs.len() {
                             return Err(VmError::Runtime(format!("array index {idx} out of bounds")));
@@ -461,21 +642,21 @@ impl<'a> Vm<'a> {
                         xs[idx as usize].clone()
                     }
                     Value::Str(s) => {
-                        let n = s.chars().count();
-                        if idx < 0 || idx as usize >= n {
-                            return Err(VmError::Runtime("string index out of bounds".into()));
+                        let c = if idx < 0 { None } else { s.chars().nth(idx as usize) };
+                        match c {
+                            Some(c) => Value::Char(c),
+                            None => return Err(VmError::Runtime("string index out of bounds".into())),
                         }
-                        Value::Char(s.chars().nth(idx as usize).unwrap_or('\0'))
                     }
                     other => return Err(VmError::Runtime(format!("cannot index {other}"))),
                 };
-                set_reg(v, frames, dest);
+                set_reg(v, &mut self.frames, *dest);
             }
             Op::StoreIdx { base, index, value } => {
-                let idx = get_reg(frames, index).as_i32();
-                let val = get_reg(frames, value);
-                let frame = frames.last_mut().unwrap();
-                match frame.regs.get_mut(base as usize) {
+                let idx = reg(&self.frames, *index).as_i32();
+                let val = reg(&self.frames, *value).clone();
+                let frame = self.frames.last_mut().expect("frame");
+                match frame.regs.get_mut(*base as usize) {
                     Some(Value::Array(xs)) => {
                         if idx < 0 || idx as usize >= xs.len() {
                             return Err(VmError::Runtime(format!("array index {idx} out of bounds")));
@@ -486,38 +667,34 @@ impl<'a> Vm<'a> {
                 }
             }
             Op::AllocObj { dest, fields } => {
-                set_reg(Value::Object(vec![Value::Unit; fields as usize]), frames, dest);
+                set_reg(Value::Object(vec![Value::Unit; *fields as usize]), &mut self.frames, *dest);
             }
             Op::LoadField { dest, base, field } => {
-                let v = match get_reg(frames, base) {
-                    Value::Object(xs) => xs.get(field as usize).cloned().unwrap_or(Value::Unit),
+                let v = match reg(&self.frames, *base) {
+                    Value::Object(xs) => xs.get(*field as usize).cloned().unwrap_or(Value::Unit),
                     _ => Value::Unit,
                 };
-                set_reg(v, frames, dest);
+                set_reg(v, &mut self.frames, *dest);
             }
             Op::StoreField { base, field, value } => {
-                let val = get_reg(frames, value);
-                let frame = frames.last_mut().unwrap();
-                if let Some(Value::Object(xs)) = frame.regs.get_mut(base as usize) {
-                    if (field as usize) < xs.len() {
-                        xs[field as usize] = val;
+                let val = reg(&self.frames, *value).clone();
+                let frame = self.frames.last_mut().expect("frame");
+                if let Some(Value::Object(xs)) = frame.regs.get_mut(*base as usize) {
+                    if (*field as usize) < xs.len() {
+                        xs[*field as usize] = val;
                     }
                 }
             }
             Op::Concat { dest, lhs, rhs } => {
-                let a = match get_reg(frames, lhs) {
-                    Value::Str(s) => s,
-                    other => other.to_string(),
-                };
-                let b = match get_reg(frames, rhs) {
-                    Value::Str(s) => s,
-                    other => other.to_string(),
-                };
-                set_reg(Value::Str(format!("{a}{b}")), frames, dest);
+                // `Display` for `Str` writes the raw text, so this equals
+                // the old "unwrap strings, `to_string` the rest" path.
+                let s = format!("{}{}", reg(&self.frames, *lhs), reg(&self.frames, *rhs));
+                set_reg(Value::Str(s), &mut self.frames, *dest);
             }
+            Op::Yield => return Ok(Flow::Yield),
             Op::Nop => {}
         }
-        Ok(None)
+        Ok(Flow::Continue)
     }
 
     fn call_native(&mut self, id: u16, args: &[Value]) -> Result<Value, VmError> {
@@ -545,6 +722,29 @@ impl<'a> Vm<'a> {
                     return Err(VmError::Native("assertion failed".into()));
                 }
                 Ok(Value::Unit)
+            }
+            8 => {
+                let c = match args.first() {
+                    Some(Value::Char(c)) => *c,
+                    other => char::from_u32(other.map(|v| v.as_i32()).unwrap_or(0) as u32).unwrap_or('\u{FFFD}'),
+                };
+                writeln!(self.stdout, "{c}").map_err(|e| VmError::Native(e.to_string()))?;
+                Ok(Value::Unit)
+            }
+            9 | 10 | 11 | 12 => Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default())),
+            13 => Ok(Value::I32(arg_i32(args, 0).wrapping_abs())),
+            14 => Ok(Value::I32(arg_i32(args, 0).min(arg_i32(args, 1)))),
+            15 => Ok(Value::I32(arg_i32(args, 0).max(arg_i32(args, 1)))),
+            16 => {
+                let (x, lo, hi) = (arg_i32(args, 0), arg_i32(args, 1), arg_i32(args, 2));
+                Ok(Value::I32(lo.max(hi.min(x))))
+            }
+            17 => Ok(Value::F64(arg_f64(args, 0).sqrt())),
+            18 => Ok(Value::F64(arg_f64(args, 0).floor())),
+            19 => Ok(Value::F64(arg_f64(args, 0).ceil())),
+            20 => {
+                let (b, e) = (arg_i32(args, 0), arg_i32(args, 1));
+                Ok(Value::I32(if e < 0 { 0 } else { b.wrapping_pow(e as u32) }))
             }
             _ => Err(VmError::Native(format!("unknown native #{id}"))),
         }
@@ -596,11 +796,12 @@ impl ProfileReport {
     }
 }
 
-fn get_reg(frames: &[Frame], r: u16) -> Value {
+/// Borrow register `r` of the top frame; unset registers read as `Unit`.
+fn reg(frames: &[Frame], r: u16) -> &Value {
     frames
         .last()
-        .and_then(|f| f.regs.get(r as usize).cloned())
-        .unwrap_or(Value::Unit)
+        .and_then(|f| f.regs.get(r as usize))
+        .unwrap_or(&UNIT)
 }
 
 fn set_reg(v: Value, frames: &mut [Frame], r: u16) {
@@ -614,30 +815,45 @@ fn set_reg(v: Value, frames: &mut [Frame], r: u16) {
 }
 
 fn copy_reg(frames: &mut [Frame], dest: u16, src: u16) {
-    let v = get_reg(frames, src);
+    let v = reg(frames, src).clone();
     set_reg(v, frames, dest);
 }
 
-fn read_i32(frames: &[Frame], r: u16) -> i32 { get_reg(frames, r).as_i32() }
-fn read_i64(frames: &[Frame], r: u16) -> i64 { get_reg(frames, r).as_i64() }
-fn read_f64(frames: &[Frame], r: u16) -> f64 { get_reg(frames, r).as_f64() }
-fn read_bool(frames: &[Frame], r: u16) -> bool { get_reg(frames, r).as_bool() }
+fn read_i32(frames: &[Frame], r: u16) -> i32 { reg(frames, r).as_i32() }
 
+fn arg_i32(args: &[Value], i: usize) -> i32 { args.get(i).map(|v| v.as_i32()).unwrap_or(0) }
+fn arg_f64(args: &[Value], i: usize) -> f64 { args.get(i).map(|v| v.as_f64()).unwrap_or(0.0) }
+
+/// Integer bit operation dispatched on the left operand's width.
+fn bit_op(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f32: fn(i32, i32) -> i32, f64: fn(i64, i64) -> i64) {
+    let v = match reg(frames, lhs) {
+        Value::I64(a) => Value::I64(f64(*a, read_i64(frames, rhs))),
+        other => Value::I32(f32(other.as_i32(), read_i32(frames, rhs))),
+    };
+    set_reg(v, frames, dest);
+}
+fn read_i64(frames: &[Frame], r: u16) -> i64 { reg(frames, r).as_i64() }
+fn read_f64(frames: &[Frame], r: u16) -> f64 { reg(frames, r).as_f64() }
+fn read_bool(frames: &[Frame], r: u16) -> bool { reg(frames, r).as_bool() }
 
 fn bin_i32(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(i32, i32) -> i32) {
-    set_reg(Value::I32(f(read_i32(frames, lhs), read_i32(frames, rhs))), frames, dest);
+    let v = f(read_i32(frames, lhs), read_i32(frames, rhs));
+    set_reg(Value::I32(v), frames, dest);
 }
 
 fn bin_i64(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(i64, i64) -> i64) {
-    set_reg(Value::I64(f(read_i64(frames, lhs), read_i64(frames, rhs))), frames, dest);
+    let v = f(read_i64(frames, lhs), read_i64(frames, rhs));
+    set_reg(Value::I64(v), frames, dest);
 }
 
 fn bin_f64(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(f64, f64) -> f64) {
-    set_reg(Value::F64(f(read_f64(frames, lhs), read_f64(frames, rhs))), frames, dest);
+    let v = f(read_f64(frames, lhs), read_f64(frames, rhs));
+    set_reg(Value::F64(v), frames, dest);
 }
 
 fn cmp_i32(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(i32, i32) -> bool) {
-    set_reg(Value::Bool(f(read_i32(frames, lhs), read_i32(frames, rhs))), frames, dest);
+    let v = f(read_i32(frames, lhs), read_i32(frames, rhs));
+    set_reg(Value::Bool(v), frames, dest);
 }
 
 /// Generic comparison for [`Op::Cmp`]: both operands must carry the same
@@ -713,15 +929,28 @@ impl Write for Sink {
     }
 }
 
-/// Run `main` with stdout captured. Unlike [`execute_captured`] the
-/// partial stdout and step count are returned even when the VM fails, so
-/// callers can show what the program printed before the error.
-pub fn run_captured(module: &BytecodeModule) -> (Result<Value, VmError>, String, u64) {
+/// Run `main` with stdout captured, custom options and host-bound externs.
+/// The partial stdout and step count are returned even when the VM fails,
+/// so callers can show what the program printed before the error.
+pub fn execute_captured_with(
+    module: &BytecodeModule,
+    opts: VmOptions,
+    host: Vec<(String, HostFn)>,
+) -> (Result<Value, VmError>, String, u64) {
     let slot = Arc::new(Mutex::new(Vec::new()));
-    let mut vm = Vm::new(module, VmOptions::default()).with_stdout(Box::new(Sink(slot.clone())));
+    let mut vm = Vm::new(module, opts).with_stdout(Box::new(Sink(slot.clone())));
+    for (name, f) in host {
+        vm = vm.with_host_fn(&name, f);
+    }
     let result = vm.run();
     let out = String::from_utf8_lossy(&slot.lock().unwrap()).into_owned();
     (result, out, vm.steps())
+}
+
+/// Run `main` with stdout captured. Unlike [`execute_captured`] the
+/// partial stdout and step count are returned even when the VM fails.
+pub fn run_captured(module: &BytecodeModule) -> (Result<Value, VmError>, String, u64) {
+    execute_captured_with(module, VmOptions::default(), Vec::new())
 }
 
 pub fn execute_captured(module: &BytecodeModule) -> Result<(Value, String, u64), VmError> {
@@ -771,6 +1000,7 @@ pub fn execute_profiled(module: &BytecodeModule) -> Result<(Value, String, Profi
 mod tests {
     use super::*;
     use crate::backend::assemble;
+    use crate::backend::bytecode::BcFunction;
     use crate::ir::emit_ir;
     use crate::lexer::tokenize;
     use crate::opt::optimize;
@@ -921,6 +1151,33 @@ mod tests {
     }
 
     #[test]
+    fn host_fn_binds_extern() {
+        let bc = bytecode_of(
+            r#"
+            extern fn twice(x: i32) -> i32;
+            extern fn note(x: i32);
+            fn main() -> i32 { note(twice(4)); return twice(twice(5)); }
+        "#,
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let host: Vec<(String, HostFn)> = vec![
+            ("twice".into(), Box::new(|a: &[Value]| Ok(Value::I32(a[0].as_i32() * 2)))),
+            (
+                "note".into(),
+                Box::new(move |a: &[Value]| {
+                    sink.lock().unwrap().push(a[0].as_i32());
+                    Ok(Value::Unit)
+                }),
+            ),
+        ];
+        let (res, out, _) = execute_captured_with(&bc, VmOptions::default(), host);
+        assert_eq!(res.unwrap(), Value::I32(20));
+        assert_eq!(out, "");
+        assert_eq!(*seen.lock().unwrap(), vec![8]);
+    }
+
+    #[test]
     fn run_captured_keeps_partial_stdout() {
         let bc = bytecode_of("fn main() -> i32 { print_i32(1); let z = 0; print_i32(5 / z); return 0; }");
         let (res, out, steps) = run_captured(&bc);
@@ -953,5 +1210,121 @@ mod tests {
         let (v, out, _) = execute_captured(&bc).expect("vm");
         assert_eq!(v, Value::I32(45150));
         assert_eq!(out, "45150\n");
+    }
+
+    #[test]
+    fn budget_resumes_and_equals_run() {
+        let bc = bytecode_of(
+            r#"
+            fn fib(n: i32) -> i32 {
+                if n < 2 { return n; }
+                return fib(n - 1) + fib(n - 2);
+            }
+            fn main() -> i32 {
+                let mut i = 0;
+                while i < 12 { print_i32(fib(i)); i = i + 1; }
+                return fib(12);
+            }
+        "#,
+        );
+        let (whole, whole_out, whole_steps) = run_captured(&bc);
+        let whole = whole.unwrap();
+
+        let slot = Arc::new(Mutex::new(Vec::new()));
+        let mut vm = Vm::new(&bc, VmOptions::default()).with_stdout(Box::new(Sink(slot.clone())));
+        let mut yields = 0;
+        let value = loop {
+            match vm.run_budget(97).unwrap() {
+                Step::Finished(v) => break v,
+                Step::Yielded => {
+                    yields += 1;
+                    assert!(!vm.is_finished());
+                    assert!(vm.steps() == 97 * yields, "budget must be exact");
+                }
+            }
+        };
+        assert!(yields > 1);
+        assert!(vm.is_finished());
+        assert_eq!(value, whole);
+        assert_eq!(vm.steps(), whole_steps);
+        assert_eq!(String::from_utf8_lossy(&slot.lock().unwrap()), whole_out);
+        // Finished VMs keep answering with the same value.
+        assert_eq!(vm.run_budget(1).unwrap(), Step::Finished(whole.clone()));
+        assert_eq!(vm.run().unwrap(), whole);
+    }
+
+    #[test]
+    fn budget_honours_total_step_limit() {
+        let bc = bytecode_of("fn main() -> i32 { let mut i = 0; while true { i = i + 1; } return i; }");
+        let opts = VmOptions { max_steps: 1_000, ..VmOptions::default() };
+        let mut vm = Vm::new(&bc, opts.clone());
+        let mut n = 0;
+        let err = loop {
+            match vm.run_budget(100) {
+                Ok(Step::Yielded) => n += 1,
+                Ok(Step::Finished(v)) => panic!("finished with {v}"),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(err, VmError::StepLimit));
+        assert_eq!(n, 10);
+        assert_eq!(vm.steps(), 1_001);
+        assert!(!vm.is_finished());
+        assert!(vm.run_budget(1).is_err(), "halted vm stays halted");
+        assert!(matches!(Vm::new(&bc, opts).run().unwrap_err(), VmError::StepLimit));
+    }
+
+    #[test]
+    fn yield_op_yields_and_run_ignores_it() {
+        let module = BytecodeModule {
+            functions: vec![BcFunction {
+                name: "main".into(),
+                arity: 0,
+                nregs: 1,
+                code: vec![
+                    Op::LoadImm { dest: 0, imm: Immediate::I32(1) },
+                    Op::Yield,
+                    Op::LoadImm { dest: 0, imm: Immediate::I32(2) },
+                    Op::Ret { src: 0 },
+                ],
+                is_native: false,
+                native_id: None,
+            }],
+            strings: vec![],
+            entry: 0,
+        };
+        assert_eq!(Op::Yield.to_string(), "yield");
+        let mut vm = Vm::new(&module, VmOptions::default());
+        assert_eq!(vm.run_budget(1_000).unwrap(), Step::Yielded);
+        assert_eq!(vm.steps(), 2, "yield counts as an instruction");
+        assert!(!vm.is_finished());
+        assert_eq!(vm.run_budget(1_000).unwrap(), Step::Finished(Value::I32(2)));
+        assert!(vm.is_finished());
+        assert_eq!(vm.steps(), 4);
+        let mut plain = Vm::new(&module, VmOptions::default());
+        assert_eq!(plain.run().unwrap(), Value::I32(2));
+        assert_eq!(plain.steps(), 4);
+    }
+
+    #[test]
+    fn array_index_reads_are_linear() {
+        let n = 20_000;
+        let mut src = String::from("fn main() -> i32 {\n    let xs = [");
+        for i in 0..n {
+            if i > 0 {
+                src.push_str(", ");
+            }
+            src.push('1');
+        }
+        src.push_str(&format!(
+            "];\n    let mut i = 0;\n    let mut s = 0;\n    while i < {n} {{\n        s = s + xs[i];\n        i = i + 1;\n    }}\n    return s;\n}}\n"
+        ));
+        let bc = bytecode_of(&src);
+        let t = std::time::Instant::now();
+        let (v, _, steps) = execute_captured(&bc).expect("vm");
+        let elapsed = t.elapsed();
+        assert_eq!(v, Value::I32(n));
+        assert!(steps > n as u64 && steps < 20 * n as u64, "steps = {steps}");
+        assert!(elapsed.as_secs_f64() < 2.0, "20k-element sum took {elapsed:?} (O(n^2) regression?)");
     }
 }

@@ -139,11 +139,14 @@ cargo run -- run examples/hello.ae
 cargo run -- run examples/fib.ae -O2 --stats --timings
 cargo run -- run examples/opaque.ae -O2
 cargo run -- run stdlib/math.ae
+cargo run -- run examples/fib.ae --include stdlib/prelude.ae
 ```
 
 `stdlib/math.ae` **não** é importado por outros ficheiros. A linguagem 0.2
 não tem `mod` / `use`. O ficheiro é um programa autónomo com `main`, para
-copiar rotinas para o seu `.ae`.
+copiar rotinas para o seu `.ae`. Para partilhar código entre ficheiros a
+CLI tem `--include FILE` (§6): `stdlib/prelude.ae` é um ficheiro sem
+`main` feito para isso.
 
 ---
 
@@ -319,14 +322,22 @@ Opções comuns:
 | `--stats` | estatísticas |
 | `--emit ir\|bytecode\|llvm` | artefacto de `compile` |
 | `-o PATH` | ficheiro de saída |
+| `--include FILE` | compila `FILE` junto com o principal; repetível (`check`, `run`, `compile`, `dump-*`, `optimize`, `verify`, `cfg`, `stats`, `profile`, `digest`, `bench`). `AETHER_INCLUDE=a.ae:b.ae` acrescenta includes por omissão |
+| `--max-steps N` | orçamento de instruções da VM (`run`, `profile`, `digest`, `bench`; omissão 50 000 000) |
+| `--max-depth N` | profundidade máxima de chamadas (`run`, `profile`, `digest`, `bench`; omissão 10 000) |
+| `--backend vm\|llvm` | motor de `run`: VM de bytecode (omissão) ou LLVM via `lli` |
 | `--iters N` | iterações do fuzzer (omissão: 200) |
 | `--seed N` | semente (aceita `0x…`) |
 | `--kind …` | suíte de fuzz |
-| `--n N` | argumento de `benchmark` (Fibonacci) |
+| `--n N` | repetições de `bench` (omissão 5) / argumento de `benchmark` (Fibonacci, omissão 20) |
 
 Códigos de saída: `0` ok, `1` erro de compilação / fuzz failure, `2` erro de
-runtime. Num erro de runtime a CLI imprime primeiro o stdout produzido até
-ali e depois `runtime error: ...`.
+runtime (incluindo `--max-steps` / `--max-depth` excedidos). Num erro de
+runtime a CLI imprime primeiro o stdout produzido até ali e depois
+`runtime error: ...`.
+
+Todos os comandos correm numa thread com 64 MiB de pilha, para que programas
+muito aninhados nunca rebentem a pilha da thread principal.
 
 ### `check`
 
@@ -338,7 +349,24 @@ Compila e executa. É o comando do dia-a-dia.
 
 ```bash
 aether run examples/opt_demo.ae -O2 --timings --stats
+aether run game.ae --include stdlib/prelude.ae
+aether run examples/loops.ae --max-steps 100000
+aether run examples/hello.ae --backend llvm
 ```
+
+Com `--backend llvm` a CLI emite o LLVM IR textual e executa-o com `lli`
+(`lli-18` ou `lli` no `PATH`), imprimindo o stdout. Sem `lli`: erro claro e
+`exit 1`. Sob `lli` o valor devolvido por `main` é o código de saída do
+processo, por isso um `main` que devolve ≠ 0 é reportado como falha.
+
+### Vários ficheiros: `--include`
+
+Não há `mod`/`use`, mas o driver compila vários ficheiros como um programa:
+cada ficheiro tem o seu `FileId` e é lexado em separado (os diagnósticos
+apontam para o ficheiro certo), os tokens são concatenados e analisados uma
+vez. Nomes repetidos entre ficheiros dão `duplicate function`.
+`stdlib/prelude.ae` (`lerp`, `sign`, `is_even`, `gcd`, `clamp_f64`,
+`wrap_index`, `sum_to`; sem `main`) existe para ser incluído assim.
 
 ### `compile`
 
@@ -367,8 +395,24 @@ mensurável de que o otimizador faz alguma coisa (não inventar speedups).
 
 ### `repl`
 
-Linhas até uma linha vazia = um programa. Se não houver `fn main`, o
-texto é envolvido num `main`. `:quit` sai.
+Linhas até uma linha vazia = uma entrada. Entradas que começam por `fn`,
+`struct` ou `extern` são definições e ficam guardadas para as seguintes
+(redefinir substitui; um erro descarta só a entrada nova). Qualquer outra
+entrada é embrulhada num `main` novo e executada contra as definições
+guardadas (`=> valor`). `:items` lista os nomes, `:reset` esquece-os,
+`:quit` sai. Detalhe em `docs/cli.md`.
+
+### `bench`
+
+```bash
+aether bench examples/fib.ae --n 5
+make bench          # benchmarks/*.ae
+```
+
+Compila o ficheiro em `-O0` e `-O2`, corre cada nível N vezes e imprime, por
+nível, µs de execução (mínimo e mediana), passos da VM, número de instruções
+IR e o valor; no fim o speedup `-O2` vs `-O0`. Avisa se os dois níveis
+divergirem no resultado.
 
 ### `benchmark`
 

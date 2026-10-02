@@ -195,4 +195,17 @@ mod tests {
         assert!(out.contains("fn main"));
         assert!(out.contains("return"));
     }
+
+    #[test]
+    fn pretty_prints_bitwise_and_desugared_compound_assignment() {
+        let src = "fn main() -> i32 { let mut x = 1; x <<= 2; x ^= !x & 3 | 4 >> 1; return x; }";
+        let (toks, _) = tokenize(FileId(0), src);
+        let (prog, diags) = parse(toks);
+        assert!(!diags.has_errors());
+        let out = pretty_program(&prog);
+        assert!(out.contains("x = (x << 2);"), "{out}");
+        assert!(out.contains("x = (x ^ (((!x) & 3) | (4 >> 1)));"), "{out}");
+        let dumped = crate::ast::dump_program(&prog);
+        assert!(dumped.contains("x = (x << 2);"), "{dumped}");
+    }
 }

@@ -18,3 +18,4 @@
 .aether-cache/
 # harness worktrees / local agent state
 .claude/
+/target175

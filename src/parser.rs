@@ -276,7 +276,9 @@ impl Parser {
                 return false;
             }
         };
-        if self.eat(TokenKind::Eq) {
+        let compound = compound_assign_op(self.peek_kind());
+        if compound.is_some() || self.check(TokenKind::Eq) {
+            self.bump();
             let value = match self.parse_expr() {
                 Some(v) => v,
                 None => {
@@ -286,6 +288,10 @@ impl Parser {
             };
             self.expect(TokenKind::Semicolon);
             let span = expr.span.merge(self.prev_span());
+            let value = match compound {
+                Some(op) => desugar_compound(&expr, op, value),
+                None => value,
+            };
             stmts.push(Stmt::Assign {
                 target: expr,
                 value,
@@ -365,10 +371,16 @@ impl Parser {
 
     fn parse_expr_stmt(&mut self) -> Option<Stmt> {
         let expr = self.parse_expr()?;
-        if self.eat(TokenKind::Eq) {
+        let compound = compound_assign_op(self.peek_kind());
+        if compound.is_some() || self.check(TokenKind::Eq) {
+            self.bump();
             let value = self.parse_expr()?;
             self.expect(TokenKind::Semicolon)?;
             let span = expr.span.merge(self.prev_span());
+            let value = match compound {
+                Some(op) => desugar_compound(&expr, op, value),
+                None => value,
+            };
             Some(Stmt::Assign {
                 target: expr,
                 value,
@@ -494,7 +506,7 @@ impl Parser {
         loop {
             let kind = self.peek_kind();
             if kind == TokenKind::As {
-                if min_prec > 9 {
+                if min_prec > PREC_CAST {
                     break;
                 }
                 lhs = self.parse_cast(lhs)?;
@@ -563,15 +575,31 @@ impl Parser {
             TokenKind::Int => {
                 let value = parse_int(&tok.lexeme);
                 if value.is_none() {
-                    self.error_at("invalid integer literal", tok.span, None);
+                    self.error_at(
+                        "invalid integer literal",
+                        tok.span,
+                        Some("integer literals must fit in 64 bits; forms: 255, 1_000, 0xFF, 0b1010, 0o17"),
+                    );
                 }
                 Literal::Int(value.unwrap_or(0))
             }
-            TokenKind::Float => Literal::Float(tok.lexeme.parse::<f64>().unwrap_or(0.0)),
+            TokenKind::Float => Literal::Float(parse_float(&tok.lexeme).unwrap_or(0.0)),
             TokenKind::True => Literal::Bool(true),
             TokenKind::False => Literal::Bool(false),
-            TokenKind::String => Literal::String(unescape_string(&tok.lexeme)),
-            _ => Literal::Char(unescape_char(&tok.lexeme)),
+            TokenKind::String => {
+                let (s, bad) = unescape_string(&tok.lexeme);
+                if bad {
+                    self.bad_unicode_escape(tok.span);
+                }
+                Literal::String(s)
+            }
+            _ => {
+                let (c, bad) = unescape_char(&tok.lexeme);
+                if bad {
+                    self.bad_unicode_escape(tok.span);
+                }
+                Literal::Char(c)
+            }
         };
         Some(Expr {
             kind: ExprKind::Literal(lit),
@@ -639,7 +667,7 @@ impl Parser {
 
     fn parse_unary(&mut self, op: UnOp) -> Option<Expr> {
         let start = self.bump().span;
-        let expr = self.parse_prec(12)?;
+        let expr = self.parse_prec(PREC_UNARY)?;
         let span = start.merge(expr.span);
         Some(Expr {
             kind: ExprKind::Unary {
@@ -930,8 +958,25 @@ impl Parser {
         }
         self.diags.push(d);
     }
+
+    fn bad_unicode_escape(&mut self, span: Span) {
+        self.diags.push(
+            Diagnostic::error("invalid unicode escape", span)
+                .with_code("E0005")
+                .with_help("write `\\u{XXXX}` with 1 to 6 hex digits naming a Unicode scalar value"),
+        );
+    }
 }
 
+/// Binding power of `as`: above arithmetic, below prefix operators.
+const PREC_CAST: u8 = 11;
+/// Binding power of the prefix operators `-` and `!`.
+const PREC_UNARY: u8 = 12;
+
+/// Precedence table (`docs/language.md`), loosest first:
+/// `||` 1, `&&` 2, `== !=` 3, `< <= > >=` 4, `|` 5, `^` 6, `&` 7, `<< >>` 8,
+/// `+ -` 9, `* / %` 10, `as` 11, prefix 12. All infix operators are
+/// left-associative.
 fn infix_info(kind: TokenKind) -> Option<(u8, bool, BinOp)> {
     // precedence, right-associative, op
     match kind {
@@ -943,20 +988,74 @@ fn infix_info(kind: TokenKind) -> Option<(u8, bool, BinOp)> {
         TokenKind::LtEq => Some((4, false, BinOp::Le)),
         TokenKind::Gt => Some((4, false, BinOp::Gt)),
         TokenKind::GtEq => Some((4, false, BinOp::Ge)),
-        TokenKind::Plus => Some((5, false, BinOp::Add)),
-        TokenKind::Minus => Some((5, false, BinOp::Sub)),
-        TokenKind::Star => Some((6, false, BinOp::Mul)),
-        TokenKind::Slash => Some((6, false, BinOp::Div)),
-        TokenKind::Percent => Some((6, false, BinOp::Rem)),
+        TokenKind::Pipe => Some((5, false, BinOp::BitOr)),
+        TokenKind::Caret => Some((6, false, BinOp::BitXor)),
+        TokenKind::Amp => Some((7, false, BinOp::BitAnd)),
+        TokenKind::Shl => Some((8, false, BinOp::Shl)),
+        TokenKind::Shr => Some((8, false, BinOp::Shr)),
+        TokenKind::Plus => Some((9, false, BinOp::Add)),
+        TokenKind::Minus => Some((9, false, BinOp::Sub)),
+        TokenKind::Star => Some((10, false, BinOp::Mul)),
+        TokenKind::Slash => Some((10, false, BinOp::Div)),
+        TokenKind::Percent => Some((10, false, BinOp::Rem)),
         _ => None,
     }
 }
 
-fn parse_int(lexeme: &str) -> Option<i64> {
-    lexeme.parse::<i64>().ok()
+/// The binary operator behind a compound-assignment token (`+=` → `+`).
+fn compound_assign_op(kind: TokenKind) -> Option<BinOp> {
+    Some(match kind {
+        TokenKind::PlusEq => BinOp::Add,
+        TokenKind::MinusEq => BinOp::Sub,
+        TokenKind::StarEq => BinOp::Mul,
+        TokenKind::SlashEq => BinOp::Div,
+        TokenKind::PercentEq => BinOp::Rem,
+        TokenKind::AmpEq => BinOp::BitAnd,
+        TokenKind::PipeEq => BinOp::BitOr,
+        TokenKind::CaretEq => BinOp::BitXor,
+        TokenKind::ShlEq => BinOp::Shl,
+        TokenKind::ShrEq => BinOp::Shr,
+        _ => return None,
+    })
 }
 
-fn unescape_string(lexeme: &str) -> String {
+/// `target op= value` is sugar for `target = target op value`. The target
+/// is evaluated twice (once as a value, once as a place), so a call inside
+/// an index expression (`a[f()] += 1`) runs twice; documented in
+/// `docs/language.md`.
+fn desugar_compound(target: &Expr, op: BinOp, value: Expr) -> Expr {
+    let span = target.span.merge(value.span);
+    Expr {
+        kind: ExprKind::Binary {
+            op,
+            lhs: Box::new(target.clone()),
+            rhs: Box::new(value),
+        },
+        span,
+    }
+}
+
+/// Decimal, `0x`, `0b` or `0o` with optional `_` separators; the value must
+/// fit in `i64` (hex and friends denote values, not bit patterns, so
+/// `0xFFFF_FFFF_FFFF_FFFF` is rejected).
+fn parse_int(lexeme: &str) -> Option<i64> {
+    let digits: String = lexeme.chars().filter(|c| *c != '_').collect();
+    let (radix, body) = match digits.get(..2) {
+        Some("0x") => (16, &digits[2..]),
+        Some("0b") => (2, &digits[2..]),
+        Some("0o") => (8, &digits[2..]),
+        _ => (10, digits.as_str()),
+    };
+    i64::from_str_radix(body, radix).ok()
+}
+
+fn parse_float(lexeme: &str) -> Option<f64> {
+    let digits: String = lexeme.chars().filter(|c| *c != '_').collect();
+    digits.parse::<f64>().ok()
+}
+
+/// Returns the decoded string and whether an invalid `\u{...}` was seen.
+fn unescape_string(lexeme: &str) -> (String, bool) {
     let inner = if lexeme.len() >= 2 && lexeme.starts_with('"') && lexeme.ends_with('"') {
         &lexeme[1..lexeme.len() - 1]
     } else if lexeme.starts_with('"') {
@@ -967,18 +1066,24 @@ fn unescape_string(lexeme: &str) -> String {
     unescape(inner)
 }
 
-fn unescape_char(lexeme: &str) -> char {
+fn unescape_char(lexeme: &str) -> (char, bool) {
     let inner = if lexeme.len() >= 2 && lexeme.starts_with('\'') && lexeme.ends_with('\'') {
         &lexeme[1..lexeme.len() - 1]
     } else {
         lexeme
     };
-    unescape(inner).chars().next().unwrap_or('\0')
+    let (s, bad) = unescape(inner);
+    (s.chars().next().unwrap_or('\0'), bad)
 }
 
-fn unescape(s: &str) -> String {
+/// Escapes: `\n \t \r \0 \\ \" \'` and `\u{XXXX}` (1–6 hex digits naming a
+/// Unicode scalar value). A malformed `\u{...}` decodes to U+FFFD and sets
+/// the flag so the parser can report E0005 and carry on. Unknown escapes
+/// are kept verbatim.
+fn unescape(s: &str) -> (String, bool) {
     let mut out = String::new();
-    let mut chars = s.chars();
+    let mut bad = false;
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
@@ -989,6 +1094,31 @@ fn unescape(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
                 Some('\'') => out.push('\''),
+                Some('u') if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    let mut hex = String::new();
+                    let mut closed = false;
+                    while let Some(&h) = chars.peek() {
+                        chars.next();
+                        if h == '}' {
+                            closed = true;
+                            break;
+                        }
+                        hex.push(h);
+                    }
+                    let decoded = if closed && !hex.is_empty() && hex.len() <= 6 {
+                        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                    } else {
+                        None
+                    };
+                    match decoded {
+                        Some(ch) => out.push(ch),
+                        None => {
+                            bad = true;
+                            out.push('\u{FFFD}');
+                        }
+                    }
+                }
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
@@ -999,7 +1129,7 @@ fn unescape(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    (out, bad)
 }
 
 pub fn parse(tokens: Vec<Token>) -> (Program, Diagnostics) {
@@ -1180,6 +1310,157 @@ mod tests {
         assert_eq!(prog.items.len(), 1);
         let (_, diags) = parse_src(&nested_parens(MAX_NESTING - 1));
         assert!(diags.iter().any(|d| d.code == Some("E0101")));
+    }
+
+    fn first_stmt(src: &str) -> Stmt {
+        let (prog, diags) = parse_src(src);
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        let Item::Fn(f) = &prog.items[0] else { panic!() };
+        f.body.as_ref().unwrap().stmts[0].clone()
+    }
+
+    fn return_expr(src: &str) -> Expr {
+        let Stmt::Return { value: Some(e), .. } = first_stmt(src) else { panic!() };
+        e
+    }
+
+    #[test]
+    fn compound_assignment_desugars_to_assign_with_binary() {
+        for (src, op) in [
+            ("fn main() -> i32 { x += 1; }", BinOp::Add),
+            ("fn main() -> i32 { x -= 1; }", BinOp::Sub),
+            ("fn main() -> i32 { x *= 1; }", BinOp::Mul),
+            ("fn main() -> i32 { x /= 1; }", BinOp::Div),
+            ("fn main() -> i32 { x %= 1; }", BinOp::Rem),
+            ("fn main() -> i32 { x &= 1; }", BinOp::BitAnd),
+            ("fn main() -> i32 { x |= 1; }", BinOp::BitOr),
+            ("fn main() -> i32 { x ^= 1; }", BinOp::BitXor),
+            ("fn main() -> i32 { x <<= 1; }", BinOp::Shl),
+            ("fn main() -> i32 { x >>= 1; }", BinOp::Shr),
+        ] {
+            let Stmt::Assign { target, value, .. } = first_stmt(src) else {
+                panic!("{src}")
+            };
+            assert!(matches!(target.kind, ExprKind::Ident(_)), "{src}");
+            let ExprKind::Binary { op: got, lhs, .. } = &value.kind else {
+                panic!("{src}")
+            };
+            assert_eq!(*got, op, "{src}");
+            assert_eq!(**lhs, target, "{src}");
+        }
+        // `a[i] += v` and `p.x -= v` keep the full place expression as lhs;
+        // the right operand binds the whole expression (`x += 1 + 2`).
+        let Stmt::Assign { target, value, .. } =
+            first_stmt("fn main() -> i32 { a[i] += 1 + 2; }")
+        else {
+            panic!()
+        };
+        assert!(matches!(target.kind, ExprKind::Index { .. }));
+        let ExprKind::Binary { op: BinOp::Add, lhs, rhs } = &value.kind else { panic!() };
+        assert_eq!(**lhs, target);
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+        let Stmt::Assign { target, .. } = first_stmt("fn main() -> i32 { p.x -= 2; }") else {
+            panic!()
+        };
+        assert!(matches!(target.kind, ExprKind::Field { .. }));
+        // also when the statement is the last thing in a block
+        let (prog, diags) = parse_src("fn main() -> i32 { let mut x = 1; x += 2; }");
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        let Item::Fn(f) = &prog.items[0] else { panic!() };
+        assert_eq!(f.body.as_ref().unwrap().stmts.len(), 2);
+    }
+
+    #[test]
+    fn bitwise_precedence_is_rust_like() {
+        // `|` 5 < `^` 6 < `&` 7 < `<< >>` 8 < `+ -` 9, all tighter than `==`.
+        let e = return_expr("fn main() -> i32 { return 1 | 2 & 3 == 3; }");
+        let ExprKind::Binary { op: BinOp::Eq, lhs, .. } = &e.kind else { panic!("{e:?}") };
+        let ExprKind::Binary { op: BinOp::BitOr, rhs, .. } = &lhs.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+
+        let e = return_expr("fn main() -> i32 { return a ^ b & c | d; }");
+        let ExprKind::Binary { op: BinOp::BitOr, lhs, .. } = &e.kind else { panic!("{e:?}") };
+        let ExprKind::Binary { op: BinOp::BitXor, rhs, .. } = &lhs.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+
+        // `1 << 2 + 3` is `1 << (2 + 3)`; `a & b << 1` is `a & (b << 1)`
+        let e = return_expr("fn main() -> i32 { return 1 << 2 + 3; }");
+        let ExprKind::Binary { op: BinOp::Shl, rhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+        let e = return_expr("fn main() -> i32 { return a & b << 1; }");
+        let ExprKind::Binary { op: BinOp::BitAnd, rhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::Shl, .. }));
+
+        // shifts are left-associative; `as` binds tighter than `<<`; `!` tighter than `as`
+        let e = return_expr("fn main() -> i32 { return a >> 1 >> 2; }");
+        let ExprKind::Binary { op: BinOp::Shr, lhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(lhs.kind, ExprKind::Binary { op: BinOp::Shr, .. }));
+        let e = return_expr("fn main() -> i32 { return a << b as i32; }");
+        let ExprKind::Binary { op: BinOp::Shl, rhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Cast { .. }));
+        let e = return_expr("fn main() -> i32 { return !a as i64; }");
+        let ExprKind::Cast { expr, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(expr.kind, ExprKind::Unary { op: UnOp::Not, .. }));
+        // `&&`/`||` still loosest
+        let e = return_expr("fn main() -> i32 { return a & b && c | d; }");
+        let ExprKind::Binary { op: BinOp::And, lhs, rhs } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(lhs.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::BitOr, .. }));
+    }
+
+    #[test]
+    fn integer_literal_forms_and_range() {
+        for (src, want) in [
+            ("0xFF", 255),
+            ("0xff", 255),
+            ("0b1010", 10),
+            ("0o17", 15),
+            ("1_000_000", 1_000_000),
+            ("0x7FFF_FFFF_FFFF_FFFF", i64::MAX),
+            ("0", 0),
+        ] {
+            let e = return_expr(&format!("fn main() -> i32 {{ return {src}; }}"));
+            assert_eq!(e.kind, ExprKind::Literal(Literal::Int(want)), "{src}");
+        }
+        let e = return_expr("fn main() -> f64 { return 1_000.000_5; }");
+        assert_eq!(e.kind, ExprKind::Literal(Literal::Float(1000.0005)));
+        for src in ["0x", "0b", "0o8", "0xFFFF_FFFF_FFFF_FFFF", "99999999999999999999"] {
+            let (_, diags) = parse_src(&format!("fn main() -> i32 {{ return {src}; }}"));
+            let out = render(&diags);
+            assert!(out.contains("invalid integer literal"), "{src}: {out}");
+        }
+    }
+
+    #[test]
+    fn unicode_escapes_in_char_and_string() {
+        let e = return_expr(r"fn main() -> i32 { return '\u{41}'; }");
+        assert_eq!(e.kind, ExprKind::Literal(Literal::Char('A')));
+        let e = return_expr(r#"fn main() -> i32 { return "a\u{1F600}b\u{0}"; }"#);
+        assert_eq!(
+            e.kind,
+            ExprKind::Literal(Literal::String("a\u{1F600}b\0".into()))
+        );
+        // invalid escapes: E0005, but the literal still parses (U+FFFD)
+        for src in [
+            r#"fn main() -> i32 { return "\u{}"; }"#,
+            r#"fn main() -> i32 { return "\u{110000}"; }"#,
+            r#"fn main() -> i32 { return "\u{D800}"; }"#,
+            r#"fn main() -> i32 { return "\u{1234567}"; }"#,
+            r#"fn main() -> i32 { return "\u{zz}"; }"#,
+            r#"fn main() -> i32 { return "\u{41"; }"#,
+        ] {
+            let (prog, diags) = parse_src(src);
+            assert_eq!(
+                diags.iter().filter(|d| d.code == Some("E0005")).count(),
+                1,
+                "{src}: {}",
+                render(&diags)
+            );
+            assert_eq!(prog.items.len(), 1, "{src}");
+        }
+        // `\u` without a brace is an unknown escape, kept verbatim as before
+        let e = return_expr(r#"fn main() -> i32 { return "\u41"; }"#);
+        assert_eq!(e.kind, ExprKind::Literal(Literal::String("\\u41".into())));
     }
 
     #[test]

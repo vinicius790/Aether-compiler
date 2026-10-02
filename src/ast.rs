@@ -218,6 +218,14 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// Integer-only bitwise operators; `Shl`/`Shr` take a shift amount of
+    /// the left operand's type and mask it to the bit width (see
+    /// `docs/language.md`).
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -236,11 +244,23 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::And => "&&",
             BinOp::Or => "||",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
     }
 
     pub fn is_logical(self) -> bool {
         matches!(self, BinOp::And | BinOp::Or)
+    }
+
+    pub fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        )
     }
 
     pub fn is_cmp(self) -> bool {

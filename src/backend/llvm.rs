@@ -48,6 +48,16 @@ fn native_sig(name: &str) -> Option<(Vec<Type>, Type)> {
         "print_f64" => (vec![Type::F64], Type::Unit),
         "print_bool" | "assert" => (vec![Type::Bool], Type::Unit),
         "len" => (vec![Type::String], Type::I32),
+        "print_char" => (vec![Type::Char], Type::Unit),
+        "to_string" => (vec![Type::I32], Type::String),
+        "i64_to_string" => (vec![Type::I64], Type::String),
+        "f64_to_string" => (vec![Type::F64], Type::String),
+        "char_to_string" => (vec![Type::Char], Type::String),
+        "abs" => (vec![Type::I32], Type::I32),
+        "min" | "max" => (vec![Type::I32, Type::I32], Type::I32),
+        "clamp" => (vec![Type::I32, Type::I32, Type::I32], Type::I32),
+        "sqrt" | "floor" | "ceil" => (vec![Type::F64], Type::F64),
+        "pow_i32" => (vec![Type::I32, Type::I32], Type::I32),
         _ => return None,
     })
 }
@@ -58,7 +68,10 @@ fn is_builtin(name: &str) -> bool {
 
 /// C symbols the prelude declares; a user function with one of these names is
 /// renamed so the module does not define a symbol twice.
-const RESERVED: &[&str] = &["printf", "puts", "strcmp", "strlen", "memcmp", "malloc", "abort"];
+const RESERVED: &[&str] = &[
+    "printf", "puts", "strcmp", "strlen", "memcmp", "malloc", "abort", "snprintf", "abs", "sqrt",
+    "floor", "ceil",
+];
 
 /// Module-wide emission state shared by all functions.
 struct ModuleCtx<'a> {
@@ -111,6 +124,15 @@ pub fn emit_llvm_ir(module: &IrModule) -> String {
     out.push_str("declare i64 @strlen(ptr)\n");
     out.push_str("declare ptr @malloc(i64)\n");
     out.push_str("declare void @abort() noreturn\n");
+    out.push_str("declare i32 @snprintf(ptr, i64, ptr, ...)\n");
+    out.push_str("declare double @llvm.sqrt.f64(double)\n");
+    out.push_str("declare double @llvm.floor.f64(double)\n");
+    out.push_str("declare double @llvm.ceil.f64(double)\n");
+    out.push_str("@.fmt.c = private unnamed_addr constant [4 x i8] c\"%c\\0A\\00\"\n");
+    out.push_str("@.fmt.d0 = private unnamed_addr constant [3 x i8] c\"%d\\00\"\n");
+    out.push_str("@.fmt.lld0 = private unnamed_addr constant [5 x i8] c\"%lld\\00\"\n");
+    out.push_str("@.fmt.g0 = private unnamed_addr constant [3 x i8] c\"%g\\00\"\n");
+    out.push_str("@.fmt.c0 = private unnamed_addr constant [3 x i8] c\"%c\\00\"\n");
     for decl in cx.extern_decls.values() {
         out.push_str(decl);
         out.push('\n');
@@ -187,6 +209,106 @@ ok:
 fail:
   call void @abort()
   unreachable
+}
+
+define void @print_char(i32 %c) {
+entry:
+  %t0 = call i32 (ptr, ...) @printf(ptr @.fmt.c, i32 %c)
+  ret void
+}
+
+define ptr @to_string(i32 %v) {
+entry:
+  %buf = call ptr @malloc(i64 32)
+  %t0 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.fmt.d0, i32 %v)
+  ret ptr %buf
+}
+
+define ptr @i64_to_string(i64 %v) {
+entry:
+  %buf = call ptr @malloc(i64 32)
+  %t0 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 32, ptr @.fmt.lld0, i64 %v)
+  ret ptr %buf
+}
+
+define ptr @f64_to_string(double %v) {
+entry:
+  %buf = call ptr @malloc(i64 64)
+  %t0 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 64, ptr @.fmt.g0, double %v)
+  ret ptr %buf
+}
+
+define ptr @char_to_string(i32 %c) {
+entry:
+  %buf = call ptr @malloc(i64 8)
+  %t0 = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 8, ptr @.fmt.c0, i32 %c)
+  ret ptr %buf
+}
+
+define i32 @abs.ae(i32 %x) {
+entry:
+  %neg = sub i32 0, %x
+  %isneg = icmp slt i32 %x, 0
+  %r = select i1 %isneg, i32 %neg, i32 %x
+  ret i32 %r
+}
+
+define i32 @min(i32 %a, i32 %b) {
+entry:
+  %c = icmp slt i32 %a, %b
+  %r = select i1 %c, i32 %a, i32 %b
+  ret i32 %r
+}
+
+define i32 @max(i32 %a, i32 %b) {
+entry:
+  %c = icmp sgt i32 %a, %b
+  %r = select i1 %c, i32 %a, i32 %b
+  ret i32 %r
+}
+
+define i32 @clamp(i32 %x, i32 %lo, i32 %hi) {
+entry:
+  %m = call i32 @min(i32 %hi, i32 %x)
+  %r = call i32 @max(i32 %lo, i32 %m)
+  ret i32 %r
+}
+
+define double @sqrt.ae(double %x) {
+entry:
+  %r = call double @llvm.sqrt.f64(double %x)
+  ret double %r
+}
+
+define double @floor.ae(double %x) {
+entry:
+  %r = call double @llvm.floor.f64(double %x)
+  ret double %r
+}
+
+define double @ceil.ae(double %x) {
+entry:
+  %r = call double @llvm.ceil.f64(double %x)
+  ret double %r
+}
+
+define i32 @pow_i32(i32 %base, i32 %exp) {
+entry:
+  %neg = icmp slt i32 %exp, 0
+  br i1 %neg, label %zero, label %loop
+zero:
+  ret i32 0
+loop:
+  %acc = phi i32 [ 1, %entry ], [ %acc2, %body ]
+  %i = phi i32 [ 0, %entry ], [ %i2, %body ]
+  %done = icmp sge i32 %i, %exp
+  br i1 %done, label %exit, label %body
+body:
+  %acc2 = mul i32 %acc, %base
+  %i2 = add i32 %i, 1
+  br label %loop
+exit:
+  ret i32 %acc
 }
 "#;
 
@@ -666,6 +788,12 @@ fn emit_bin(fx: &mut FnCtx, dest: Reg, op: BinOp, ty: &Type, lhs: Reg, rhs: Reg)
                     fx.store(dest, &t);
                     return;
                 }
+                // sema never types bitwise operators on floats
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+                    fx.line("; UNSUPPORTED: bitwise operator on f64");
+                    fx.line("call void @abort()");
+                    return;
+                }
             };
             fx.line(&format!("{t} = {opcode} double {a}, {b}"));
         }
@@ -678,8 +806,20 @@ fn emit_bin(fx: &mut FnCtx, dest: Reg, op: BinOp, ty: &Type, lhs: Reg, rhs: Reg)
                 BinOp::Mul => "mul".to_string(),
                 BinOp::Div => "sdiv".to_string(),
                 BinOp::Rem => "srem".to_string(),
-                BinOp::And => "and".to_string(),
-                BinOp::Or => "or".to_string(),
+                BinOp::And | BinOp::BitAnd => "and".to_string(),
+                BinOp::Or | BinOp::BitOr => "or".to_string(),
+                BinOp::BitXor => "xor".to_string(),
+                // Shift amounts are masked like the VM (`& 31` / `& 63`), so
+                // over-wide shifts wrap instead of producing poison.
+                BinOp::Shl | BinOp::Shr => {
+                    let mask = if *ty == Type::I64 { 63 } else { 31 };
+                    let m = fx.tmp();
+                    fx.line(&format!("{m} = and {lty} {b}, {mask}"));
+                    let opc = if op == BinOp::Shl { "shl" } else { "ashr" };
+                    fx.line(&format!("{t} = {opc} {lty} {a}, {m}"));
+                    fx.store(dest, &t);
+                    return;
+                }
                 cmp => format!("icmp {}", icmp_pred(cmp)),
             };
             fx.line(&format!("{t} = {opcode} {lty} {a}, {b}"));

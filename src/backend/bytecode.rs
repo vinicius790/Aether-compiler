@@ -9,7 +9,7 @@
 use crate::ast::{BinOp, UnOp};
 use crate::ir::{ConstValue, Inst, IrFunction, IrModule, Terminator};
 use crate::ty::Type;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,9 +124,9 @@ pub enum Op {
     AllocArr { dest: u16, len: u32 },
     LoadIdx { dest: u16, base: u16, index: u16 },
     StoreIdx { base: u16, index: u16, value: u16 },
-    AllocObj { dest: u16, fields: u8 },
-    LoadField { dest: u16, base: u16, field: u8 },
-    StoreField { base: u16, field: u8, value: u16 },
+    AllocObj { dest: u16, fields: u16 },
+    LoadField { dest: u16, base: u16, field: u16 },
+    StoreField { base: u16, field: u16, value: u16 },
     Concat { dest: u16, lhs: u16, rhs: u16 },
     /// Cooperative scheduling point: `Vm::run_budget` returns `Step::Yielded`
     /// right after this instruction; `Vm::run` treats it as a no-op.
@@ -150,6 +150,10 @@ pub struct BcFunction {
     pub code: Vec<Op>,
     pub is_native: bool,
     pub native_id: Option<u16>,
+    /// Declared return type of an `extern fn` bound to the host (`None` for
+    /// everything else). The VM checks the value a host closure returns
+    /// against it, so a mistyped binding is a runtime error, not garbage.
+    pub ret_ty: Option<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,8 +229,8 @@ impl fmt::Display for Op {
             Op::OrBool { dest, lhs, rhs } => write!(f, "or r{dest}, r{lhs}, r{rhs}"),
             Op::NotBool { dest, src } => write!(f, "not r{dest}, r{src}"),
             Op::Jump { target } => write!(f, "jmp {target}"),
-            Op::JumpIf { cond, target } => write!(f, "jz r{cond}, {target}"),
-            Op::JumpIfNot { cond, target } => write!(f, "jnz r{cond}, {target}"),
+            Op::JumpIf { cond, target } => write!(f, "jnz r{cond}, {target}"),
+            Op::JumpIfNot { cond, target } => write!(f, "jz r{cond}, {target}"),
             Op::Call { func, dest, args } => write!(f, "call f{func} -> {dest:?} {args:?}"),
             Op::CallNative { id, dest, args } => write!(f, "native #{id} -> {dest:?} {args:?}"),
             Op::Ret { src } => write!(f, "ret r{src}"),
@@ -265,16 +269,43 @@ impl fmt::Display for Op {
 /// Largest register index the VM can address.
 pub const MAX_REGS: u32 = u16::MAX as u32;
 
-pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
-    let mut strings: Vec<String> = Vec::new();
-    let intern = |strings: &mut Vec<String>, s: &str| -> u32 {
-        if let Some(i) = strings.iter().position(|x| x == s) {
-            i as u32
-        } else {
-            strings.push(s.to_string());
-            (strings.len() - 1) as u32
+/// Largest number of fields an object (struct, tuple or enum slot list) may
+/// have: `AllocObj`/`LoadField`/`StoreField` carry a `u16`.
+pub const MAX_FIELDS: usize = u16::MAX as usize;
+
+/// Largest array the VM allocates (`AllocArr`). A literal beyond this is a
+/// compile error (E0300) and the VM refuses the same size at runtime instead
+/// of aborting the process on allocation failure.
+pub const MAX_ARRAY_LEN: usize = 1 << 28;
+
+/// Constant pool with O(1) interning.
+#[derive(Default)]
+struct Pool {
+    strings: Vec<String>,
+    index: HashMap<String, u32>,
+}
+
+impl Pool {
+    fn intern(&mut self, s: &str) -> Result<u32, String> {
+        if let Some(&i) = self.index.get(s) {
+            return Ok(i);
         }
-    };
+        let i = u32::try_from(self.strings.len()).map_err(|_| "too many string constants".to_string())?;
+        self.strings.push(s.to_string());
+        self.index.insert(s.to_string(), i);
+        Ok(i)
+    }
+}
+
+/// What the assembler knows about the module while lowering one function.
+struct Ctx<'a> {
+    names: &'a HashMap<String, u32>,
+    /// Parameter count of every IR function, to check call arity.
+    arities: &'a HashMap<&'a str, usize>,
+}
+
+pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
+    let mut pool = Pool::default();
 
     // built-in natives first so user functions follow; the id is the index
     // in `runtime::NATIVES`
@@ -293,6 +324,7 @@ pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
             code: Vec::new(),
             is_native: true,
             native_id: Some(*id),
+            ret_ty: None,
         });
     }
 
@@ -301,7 +333,11 @@ pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
         name_to_idx.insert(f.name.clone(), i as u32);
     }
     // A user function with a built-in's name shadows the native (sema agrees).
+    let mut arities: HashMap<&str, usize> = HashMap::new();
     for f in &module.functions {
+        if arities.insert(f.name.as_str(), f.params.len()).is_some() {
+            return Err(format!("duplicate function `{}`", f.name));
+        }
         let idx = functions.len() as u32;
         name_to_idx.insert(f.name.clone(), idx);
         functions.push(BcFunction {
@@ -311,15 +347,20 @@ pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
             code: Vec::new(),
             is_native: f.is_extern,
             native_id: None,
+            ret_ty: f.is_extern.then(|| f.return_ty.clone()),
         });
     }
 
+    let ctx = Ctx {
+        names: &name_to_idx,
+        arities: &arities,
+    };
     for irf in &module.functions {
         if irf.is_extern {
             continue;
         }
         let idx = *name_to_idx.get(&irf.name).unwrap();
-        let (code, nregs) = lower_function(irf, &name_to_idx, &mut strings, intern)?;
+        let (code, nregs) = lower_function(irf, &ctx, &mut pool)?;
         functions[idx as usize].code = code;
         functions[idx as usize].nregs = nregs;
         functions[idx as usize].arity = arity_of(irf)?;
@@ -328,7 +369,7 @@ pub fn assemble(module: &IrModule) -> Result<BytecodeModule, String> {
     let entry = *name_to_idx.get("main").unwrap_or(&0);
     Ok(BytecodeModule {
         functions,
-        strings,
+        strings: pool.strings,
         entry,
     })
 }
@@ -347,22 +388,99 @@ fn too_many_regs(name: &str, n: u64) -> String {
     format!("function `{name}` needs {n} registers; the VM supports at most {MAX_REGS}")
 }
 
-/// Narrow an IR register to a VM register. Callers check `reg_count` up
-/// front, so this only fires on malformed IR that references a register
-/// beyond the function's declared count.
+/// Narrow an IR register to a VM register. `check_function` has already
+/// verified every register against `reg_count`, so this only fires on a
+/// declared count that exceeds what a `u16` can address.
 fn reg(r: crate::ir::Reg, fname: &str) -> Result<u16, String> {
     u16::try_from(r.0).map_err(|_| too_many_regs(fname, r.0 as u64 + 1))
 }
 
-fn lower_function(
-    f: &IrFunction,
-    names: &HashMap<String, u32>,
-    strings: &mut Vec<String>,
-    intern: fn(&mut Vec<String>, &str) -> u32,
-) -> Result<(Vec<Op>, u16), String> {
+/// Rejects, before any code is emitted, everything that would make the VM
+/// read or write outside a frame, jump outside a function or call with the
+/// wrong number of arguments. Well-formed IR from the compiler never trips
+/// these; hand-built or fuzzed IR gets a diagnostic instead of silent `Unit`s.
+fn check_function(f: &IrFunction, ctx: &Ctx<'_>) -> Result<(), String> {
     if f.reg_count > MAX_REGS {
         return Err(too_many_regs(&f.name, f.reg_count as u64));
     }
+    if f.blocks.is_empty() {
+        return Err(format!("function `{}` has no blocks", f.name));
+    }
+    let name = &f.name;
+    let in_range = |r: crate::ir::Reg, what: &str| -> Result<(), String> {
+        if r.0 >= f.reg_count {
+            Err(format!(
+                "function `{name}`: {what} register %{} is outside the {} declared registers",
+                r.0, f.reg_count
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    for (i, (_, _, r)) in f.params.iter().enumerate() {
+        if r.0 as usize != i {
+            return Err(format!(
+                "function `{name}`: parameter {i} lives in %{}, parameters must occupy the first registers",
+                r.0
+            ));
+        }
+        in_range(*r, "parameter")?;
+    }
+    let mut ids: HashSet<u32> = HashSet::new();
+    for bb in &f.blocks {
+        if !ids.insert(bb.id.0) {
+            return Err(format!("function `{name}` has two blocks numbered {}", bb.id.0));
+        }
+    }
+    let target_ok = |t: crate::ir::BlockId| -> Result<(), String> {
+        if ids.contains(&t.0) {
+            Ok(())
+        } else {
+            Err(format!("function `{name}` jumps to the missing block bb{}", t.0))
+        }
+    };
+    for bb in &f.blocks {
+        for inst in &bb.insts {
+            for u in inst.uses() {
+                in_range(u, "source")?;
+            }
+            if let Some(d) = inst.dest_reg() {
+                in_range(d, "destination")?;
+            }
+            if let Inst::Call { func, args, .. } = inst {
+                if !ctx.names.contains_key(func) {
+                    return Err(format!("unknown function `{func}`"));
+                }
+                if let Some(&n) = ctx.arities.get(func.as_str()) {
+                    if n != args.len() {
+                        return Err(format!(
+                            "function `{name}` calls `{func}` with {} arguments, it takes {n}",
+                            args.len()
+                        ));
+                    }
+                }
+            }
+        }
+        match &bb.term {
+            Terminator::Jump { target } => target_ok(*target)?,
+            Terminator::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
+                in_range(*cond, "branch condition")?;
+                target_ok(*then_bb)?;
+                target_ok(*else_bb)?;
+            }
+            Terminator::Return { value: Some(r) } => in_range(*r, "return value")?,
+            Terminator::Return { value: None } | Terminator::Unreachable => {}
+        }
+    }
+    Ok(())
+}
+
+fn lower_function(f: &IrFunction, ctx: &Ctx<'_>, pool: &mut Pool) -> Result<(Vec<Op>, u16), String> {
+    check_function(f, ctx)?;
 
     // Map block ids to instruction offsets after layout.
     let mut block_start: HashMap<u32, u32> = HashMap::new();
@@ -374,7 +492,7 @@ fn lower_function(
     for bb in &f.blocks {
         block_start.insert(bb.id.0, code.len() as u32);
         for inst in &bb.insts {
-            emit_inst(inst, &f.name, &mut code, names, strings, intern)?;
+            emit_inst(inst, &f.name, &mut code, ctx, pool)?;
         }
         match &bb.term {
             Terminator::Jump { target } => {
@@ -410,16 +528,16 @@ fn lower_function(
         }
     }
 
-    // Patch jumps
+    // Patch jumps; `check_function` guarantees every target block exists.
     for op in &mut code {
         match op {
             Op::Jump { target } if *target & BLOCK_FLAG != 0 => {
                 let bid = *target & !BLOCK_FLAG;
-                *target = *block_start.get(&bid).unwrap_or(&0);
+                *target = block_start[&bid];
             }
             Op::JumpIf { target, .. } | Op::JumpIfNot { target, .. } if *target & BLOCK_FLAG != 0 => {
                 let bid = *target & !BLOCK_FLAG;
-                *target = *block_start.get(&bid).unwrap_or(&0);
+                *target = block_start[&bid];
             }
             _ => {}
         }
@@ -429,18 +547,25 @@ fn lower_function(
     Ok((code, nregs))
 }
 
+/// Field index / field count as the `u16` the field opcodes carry.
+fn field_u16(n: usize, what: &str, fname: &str) -> Result<u16, String> {
+    u16::try_from(n).map_err(|_| {
+        format!("function `{fname}`: {what} {n} exceeds the {MAX_FIELDS} fields a struct, tuple or enum may have")
+    })
+}
+
 fn emit_inst(
     inst: &Inst,
     fname: &str,
     code: &mut Vec<Op>,
-    names: &HashMap<String, u32>,
-    strings: &mut Vec<String>,
-    intern: fn(&mut Vec<String>, &str) -> u32,
+    ctx: &Ctx<'_>,
+    pool: &mut Pool,
 ) -> Result<(), String> {
+    let names = ctx.names;
     match inst {
         Inst::LoadConst { dest, value } => match value {
             ConstValue::String(s) => {
-                let idx = intern(strings, s);
+                let idx = pool.intern(s)?;
                 code.push(Op::LoadStr {
                     dest: reg(*dest, fname)?,
                     idx,
@@ -449,7 +574,7 @@ fn emit_inst(
             other => {
                 code.push(Op::LoadImm {
                     dest: reg(*dest, fname)?,
-                    imm: const_to_imm(other, strings, intern),
+                    imm: const_to_imm(other, pool)?,
                 });
             }
         },
@@ -506,7 +631,11 @@ fn emit_inst(
                 (BinOp::Ne | BinOp::Le | BinOp::Gt | BinOp::Ge, Type::I64 | Type::F64)
                 | (BinOp::Ne, Type::Bool)
                 | (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, Type::Char)
-                | (BinOp::Eq | BinOp::Ne, Type::String) => Op::Cmp {
+                | (BinOp::Eq | BinOp::Ne, Type::String)
+                | (
+                    BinOp::Eq | BinOp::Ne,
+                    Type::Array { .. } | Type::Struct { .. } | Type::Tuple(_) | Type::Enum { .. },
+                ) => Op::Cmp {
                     op: CmpOp::from_bin(*op).expect("comparison operator"),
                     dest: d,
                     lhs: l,
@@ -598,25 +727,32 @@ fn emit_inst(
         } => code.push(Op::LoadField {
             dest: reg(*dest, fname)?,
             base: reg(*base, fname)?,
-            field: *index as u8,
+            field: field_u16(*index, "field index", fname)?,
         }),
         Inst::FieldStore {
             base, index, value, ..
         } => code.push(Op::StoreField {
             base: reg(*base, fname)?,
-            field: *index as u8,
+            field: field_u16(*index, "field index", fname)?,
             value: reg(*value, fname)?,
         }),
-        Inst::AllocArray { dest, len, .. } => code.push(Op::AllocArr {
-            dest: reg(*dest, fname)?,
-            len: *len as u32,
-        }),
+        Inst::AllocArray { dest, len, .. } => {
+            let n = usize::try_from(*len).ok().filter(|n| *n <= MAX_ARRAY_LEN).ok_or_else(|| {
+                format!("function `{fname}`: array of {len} elements exceeds the VM limit of {MAX_ARRAY_LEN}")
+            })?;
+            code.push(Op::AllocArr {
+                dest: reg(*dest, fname)?,
+                len: n as u32,
+            });
+        }
         Inst::AllocStruct { dest, ty } => {
             // structs, tuples and enums (tag + payload slots) are all objects
-            let n = ty.layout_fields().map(|f| f.len()).unwrap_or(0) as u8;
+            let Some(fields) = ty.layout_fields() else {
+                return Err(format!("function `{fname}`: cannot allocate an object of type `{ty}`"));
+            };
             code.push(Op::AllocObj {
                 dest: reg(*dest, fname)?,
-                fields: n,
+                fields: field_u16(fields.len(), "field count", fname)?,
             });
         }
         Inst::Yield => code.push(Op::Yield),
@@ -625,20 +761,16 @@ fn emit_inst(
     Ok(())
 }
 
-fn const_to_imm(
-    v: &ConstValue,
-    strings: &mut Vec<String>,
-    intern: fn(&mut Vec<String>, &str) -> u32,
-) -> Immediate {
-    match v {
+fn const_to_imm(v: &ConstValue, pool: &mut Pool) -> Result<Immediate, String> {
+    Ok(match v {
         ConstValue::I32(x) => Immediate::I32(*x),
         ConstValue::I64(x) => Immediate::I64(*x),
         ConstValue::F64(x) => Immediate::F64(x.to_bits()),
         ConstValue::Bool(x) => Immediate::Bool(*x),
-        ConstValue::String(s) => Immediate::Str(intern(strings, s)),
+        ConstValue::String(s) => Immediate::Str(pool.intern(s)?),
         ConstValue::Char(c) => Immediate::Char(*c as u32),
         ConstValue::Unit => Immediate::Unit,
-    }
+    })
 }
 
 #[cfg(test)]

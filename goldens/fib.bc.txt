@@ -45,7 +45,7 @@ fn pow_i32 #20 arity=1 regs=1
 fn fib #21 arity=1 regs=9
   0000  loadimm r1, I32(2)
   0001  lti32 r2, r0, r1
-  0002  jz r2, 4
+  0002  jnz r2, 4
   0003  jmp 5
   0004  ret r0
   0005  loadimm r1, I32(1)

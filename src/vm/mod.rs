@@ -5,7 +5,8 @@
 //! wrapper. `extern fn` declarations are bound at runtime through
 //! [`Vm::with_host_fn`] / [`HostFn`].
 
-use crate::backend::bytecode::{BytecodeModule, CmpOp, Immediate, Op};
+use crate::backend::bytecode::{BcFunction, BytecodeModule, CmpOp, Immediate, Op, MAX_ARRAY_LEN};
+use crate::ty::Type;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
@@ -530,15 +531,7 @@ impl<'a> Vm<'a> {
                 if callee_fn.is_native {
                     let result = match callee_fn.native_id {
                         Some(nid) => self.call_native(nid, &argv)?,
-                        None => match self.host.get_mut(callee_fn.name.as_str()) {
-                            Some(f) => f(&argv)?,
-                            None => {
-                                return Err(VmError::Native(format!(
-                                    "extern function `{}` has no implementation in the VM",
-                                    callee_fn.name
-                                )))
-                            }
-                        },
+                        None => self.call_host(callee_fn, &argv)?,
                     };
                     if let Some(d) = dest {
                         set_reg(result, &mut self.frames, *d);
@@ -640,10 +633,16 @@ impl<'a> Vm<'a> {
                 set_reg(Value::Char(c), &mut self.frames, *dest);
             }
             Op::AllocArr { dest, len } => {
+                if *len as usize > MAX_ARRAY_LEN {
+                    return Err(array_too_long(*len));
+                }
                 set_reg(Value::array(vec![Value::I32(0); *len as usize]), &mut self.frames, *dest);
             }
             Op::LoadIdx { dest, base, index } => {
-                let idx = reg(&self.frames, *index).as_i32();
+                let idx = match reg(&self.frames, *index) {
+                    Value::I32(i) => *i,
+                    other => return Err(index_err(other)),
+                };
                 // Only the element is cloned, never the container.
                 let v = match reg(&self.frames, *base) {
                     Value::Array(xs) => {
@@ -659,12 +658,15 @@ impl<'a> Vm<'a> {
                             None => return Err(VmError::Runtime("string index out of bounds".into())),
                         }
                     }
-                    other => return Err(VmError::Runtime(format!("cannot index {other}"))),
+                    other => return Err(type_err("index", other)),
                 };
                 set_reg(v, &mut self.frames, *dest);
             }
             Op::StoreIdx { base, index, value } => {
-                let idx = reg(&self.frames, *index).as_i32();
+                let idx = match reg(&self.frames, *index) {
+                    Value::I32(i) => *i,
+                    other => return Err(index_err(other)),
+                };
                 let val = reg(&self.frames, *value).clone();
                 let frame = self.frames.last_mut().expect("frame");
                 match frame.regs.get_mut(*base as usize) {
@@ -676,7 +678,8 @@ impl<'a> Vm<'a> {
                         // register/value still shares it.
                         Rc::make_mut(xs)[idx as usize] = val;
                     }
-                    _ => return Err(VmError::Runtime("store into non-array".into())),
+                    Some(other) => return Err(type_err("store into", other)),
+                    None => return Err(VmError::Runtime("store into a missing register".into())),
                 }
             }
             Op::AllocObj { dest, fields } => {
@@ -684,24 +687,42 @@ impl<'a> Vm<'a> {
             }
             Op::LoadField { dest, base, field } => {
                 let v = match reg(&self.frames, *base) {
-                    Value::Object(xs) => xs.get(*field as usize).cloned().unwrap_or(Value::Unit),
-                    _ => Value::Unit,
+                    Value::Object(xs) => match xs.get(*field as usize) {
+                        Some(v) => v.clone(),
+                        None => return Err(field_err(*field, Some(xs.len()), "read", "object")),
+                    },
+                    other => return Err(field_err(*field, None, "read", other.type_name())),
                 };
                 set_reg(v, &mut self.frames, *dest);
             }
             Op::StoreField { base, field, value } => {
                 let val = reg(&self.frames, *value).clone();
                 let frame = self.frames.last_mut().expect("frame");
-                if let Some(Value::Object(xs)) = frame.regs.get_mut(*base as usize) {
-                    if (*field as usize) < xs.len() {
+                match frame.regs.get_mut(*base as usize) {
+                    Some(Value::Object(xs)) => {
+                        if (*field as usize) >= xs.len() {
+                            return Err(field_err(*field, Some(xs.len()), "write", "object"));
+                        }
                         Rc::make_mut(xs)[*field as usize] = val;
                     }
+                    Some(other) => return Err(field_err(*field, None, "write", other.type_name())),
+                    None => return Err(VmError::Runtime("store into a missing register".into())),
                 }
             }
             Op::Concat { dest, lhs, rhs } => {
-                // `Display` for `Str` writes the raw text, so this equals
-                // the old "unwrap strings, `to_string` the rest" path.
-                let s = format!("{}{}", reg(&self.frames, *lhs), reg(&self.frames, *rhs));
+                let s = match (reg(&self.frames, *lhs), reg(&self.frames, *rhs)) {
+                    (Value::Str(a), Value::Str(b)) => {
+                        let n = a.len().saturating_add(b.len());
+                        if n > MAX_STRING_BYTES {
+                            return Err(string_too_long(n));
+                        }
+                        let mut s = String::with_capacity(n);
+                        s.push_str(a);
+                        s.push_str(b);
+                        s
+                    }
+                    (a, b) => return Err(concat_err(a, b)),
+                };
                 set_reg(Value::Str(s), &mut self.frames, *dest);
             }
             Op::Yield => return Ok(Flow::Yield),
@@ -710,53 +731,95 @@ impl<'a> Vm<'a> {
         Ok(Flow::Continue)
     }
 
+    /// Runs the host closure bound to an `extern fn` and checks what it
+    /// returned against the declared return type.
+    #[inline(never)]
+    fn call_host(&mut self, callee_fn: &BcFunction, argv: &[Value]) -> Result<Value, VmError> {
+        let Some(f) = self.host.get_mut(callee_fn.name.as_str()) else {
+            return Err(VmError::Native(format!(
+                "extern function `{}` has no implementation in the VM",
+                callee_fn.name
+            )));
+        };
+        let v = f(argv)?;
+        match &callee_fn.ret_ty {
+            // unit externs: whatever the host returns is dropped
+            Some(Type::Unit) => Ok(Value::Unit),
+            Some(t) if !value_has_type(&v, t) => Err(VmError::Native(format!(
+                "extern function `{}` returned {} but is declared to return `{t}`",
+                callee_fn.name,
+                describe(&v)
+            ))),
+            _ => Ok(v),
+        }
+    }
+
+    #[inline(never)]
     fn call_native(&mut self, id: u16, args: &[Value]) -> Result<Value, VmError> {
+        let io_err = |e: io::Error| VmError::Native(e.to_string());
         match id {
             0 => {
-                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
-                write!(self.stdout, "{s}").map_err(|e| VmError::Native(e.to_string()))?;
+                let s = arg_str(id, args, 0)?;
+                write!(self.stdout, "{s}").map_err(io_err)?;
                 Ok(Value::Unit)
             }
-            1 | 2 | 3 | 4 | 5 => {
-                let s = args.first().map(|v| v.to_string()).unwrap_or_default();
-                writeln!(self.stdout, "{s}").map_err(|e| VmError::Native(e.to_string()))?;
+            1 => {
+                let s = arg_str(id, args, 0)?;
+                writeln!(self.stdout, "{s}").map_err(io_err)?;
                 Ok(Value::Unit)
             }
-            6 => {
-                let n = match args.first() {
-                    Some(Value::Str(s)) => s.chars().count() as i32,
-                    Some(Value::Array(xs)) => xs.len() as i32,
-                    _ => 0,
-                };
-                Ok(Value::I32(n))
+            2 => {
+                let v = arg_i32(id, args, 0)?;
+                writeln!(self.stdout, "{v}").map_err(io_err)?;
+                Ok(Value::Unit)
             }
+            3 => {
+                let v = arg_i64(id, args, 0)?;
+                writeln!(self.stdout, "{v}").map_err(io_err)?;
+                Ok(Value::Unit)
+            }
+            4 => {
+                let v = arg_f64(id, args, 0)?;
+                writeln!(self.stdout, "{v}").map_err(io_err)?;
+                Ok(Value::Unit)
+            }
+            5 => {
+                let v = arg_bool(id, args, 0)?;
+                writeln!(self.stdout, "{v}").map_err(io_err)?;
+                Ok(Value::Unit)
+            }
+            6 => match args.first() {
+                Some(Value::Str(s)) => Ok(Value::I32(i32::try_from(s.chars().count()).unwrap_or(i32::MAX))),
+                Some(Value::Array(xs)) => Ok(Value::I32(i32::try_from(xs.len()).unwrap_or(i32::MAX))),
+                other => Err(bad_arg(id, 0, "string or array", other)),
+            },
             7 => {
-                if !args.first().map(|v| v.as_bool()).unwrap_or(false) {
+                if !arg_bool(id, args, 0)? {
                     return Err(VmError::Native("assertion failed".into()));
                 }
                 Ok(Value::Unit)
             }
             8 => {
-                let c = match args.first() {
-                    Some(Value::Char(c)) => *c,
-                    other => char::from_u32(other.map(|v| v.as_i32()).unwrap_or(0) as u32).unwrap_or('\u{FFFD}'),
-                };
-                writeln!(self.stdout, "{c}").map_err(|e| VmError::Native(e.to_string()))?;
+                let c = arg_char(id, args, 0)?;
+                writeln!(self.stdout, "{c}").map_err(io_err)?;
                 Ok(Value::Unit)
             }
-            9 | 10 | 11 | 12 => Ok(Value::Str(args.first().map(|v| v.to_string()).unwrap_or_default())),
-            13 => Ok(Value::I32(arg_i32(args, 0).wrapping_abs())),
-            14 => Ok(Value::I32(arg_i32(args, 0).min(arg_i32(args, 1)))),
-            15 => Ok(Value::I32(arg_i32(args, 0).max(arg_i32(args, 1)))),
+            9 => Ok(Value::Str(arg_i32(id, args, 0)?.to_string())),
+            10 => Ok(Value::Str(arg_i64(id, args, 0)?.to_string())),
+            11 => Ok(Value::Str(arg_f64(id, args, 0)?.to_string())),
+            12 => Ok(Value::Str(arg_char(id, args, 0)?.to_string())),
+            13 => Ok(Value::I32(arg_i32(id, args, 0)?.wrapping_abs())),
+            14 => Ok(Value::I32(arg_i32(id, args, 0)?.min(arg_i32(id, args, 1)?))),
+            15 => Ok(Value::I32(arg_i32(id, args, 0)?.max(arg_i32(id, args, 1)?))),
             16 => {
-                let (x, lo, hi) = (arg_i32(args, 0), arg_i32(args, 1), arg_i32(args, 2));
+                let (x, lo, hi) = (arg_i32(id, args, 0)?, arg_i32(id, args, 1)?, arg_i32(id, args, 2)?);
                 Ok(Value::I32(lo.max(hi.min(x))))
             }
-            17 => Ok(Value::F64(arg_f64(args, 0).sqrt())),
-            18 => Ok(Value::F64(arg_f64(args, 0).floor())),
-            19 => Ok(Value::F64(arg_f64(args, 0).ceil())),
+            17 => Ok(Value::F64(arg_f64(id, args, 0)?.sqrt())),
+            18 => Ok(Value::F64(arg_f64(id, args, 0)?.floor())),
+            19 => Ok(Value::F64(arg_f64(id, args, 0)?.ceil())),
             20 => {
-                let (b, e) = (arg_i32(args, 0), arg_i32(args, 1));
+                let (b, e) = (arg_i32(id, args, 0)?, arg_i32(id, args, 1)?);
                 Ok(Value::I32(if e < 0 { 0 } else { b.wrapping_pow(e as u32) }))
             }
             _ => Err(VmError::Native(format!("unknown native #{id}"))),
@@ -834,8 +897,142 @@ fn copy_reg(frames: &mut [Frame], dest: u16, src: u16) {
 
 fn read_i32(frames: &[Frame], r: u16) -> i32 { reg(frames, r).as_i32() }
 
-fn arg_i32(args: &[Value], i: usize) -> i32 { args.get(i).map(|v| v.as_i32()).unwrap_or(0) }
-fn arg_f64(args: &[Value], i: usize) -> f64 { args.get(i).map(|v| v.as_f64()).unwrap_or(0.0) }
+/// Largest string the VM builds by concatenation (256 MiB). Without a bound,
+/// `s = s + s` in a loop aborts the whole process on allocation failure.
+pub const MAX_STRING_BYTES: usize = 1 << 28;
+
+#[cold]
+#[inline(never)]
+fn index_err(v: &Value) -> VmError {
+    VmError::Runtime(format!("index must be i32, got {}", v.type_name()))
+}
+
+// Error constructors live out of line so the dispatch loop stays small.
+
+#[cold]
+#[inline(never)]
+fn field_err(field: u16, len: Option<usize>, verb: &str, ty: &str) -> VmError {
+    VmError::Runtime(match len {
+        Some(n) => format!("cannot {verb} field {field}: the object has {n} fields"),
+        None => format!("cannot {verb} field {field} of a value of type {ty}"),
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn type_err(what: &str, v: &Value) -> VmError {
+    VmError::Runtime(format!("cannot {what} a value of type {}", v.type_name()))
+}
+
+#[cold]
+#[inline(never)]
+fn concat_err(a: &Value, b: &Value) -> VmError {
+    VmError::Runtime(format!("cannot concatenate {} with {}", a.type_name(), b.type_name()))
+}
+
+#[cold]
+#[inline(never)]
+fn string_too_long(n: usize) -> VmError {
+    VmError::Runtime(format!("string of {n} bytes exceeds the limit of {MAX_STRING_BYTES}"))
+}
+
+#[cold]
+#[inline(never)]
+fn array_too_long(n: u32) -> VmError {
+    VmError::Runtime(format!("array of {n} elements exceeds the limit of {MAX_ARRAY_LEN}"))
+}
+
+fn bad_arg(id: u16, i: usize, want: &str, got: Option<&Value>) -> VmError {
+    let name = crate::runtime::NATIVES.get(id as usize).copied().unwrap_or("?");
+    let got = got.map_or("nothing", Value::type_name);
+    VmError::Native(format!("`{name}` expects {want} for argument {}, got {got}", i + 1))
+}
+
+fn arg_i32(id: u16, args: &[Value], i: usize) -> Result<i32, VmError> {
+    match args.get(i) {
+        Some(Value::I32(v)) => Ok(*v),
+        other => Err(bad_arg(id, i, "i32", other)),
+    }
+}
+
+fn arg_i64(id: u16, args: &[Value], i: usize) -> Result<i64, VmError> {
+    match args.get(i) {
+        Some(Value::I64(v)) => Ok(*v),
+        other => Err(bad_arg(id, i, "i64", other)),
+    }
+}
+
+fn arg_f64(id: u16, args: &[Value], i: usize) -> Result<f64, VmError> {
+    match args.get(i) {
+        Some(Value::F64(v)) => Ok(*v),
+        other => Err(bad_arg(id, i, "f64", other)),
+    }
+}
+
+fn arg_bool(id: u16, args: &[Value], i: usize) -> Result<bool, VmError> {
+    match args.get(i) {
+        Some(Value::Bool(v)) => Ok(*v),
+        other => Err(bad_arg(id, i, "bool", other)),
+    }
+}
+
+fn arg_char(id: u16, args: &[Value], i: usize) -> Result<char, VmError> {
+    match args.get(i) {
+        Some(Value::Char(v)) => Ok(*v),
+        other => Err(bad_arg(id, i, "char", other)),
+    }
+}
+
+fn arg_str(id: u16, args: &[Value], i: usize) -> Result<&str, VmError> {
+    match args.get(i) {
+        Some(Value::Str(v)) => Ok(v),
+        other => Err(bad_arg(id, i, "string", other)),
+    }
+}
+
+/// Short description of a value for error messages (never prints a whole array).
+fn describe(v: &Value) -> String {
+    match v {
+        Value::Array(xs) => format!("an array of {} elements", xs.len()),
+        Value::Object(xs) => format!("an object of {} fields", xs.len()),
+        Value::Unit => "unit".to_string(),
+        other => format!("{} `{other}`", other.type_name()),
+    }
+}
+
+/// Does `v` have the shape of source type `t`? Used on values a host closure
+/// hands back for an `extern fn`, which the type checker never saw.
+fn value_has_type(v: &Value, t: &Type) -> bool {
+    match (t, v) {
+        (Type::Unit, Value::Unit)
+        | (Type::Bool, Value::Bool(_))
+        | (Type::I32, Value::I32(_))
+        | (Type::I64, Value::I64(_))
+        | (Type::F64, Value::F64(_))
+        | (Type::String, Value::Str(_))
+        | (Type::Char, Value::Char(_)) => true,
+        (Type::Array { elem, len }, Value::Array(xs)) => {
+            i64::try_from(xs.len()).map_or(false, |n| n == *len) && xs.iter().all(|x| value_has_type(x, elem))
+        }
+        (Type::Struct { .. } | Type::Tuple(_), Value::Object(xs)) => match t.layout_fields() {
+            Some(fields) => fields.len() == xs.len() && fields.iter().zip(xs.iter()).all(|(ft, x)| value_has_type(x, ft)),
+            None => false,
+        },
+        (Type::Enum { variants, .. }, Value::Object(xs)) => {
+            let Some(layout) = t.layout_fields() else { return false };
+            if xs.len() != layout.len() {
+                return false;
+            }
+            let Value::I32(tag) = xs[0] else { return false };
+            let Some((_, payload)) = usize::try_from(tag).ok().and_then(|i| variants.get(i)) else {
+                return false;
+            };
+            payload.iter().enumerate().all(|(i, pt)| value_has_type(&xs[i + 1], pt))
+        }
+        (Type::Error | Type::Fn { .. }, _) => true,
+        _ => false,
+    }
+}
 
 /// Integer bit operation dispatched on the left operand's width.
 fn bit_op(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f32: fn(i32, i32) -> i32, f64: fn(i64, i64) -> i64) {
@@ -898,6 +1095,18 @@ fn cmp_values(op: CmpOp, a: &Value, b: &Value) -> Result<bool, VmError> {
             CmpOp::Ge => x >= y,
         },
         (Value::Unit, Value::Unit) => matches!(op, CmpOp::Eq | CmpOp::Le | CmpOp::Ge),
+        // Aggregates compare element by element (IEEE for floats, like the
+        // lowering of tuple/struct `==`); only `==` and `!=` are defined.
+        (Value::Array(_), Value::Array(_)) | (Value::Object(_), Value::Object(_)) => match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            _ => {
+                return Err(VmError::Runtime(format!(
+                    "cannot order two values of type {}",
+                    a.type_name()
+                )))
+            }
+        },
         _ => {
             return Err(VmError::Runtime(format!(
                 "cannot compare {} with {}",
@@ -1304,6 +1513,7 @@ mod tests {
                 ],
                 is_native: false,
                 native_id: None,
+                ret_ty: None,
             }],
             strings: vec![],
             entry: 0,

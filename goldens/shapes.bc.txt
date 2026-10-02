@@ -54,7 +54,7 @@ fn area #21 arity=1 regs=9
   0001  loadfld r2, r0.0
   0002  loadimm r3, I32(0)
   0003  eqi32 r4, r2, r3
-  0004  jz r4, 7
+  0004  jnz r4, 7
   0005  jmp 12
   0006  retvoid
   0007  loadfld r5, r1.1
@@ -64,7 +64,7 @@ fn area #21 arity=1 regs=9
   0011  ret r8
   0012  loadimm r3, I32(1)
   0013  eqi32 r4, r2, r3
-  0014  jz r4, 16
+  0014  jnz r4, 16
   0015  jmp 20
   0016  loadfld r5, r1.1
   0017  loadfld r6, r1.2
@@ -72,7 +72,7 @@ fn area #21 arity=1 regs=9
   0019  ret r7
   0020  loadimm r3, I32(2)
   0021  eqi32 r4, r2, r3
-  0022  jz r4, 24
+  0022  jnz r4, 24
   0023  jmp 6
   0024  loadimm r5, F64(0)
   0025  ret r5
@@ -82,18 +82,18 @@ fn describe #22 arity=1 regs=8
   0001  loadfld r2, r0.0
   0002  loadimm r3, I32(0)
   0003  eqi32 r4, r2, r3
-  0004  jz r4, 6
+  0004  jnz r4, 6
   0005  jmp 8
   0006  loadstr r5, str[0]
   0007  ret r5
   0008  loadimm r3, I32(1)
   0009  eqi32 r4, r2, r3
-  0010  jz r4, 12
+  0010  jnz r4, 12
   0011  jmp 17
   0012  loadfld r6, r1.1
   0013  loadfld r7, r1.2
   0014  eqf64 r4, r6, r7
-  0015  jz r4, 19
+  0015  jnz r4, 19
   0016  jmp 21
   0017  loadstr r5, str[1]
   0018  ret r5
@@ -104,7 +104,7 @@ fn describe #22 arity=1 regs=8
 
 fn min_max #23 arity=2 regs=4
   0000  lti32 r2, r0, r1
-  0001  jz r2, 3
+  0001  jnz r2, 3
   0002  jmp 7
   0003  allocobj r3, 2
   0004  storefld r3.0, r0
@@ -119,13 +119,13 @@ fn code_for #24 arity=1 regs=4
   0000  mov r1, r0
   0001  loadimm r2, I32(4)
   0002  eqi32 r3, r0, r2
-  0003  jz r3, 5
+  0003  jnz r3, 5
   0004  jmp 7
   0005  loadimm r1, I32(40)
   0006  ret r1
   0007  loadimm r2, I32(9)
   0008  eqi32 r3, r1, r2
-  0009  jz r3, 11
+  0009  jnz r3, 11
   0010  jmp 13
   0011  loadimm r1, I32(0)
   0012  ret r1
@@ -170,7 +170,7 @@ fn main #25 arity=0 regs=32
   0034  loadimm r21, I32(4)
   0035  jmp 36
   0036  lti32 r22, r20, r21
-  0037  jz r22, 39
+  0037  jnz r22, 39
   0038  jmp 51
   0039  loadidx r1, r18[r20]
   0040  call f22 -> Some(23) [1]
@@ -202,7 +202,7 @@ fn main #25 arity=0 regs=32
   0066  loadfld r4, r5.0
   0067  loadimm r6, I32(1)
   0068  eqi32 r22, r4, r6
-  0069  jz r22, 96
+  0069  jnz r22, 96
   0070  jmp 103
   0071  loadimm r2, I32(9)
   0072  loadimm r4, I32(4)
@@ -227,7 +227,7 @@ fn main #25 arity=0 regs=32
   0091  loadfld r30, r29.0
   0092  eqi32 r22, r21, r30
   0093  mov r31, r22
-  0094  jz r22, 108
+  0094  jnz r22, 108
   0095  jmp 106
   0096  loadfld r3, r10.1
   0097  loadfld r7, r10.2
@@ -239,13 +239,13 @@ fn main #25 arity=0 regs=32
   0103  loadstr r23, str[5]
   0104  native #1 -> None [23]
   0105  jmp 71
-  0106  jz r31, 114
+  0106  jnz r31, 114
   0107  jmp 117
   0108  loadfld r2, r28.1
   0109  loadfld r4, r29.1
   0110  eqi32 r22, r2, r4
   0111  mov r31, r22
-  0112  jz r22, 106
+  0112  jnz r22, 106
   0113  jmp 106
   0114  loadstr r23, str[6]
   0115  native #1 -> None [23]
@@ -260,36 +260,36 @@ fn main #25 arity=0 regs=32
   0124  loadfld r6, r1.0
   0125  loadfld r9, r5.0
   0126  eqi32 r22, r6, r9
-  0127  jz r22, 132
+  0127  jnz r22, 132
   0128  jmp 129
   0129  not r31, r22
-  0130  jz r31, 158
+  0130  jnz r31, 158
   0131  jmp 160
   0132  loadimm r2, I32(0)
   0133  eqi32 r31, r6, r2
-  0134  jz r31, 136
+  0134  jnz r31, 136
   0135  jmp 142
   0136  loadfld r3, r1.1
   0137  loadfld r7, r5.1
   0138  eqf64 r31, r3, r7
   0139  mov r22, r31
-  0140  jz r31, 129
+  0140  jnz r31, 129
   0141  jmp 129
   0142  loadimm r2, I32(1)
   0143  eqi32 r31, r6, r2
-  0144  jz r31, 146
+  0144  jnz r31, 146
   0145  jmp 129
   0146  loadfld r3, r1.1
   0147  loadfld r7, r5.1
   0148  eqf64 r31, r3, r7
   0149  mov r22, r31
-  0150  jz r31, 152
+  0150  jnz r31, 152
   0151  jmp 129
   0152  loadfld r3, r1.2
   0153  loadfld r7, r5.2
   0154  eqf64 r31, r3, r7
   0155  mov r22, r31
-  0156  jz r31, 129
+  0156  jnz r31, 129
   0157  jmp 129
   0158  loadimm r2, I32(1)
   0159  ret r2

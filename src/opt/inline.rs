@@ -7,7 +7,9 @@
 //! Runs after `cf-simplify`, which removes the dead block lowering leaves
 //! after every `return`; before that pass no function is a single block.
 
+use crate::backend::bytecode::MAX_REGS;
 use crate::ir::{Inst, IrFunction, IrModule, Reg, Terminator};
+use std::collections::HashMap;
 
 const MAX_INSTS: usize = 12;
 
@@ -125,11 +127,11 @@ fn remap_inst(inst: &Inst, base: u32) -> Inst {
 }
 
 pub fn pass_inline(module: &mut IrModule) {
-    let leaves: Vec<IrFunction> = module
+    let leaves: HashMap<String, IrFunction> = module
         .functions
         .iter()
         .filter(|f| is_inlineable(f))
-        .cloned()
+        .map(|f| (f.name.clone(), f.clone()))
         .collect();
     if leaves.is_empty() {
         return;
@@ -143,11 +145,17 @@ pub fn pass_inline(module: &mut IrModule) {
                     out.push(inst);
                     continue;
                 };
-                let Some(cal) = leaves.iter().find(|c| c.name == *func && c.name != f.name) else {
+                let Some(cal) = leaves.get(func).filter(|c| c.name != f.name) else {
                     out.push(inst);
                     continue;
                 };
                 let base = f.reg_count + extra;
+                // Never grow a frame past what the VM can address: a program
+                // that assembles at -O0 must not fail to at -O2.
+                if u64::from(base) + u64::from(cal.reg_count) > u64::from(MAX_REGS) {
+                    out.push(inst);
+                    continue;
+                }
                 extra += cal.reg_count;
                 for ((_, _, pr), a) in cal.params.iter().zip(args.iter()) {
                     out.push(Inst::Move {

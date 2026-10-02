@@ -196,9 +196,15 @@ fn pretty_match(scrutinee: &Expr, arms: &[crate::ast::MatchArm], indent: usize) 
         s.push_str(&inn);
         s.push_str(&pattern_str(&arm.pattern));
         s.push_str(" => ");
-        match (&arm.body.stmts.is_empty(), &arm.body.tail) {
-            (true, Some(t)) => {
+        match (&arm.body.stmts.as_slice(), &arm.body.tail) {
+            ([], Some(t)) => {
                 s.push_str(&pretty_expr(t, indent + 1));
+                s.push(',');
+            }
+            // `{ match .. }` re-parses as an expression arm (the match becomes
+            // the block's tail), so print it that way to stay a fixpoint
+            ([Stmt::Match { scrutinee, arms: inner, .. }], None) => {
+                s.push_str(&pretty_match(scrutinee, inner, indent + 1));
                 s.push(',');
             }
             _ => s.push_str(&pretty_block(&arm.body, indent + 1)),

@@ -9,6 +9,14 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- VM/assembler/optimizer audit: DCE keeps trapping ops (div/rem by non-constant, index loads), liveness
+  to a true fixpoint, CSE soundness and O(n) data structures, 256+ field structs (u16 field index),
+  strict VM type errors instead of silent `Unit`, host extern results type-checked (`BcFunction.ret_ty`),
+  assembler validates IR (E0300), string/array size caps, inliner respects the 65535-register limit,
+  `==` on arrays, `jnz`/`jz` disassembly names
+- Fuzz: `lang` kind (enums, match, tuples, compound assignment, bit ops, built-ins, modules), shared
+  oracles (-O0/-O1/-O2, verify, determinism, run_budget equivalence, fmt fixpoint), seed mixing fix
+- Sema: array literals take the expected element type; `-(-2147483648)` wraps instead of being a literal error
 - Nested variant/literal/tuple patterns, `let (a, (b, c)) = t;`; `match` as an expression
   (arm values, E0273, never-typed diverging arms); matrix exhaustiveness with a witness in
   E0270; warning W0272 (unreachable arm); E0274 (name bound twice in a pattern); `==` on arrays

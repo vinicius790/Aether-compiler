@@ -151,6 +151,10 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
 /// Removes functions that `main` can never reach (typically leaves that were
 /// inlined everywhere). Extern declarations are kept: they are bound by the host.
 pub fn pass_dead_functions(module: &mut IrModule) {
+    // A library (no `main`) has no root to measure reachability from.
+    if module.function("main").is_none() {
+        return;
+    }
     let mut live: HashSet<String> = HashSet::new();
     let mut stack = vec!["main".to_string()];
     while let Some(name) = stack.pop() {
@@ -173,6 +177,9 @@ pub fn pass_dead_functions(module: &mut IrModule) {
         .functions
         .retain(|f| f.is_extern || live.contains(&f.name));
 }
+
+/// Longest string constant `const-fold` will build (bytes).
+const MAX_FOLDED_STRING: usize = 1 << 16;
 
 /// Compare two constants of the same type the way the VM would.
 fn fold_cmp<T: PartialOrd>(op: BinOp, a: T, b: T) -> Option<ConstValue> {
@@ -221,7 +228,11 @@ fn fold_bin(op: BinOp, _ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option
         (BinOp::Div, F64(a), F64(b)) => Some(F64(a / b)),
         (BinOp::And, Bool(a), Bool(b)) => Some(Bool(*a && *b)),
         (BinOp::Or, Bool(a), Bool(b)) => Some(Bool(*a || *b)),
-        (BinOp::Add, String(a), String(b)) => Some(String(format!("{a}{b}"))),
+        // Bounded: folding must not blow the constant pool up (the VM builds
+        // longer strings at runtime, where `StepLimit` still applies).
+        (BinOp::Add, String(a), String(b)) if a.len() + b.len() <= MAX_FOLDED_STRING => {
+            Some(String(format!("{a}{b}")))
+        }
         (_, I32(a), I32(b)) => fold_cmp(op, a, b),
         (_, I64(a), I64(b)) => fold_cmp(op, a, b),
         (_, F64(a), F64(b)) => fold_cmp(op, a, b),
@@ -485,10 +496,27 @@ fn is_int_const(c: &ConstValue, v: i64) -> bool {
 
 /// Local common-subexpression elimination (CS143 lecture 14:
 /// value numbering inside a basic block).
+///
+/// `seen` maps `(op, lhs, rhs)` to the register holding the result. An entry
+/// dies when any register it mentions (operands or result) is redefined, and
+/// when an `IndexStore`/`FieldStore` mutates an operand in place (operands of
+/// `==` on arrays are aggregates). `deps` indexes entries by register so each
+/// invalidation costs the entries it kills, not the whole table.
 pub fn pass_local_cse(module: &mut IrModule) {
+    type Key = (u8, u32, u32);
+
+    fn kill(seen: &mut HashMap<Key, u32>, deps: &mut HashMap<u32, Vec<Key>>, r: u32) {
+        if let Some(keys) = deps.remove(&r) {
+            for k in keys {
+                seen.remove(&k);
+            }
+        }
+    }
+
     for f in &mut module.functions {
         for bb in &mut f.blocks {
-            let mut seen: HashMap<(u8, u32, u32), u32> = HashMap::new();
+            let mut seen: HashMap<Key, u32> = HashMap::new();
+            let mut deps: HashMap<u32, Vec<Key>> = HashMap::new();
             for inst in &mut bb.insts {
                 if let Inst::Bin {
                     dest,
@@ -499,20 +527,25 @@ pub fn pass_local_cse(module: &mut IrModule) {
                 } = inst.clone()
                 {
                     let key = (op as u8, lhs.0, rhs.0);
-                    if let Some(&prev) = seen.get(&key) {
+                    let hit = seen.get(&key).copied();
+                    kill(&mut seen, &mut deps, dest.0);
+                    if let Some(prev) = hit {
                         *inst = Inst::Move {
                             dest,
                             src: Reg(prev),
                         };
-                        seen.retain(|(_, a, b), d| {
-                            *a != dest.0 && *b != dest.0 && *d != dest.0
-                        });
-                        continue;
+                    } else if dest.0 != lhs.0 && dest.0 != rhs.0 {
+                        // `r = op r, x` overwrites its own operand: the entry
+                        // would describe the old `r`, so it is never recorded.
+                        seen.insert(key, dest.0);
+                        for r in [lhs.0, rhs.0, dest.0] {
+                            deps.entry(r).or_default().push(key);
+                        }
                     }
-                    seen.retain(|(_, a, b), d| *a != dest.0 && *b != dest.0 && *d != dest.0);
-                    seen.insert(key, dest.0);
+                } else if let Inst::IndexStore { base, .. } | Inst::FieldStore { base, .. } = inst {
+                    kill(&mut seen, &mut deps, base.0);
                 } else if let Some(d) = inst.dest_reg() {
-                    seen.retain(|(_, a, b), prev| *a != d.0 && *b != d.0 && *prev != d.0);
+                    kill(&mut seen, &mut deps, d.0);
                 }
             }
         }
@@ -525,25 +558,43 @@ pub fn pass_local_cse(module: &mut IrModule) {
 /// store through a register must neither be redirected to the register it
 /// was copied from, nor leave aliases alive on either side of the copy.
 pub fn pass_copy_prop(module: &mut IrModule) {
+    /// Drops every alias whose target is `r`.
+    fn kill_targets(alias: &mut HashMap<u32, u32>, rev: &mut HashMap<u32, Vec<u32>>, r: u32) {
+        if let Some(ds) = rev.remove(&r) {
+            for d in ds {
+                if alias.get(&d) == Some(&r) {
+                    alias.remove(&d);
+                }
+            }
+        }
+    }
+
     for f in &mut module.functions {
         for bb in &mut f.blocks {
+            // alias[d] = s: `d` currently holds a copy of `s`; `rev[s]` lists
+            // the `d`s (possibly stale) so a write to `s` finds them without
+            // scanning the whole map.
             let mut alias: HashMap<u32, u32> = HashMap::new();
+            let mut rev: HashMap<u32, Vec<u32>> = HashMap::new();
             for inst in &mut bb.insts {
                 // resolve uses
                 rewrite_uses(inst, &alias);
                 if let Inst::IndexStore { base, .. } | Inst::FieldStore { base, .. } = inst {
                     let b = base.0;
-                    alias.retain(|k, v| *k != b && *v != b);
+                    alias.remove(&b);
+                    kill_targets(&mut alias, &mut rev, b);
                     continue;
                 }
                 if let Inst::Move { dest, src } = inst {
                     if dest.0 != src.0 {
-                        alias.retain(|_, v| *v != dest.0);
-                        alias.insert(dest.0, resolve(&alias, src.0));
+                        kill_targets(&mut alias, &mut rev, dest.0);
+                        let root = resolve(&alias, src.0);
+                        alias.insert(dest.0, root);
+                        rev.entry(root).or_default().push(dest.0);
                     }
                 } else if let Some(d) = inst.dest_reg() {
-                    alias.retain(|_, v| *v != d.0);
                     alias.remove(&d.0);
+                    kill_targets(&mut alias, &mut rev, d.0);
                 }
             }
             match &mut bb.term {
@@ -638,13 +689,14 @@ pub fn pass_cf_simplify(module: &mut IrModule) {
         }
         // drop unreachable blocks
         let mut live = HashSet::new();
+        let index: HashMap<u32, usize> = f.blocks.iter().enumerate().map(|(i, b)| (b.id.0, i)).collect();
         if let Some(first) = f.blocks.first() {
             let mut stack = vec![first.id];
             while let Some(id) = stack.pop() {
                 if !live.insert(id.0) {
                     continue;
                 }
-                if let Some(bb) = f.blocks.iter().find(|b| b.id == id) {
+                if let Some(bb) = index.get(&id.0).map(|&i| &f.blocks[i]) {
                     match bb.term {
                         Terminator::Jump { target } => stack.push(target),
                         Terminator::Branch {
@@ -662,8 +714,47 @@ pub fn pass_cf_simplify(module: &mut IrModule) {
     }
 }
 
+/// Registers that hold a known nonzero integer wherever they are read: defined
+/// exactly once, by a `LoadConst`, and never a parameter.
+fn nonzero_regs(f: &IrFunction) -> HashSet<u32> {
+    let mut defs: HashMap<u32, u32> = HashMap::new();
+    let mut nonzero: HashSet<u32> = HashSet::new();
+    for (_, _, r) in &f.params {
+        *defs.entry(r.0).or_insert(0) += 2;
+    }
+    for bb in &f.blocks {
+        for inst in &bb.insts {
+            if let Some(d) = inst.dest_reg() {
+                *defs.entry(d.0).or_insert(0) += 1;
+                if let Inst::LoadConst { value, .. } = inst {
+                    if matches!(value, ConstValue::I32(v) if *v != 0) || matches!(value, ConstValue::I64(v) if *v != 0) {
+                        nonzero.insert(d.0);
+                    }
+                }
+            }
+        }
+    }
+    nonzero.retain(|r| defs.get(r) == Some(&1));
+    nonzero
+}
+
+/// An instruction whose only observable effect may be a runtime error: integer
+/// division/remainder by a divisor that is not a known nonzero constant, and
+/// element loads (bounds). Removing one when its result is dead would turn a
+/// program that traps at `-O0` into one that runs on at `-O2`.
+fn may_trap(inst: &Inst, nonzero: &HashSet<u32>) -> bool {
+    match inst {
+        Inst::Bin { op: BinOp::Div | BinOp::Rem, ty, rhs, .. } => {
+            ty.is_integer() && !nonzero.contains(&rhs.0)
+        }
+        Inst::IndexLoad { .. } => true,
+        _ => false,
+    }
+}
+
 pub fn pass_dce(module: &mut IrModule) {
     for f in &mut module.functions {
+        let nonzero = nonzero_regs(f);
         let lv = liveness::analyze_function(f);
         for bb in &mut f.blocks {
             let mut used = lv.live_out.get(&bb.id.0).cloned().unwrap_or_default();
@@ -686,15 +777,8 @@ pub fn pass_dce(module: &mut IrModule) {
                 // -O0 reports the error.
                 let effect = matches!(
                     inst,
-                    Inst::Call { .. }
-                        | Inst::IndexStore { .. }
-                        | Inst::FieldStore { .. }
-                        | Inst::IndexLoad { .. }
-                        | Inst::Yield
-                ) || matches!(
-                    inst,
-                    Inst::Bin { op: BinOp::Div | BinOp::Rem, ty, .. } if ty.is_integer()
-                );
+                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Yield
+                ) || may_trap(inst, &nonzero);
                 let dest_live = inst
                     .dest_reg()
                     .map(|d| used.contains(&d.0))

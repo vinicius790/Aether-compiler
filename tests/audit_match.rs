@@ -1333,3 +1333,23 @@ fn dead_trapping_operations_still_trap_when_optimised() {
         assert!(run_source("trap.ae", ok, level).is_ok());
     }
 }
+
+#[test]
+fn fmt_is_a_fixpoint_for_an_arm_block_holding_one_match() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("aether_fmtfix_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = "enum E { A(i32), B }\nfn main() -> i32 {\n let e = E::A(1);\n match e {\n E::A(x) => { match x { 1 => { print_i32(1); } _ => { print_i32(2); } } }\n E::B => { print_i32(3); }\n }\n return 0;\n}\n";
+    let f = dir.join("a.ae");
+    std::fs::write(&f, src).unwrap();
+    let fmt = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_aether")).args(["fmt", p.to_str().unwrap()]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let one = fmt(&f);
+    let g = dir.join("b.ae");
+    std::fs::write(&g, &one).unwrap();
+    assert_eq!(one, fmt(&g), "fmt(fmt(p)) != fmt(p)");
+    let _ = std::fs::remove_dir_all(&dir);
+}

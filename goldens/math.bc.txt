@@ -45,7 +45,7 @@ fn pow_i32 #20 arity=1 regs=1
 fn abs #21 arity=1 regs=4
   0000  loadimm r1, I32(0)
   0001  lti32 r2, r0, r1
-  0002  jz r2, 4
+  0002  jnz r2, 4
   0003  jmp 7
   0004  loadimm r1, I32(0)
   0005  subi32 r3, r1, r0
@@ -54,14 +54,14 @@ fn abs #21 arity=1 regs=4
 
 fn min #22 arity=2 regs=3
   0000  lti32 r2, r0, r1
-  0001  jz r2, 3
+  0001  jnz r2, 3
   0002  jmp 4
   0003  ret r0
   0004  ret r1
 
 fn max #23 arity=2 regs=3
   0000  gti32 r2, r0, r1
-  0001  jz r2, 3
+  0001  jnz r2, 3
   0002  jmp 4
   0003  ret r0
   0004  ret r1

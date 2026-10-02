@@ -445,8 +445,8 @@ o seu próprio `abs`).
 A VM armazena valores em registradores por frame. Arrays e structs são
 `Value::Array` / `Value::Object` no heap do processo hospedeiro (Rust).
 Como arrays e structs têm semântica de valor, não há aliasing observável
-entre variáveis: `let b = a;` copia a árvore `Value`. (No emissor LLVM,
-que é só de estudo, copiar um agregado copia o ponteiro e há aliasing.)
+entre variáveis: `let b = a;` copia a árvore `Value`. (No emissor LLVM os
+agregados ficam inline e cada cópia é um `memcpy`: também não há aliasing.)
 Não há lifetime nem GC explícito: o `Drop` do frame libera as árvores.
 
 ## Modelo de execução

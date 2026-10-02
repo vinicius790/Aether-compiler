@@ -987,7 +987,8 @@ impl Parser {
                 Literal::Char(c)
             }
         };
-        Some(Expr {
+        // `Postfix ::= Primary (...)*`: a literal takes postfixes too ("ab"[1])
+        self.parse_postfix(Expr {
             kind: ExprKind::Literal(lit),
             span: tok.span,
         })

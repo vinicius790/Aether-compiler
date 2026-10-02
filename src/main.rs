@@ -750,8 +750,8 @@ fn run_llvm(c: &Compiled, a: &Args) -> Result<ExitCode, String> {
             Ok(ExitCode::from(2))
         }
         LliStatus::Signaled(11) => {
-            // SIGSEGV: the program ran off the native stack (the LLVM backend
-            // has no call-depth limit), not a fault of the backend
+            // SIGSEGV: the program ran off the native stack (frames larger
+            // than the 1 GiB main stack allows before the depth limit trips)
             eprintln!(
                 "runtime error: the program crashed under lli (SIGSEGV; most likely a native \
                  stack overflow from deep recursion, which the VM reports as `call stack overflow`)"

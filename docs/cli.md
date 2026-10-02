@@ -141,7 +141,12 @@ resultado do programa, não uma falha, e `run` sai com `0` como na VM
 runtime escrever `runtime error: ...`, a mesma mensagem da VM) e um SIGSEGV
 (pilha nativa esgotada) são erros de runtime (`exit 2`); um estado ≠ 0 acompanhado de mensagens do
 `lli` no stderr (módulo rejeitado) é `exit 1`. `--max-steps`/`--max-depth`
-não se aplicam a este motor. A API é `aether::driver::run_llvm_ir`, que
+não se aplicam a este motor: não há orçamento de instruções (o `--timeout`
+pára um ciclo infinito) e a profundidade de chamadas tem o limite por
+omissão da VM (10 mil frames contando `main`; `runtime error: call stack
+overflow`, no mesmo ponto que a VM ao mesmo `-O`). O programa corre numa
+thread com 1 GiB de pilha, para que recursão funda com agregados grandes
+(que a VM guarda no heap) não esgote a pilha nativa. A API é `aether::driver::run_llvm_ir`, que
 devolve stdout, stderr e o estado (`LliStatus::Exited(n)` / `Signaled(sig)`)
 em separado. Contrato e limites: [`llvm.md`](llvm.md).
 

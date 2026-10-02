@@ -15,7 +15,12 @@ Tudo vive no binário `aether` ou em `src/fuzz`. Não há crates extra.
 | `repl` | ciclo ler–compilar–correr |
 | `benchmark` | `fib(n)` O0 vs O2 |
 | `fuzz` | propriedades, mutação, greybox, formato |
-| `dump-hir` | HIR tipada |
-| `dump-liveness` | live-in por bloco |
+| `dump-hir FILE` | HIR tipada |
+| `dump-liveness FILE [-On]` | live-in por bloco |
+| `stats FILE [-On]` | relatório do otimizador + liveness + tamanho da IR |
+| `profile FILE [-On]` | contagem de chamadas + digest da execução |
+| `digest FILE [-On]` | impressão digital determinística de stdout + valor |
 
-Fuzz kinds: `all`, `lexer`, `parser`, `pipeline`, `gen`, `diff`, `mut`, `struct`, `aspect`, `mir`, `greybox`, `format`.
+Códigos de saída: `0` ok, `1` erro de compilação, `2` erro de runtime.
+
+Fuzz kinds: `all`, `lexer`, `parser`, `pipeline`, `gen`, `diff`, `agg` (alias `aggregate`), `mut`, `struct`, `aspect`, `mir`, `greybox`, `format`. `all` inclui `agg`.

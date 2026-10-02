@@ -1,4 +1,4 @@
-# Manual do repositório Aether 0.2.0
+# Manual do repositório Aether 0.2.2
 
 Este ficheiro explica **o que existe no ZIP**, **para que serve cada peça** e
 **como usar, testar, estender e não partir** o compilador. Não substitui as
@@ -49,7 +49,7 @@ fonte .ae
 A VM é o backend em que se confia. O LLVM emitido é texto; não há JIT
 ligado, não há ABI estável, não há `llc` no caminho crítico.
 
-Versão do software e da linguagem neste ZIP: **0.2.0** (ver `CHANGELOG.md`).
+Versão do software e da linguagem neste ZIP: **0.2.2** (ver `CHANGELOG.md`).
 Licença: MIT (`LICENSE`, `NOTICE`).
 
 ---
@@ -69,7 +69,7 @@ cd aether
 |---------|--------|
 | `README.md` | Porta de entrada (inglês) |
 | `MANUAL.md` | Este manual |
-| `Cargo.toml` / `Cargo.lock` | Pacote Rust `aether` 0.2.0, binário + lib |
+| `Cargo.toml` / `Cargo.lock` | Pacote Rust `aether` 0.2.2, binário + lib |
 | `rust-toolchain.toml` | MSRV 1.75.0 + rustfmt/clippy |
 | `rustfmt.toml` / `clippy.toml` / `.editorconfig` | Estilo |
 | `Makefile` | Atalhos `test`, `examples`, `fuzz`, `verify`, `release` |
@@ -124,8 +124,11 @@ O que `cargo test` cobre:
 - testes unitários em `src/**` (lexer, parser, sema, IR, opt, VM, fuzz, pretty, cfg, verify)
 - `tests/cli_examples.rs` — o binário corre `hello`, `opt_demo`, `check`
 - `tests/tools.rs` — `verify`, `cfg`, `fmt`, `opaque.ae` `-O2`, `stdlib/math.ae`
+- `tests/regressions.rs` — um teste por bug corrigido (R1–R22 em
+  `docs/test-matrix.md`); cada programa corre em `-O0` e `-O2`, que têm de
+  concordar e coincidir com o stdout/valor esperado
 
-Ordem de magnitude no estado 0.2.0: dezenas de testes, todos no mesmo
+Ordem de magnitude no estado 0.2.2: dezenas de testes, todos no mesmo
 processo `cargo test`. Se algum falhar, o repositório **não** está utilizável;
 não ignore e não “ajuste o assert”.
 
@@ -158,7 +161,7 @@ não necessariamente código de saída do processo — a CLI imprime o valor).
 
 | Tipo | Notas |
 |------|--------|
-| `i32` `i64` | inteiros com wrap nos folds |
+| `i32` `i64` | inteiros com wrap (soma, produto e divisão) |
 | `f64` | IEEE |
 | `bool` | `true` / `false` |
 | `string` | concatenação com `+` no fold de constantes |
@@ -168,6 +171,22 @@ não necessariamente código de saída do processo — a CLI imprime o valor).
 | `struct Nome { campo: T, ... }` | |
 
 Não há referências, traits, generics, nem heap exposto ao utilizador.
+
+Regras que costumam surpreender (detalhe em `docs/language.md`):
+
+- A expressão final sem `;` do corpo de uma função é o valor devolvido e
+  tem de ter o tipo de retorno (E0221). Em blocos aninhados é avaliada
+  como instrução.
+- Arrays e structs têm **semântica de valor**: `let b = a;` copia.
+- `&&` / `||` avaliam o operando direito só quando é preciso.
+- Literais negativos são literais únicos; `-2147483648` é um `i32` válido.
+  Um literal inteiro fora do intervalo de `i32` é erro (E0263) e um literal
+  nu adopta o tipo do outro operando (`1 + a` com `a: i64` é `i64`).
+- Funções não são valores: usar o nome de uma função como valor é E0264.
+- Os limites de `for` são `i32` (E0238); a variável só existe no corpo.
+- `len` conta caracteres (valores escalares Unicode), como a indexação.
+- Aninhamento acima de 512 níveis (expressões ou blocos) é diagnosticado
+  (E0101).
 
 ### Controlo
 
@@ -305,8 +324,9 @@ Opções comuns:
 | `--kind …` | suíte de fuzz |
 | `--n N` | argumento de `benchmark` (Fibonacci) |
 
-Códigos de saída: `0` ok, `1` erro de compilação / fuzz failure, `2` runtime
-(quando aplicável).
+Códigos de saída: `0` ok, `1` erro de compilação / fuzz failure, `2` erro de
+runtime. Num erro de runtime a CLI imprime primeiro o stdout produzido até
+ali e depois `runtime error: ...`.
 
 ### `check`
 
@@ -326,7 +346,19 @@ Escreve IR / bytecode / LLVM num ficheiro.
 
 ### `dump-*` e `disassemble`
 
-Inspeção. `disassemble` é alias de `dump-bytecode`.
+Inspeção. `disassemble` é alias de `dump-bytecode`. Além de `dump-tokens`,
+`dump-ast`, `dump-ir`, `dump-bytecode` e `dump-llvm`:
+
+- `dump-hir <file>` — HIR tipada
+- `dump-liveness <file> [-On]` — conjuntos live-in por bloco
+
+### `stats` `profile` `digest`
+
+- `stats <file> [-On]` — relatório do otimizador + liveness + tamanho da IR
+- `profile <file> [-On]` — contagem de chamadas por função + digest da execução
+- `digest <file> [-On]` — impressão digital determinística de stdout + valor
+  (FNV-1a de `"{value}\n{stdout}"`); duas compilações do mesmo fonte (`-O0` vs
+  `-O2`) têm de dar o mesmo digest
 
 ### `optimize`
 
@@ -368,23 +400,35 @@ Níveis:
 - `-O1` — fold, copy-prop, DCE (subconjunto)
 - `-O2` — sequência completa, duas varridas de fold/DCE
 
-Passes em `-O2` (ordem aproximada no código):
+Passes em `-O2`, pela ordem em que correm:
 
-1. `const-fold` — `Bin`/`Un` com ambos os lados constantes; `br` constante → `jmp`
-2. `algebraic` — `x+0`, `x-0`, `x*1`, `x*0`, `x*2 → x+x`, **predicados opacos**
-3. `copy-prop` — substitui usos de `Move`
-4. `const-prop` — segunda varrida de fold
-5. `cf-simplify` — blocos vazios, inatingíveis
-6. `dce` — instruções puras cujo destino nunca é lido
-7. fold + dce outra vez
+1. `const-fold` — `Bin`/`Un` com ambos os lados constantes (inclui
+   comparações `i64`/`f64`/`char`/`string`/`bool` e `i64` `%`; a divisão
+   usa wrapping); `br` constante → `jmp`
+2. `algebraic` — `x+0`, `x-0`, `x*1`, `x/1`, `x*0`, `x*2 → x+x`, **predicados opacos**
+3. `cf-simplify` — blocos vazios, inatingíveis (antes do inline, para que
+   as folhas de um só bloco sejam reconhecidas: o lowering deixa um bloco
+   morto depois de cada `return`)
+4. `inline` — copia folhas de um bloco para o chamador; os argumentos vão
+   para registradores novos e todos os tipos de instrução são remapeados
+5. `local-cse` — value numbering dentro do bloco
+6. `copy-prop` — substitui usos de `Move`; não redirecciona a base de um
+   store de elemento/campo e descarta aliases dos dois lados de um store
+   (semântica de valor)
+7. `const-prop` — segunda varrida de fold
+8. `cf-simplify` — outra vez, depois do inline
+9. `dce` — instruções puras cujo destino nunca é lido
+10. `const-fold` e `dce` outra vez
 
-Identidades opacas (0.2.0), **mesmo registrador**, sem exigir constante:
+Identidades opacas, **mesmo registrador**, sem exigir constante. Aplicam-se
+só a `i32` e `i64`; **nunca** a `f64` (com NaN, `x - x`, `x * 0` e `x == x`
+não dão `0` / `true`):
 
 | Padrão | Resultado |
 |--------|-----------|
 | `x - x` | `0` |
 | `x * 0` / `0 * x` | `0` |
-| `x == x` (`i32`) | `true` |
+| `x == x` | `true` |
 | `x != x`, `x < x`, `x > x` | `false` |
 | `x <= x`, `x >= x` | `true` |
 
@@ -410,7 +454,18 @@ Há um teste `does_not_fold_across_reassignment` exactamente para isso.
 ### VM — `src/vm/mod.rs`, `docs/vm.md`
 
 - Registradores, não stack de operandos como JVM.
-- Natives via `CallNative`.
+- Natives via `CallNative`. Chamar uma `extern fn` que a VM não implementa
+  é erro de runtime.
+- Registradores `u16`: até 65535 por frame. O assembler devolve erro de
+  compilação em vez de truncar.
+- Comparações e conversões que a sema aceita têm todas opcode: `Cmp { op }`
+  genérico (`Eq Ne Lt Le Gt Ge`) para `i64`/`f64`/`bool`/`char`/`string`,
+  `RemI64`, `NegI64` e as conversões `CastI64ToF64`, `CastF64ToI64`,
+  `CastBoolToI64`, `CastCharToI32`, `CastI32ToChar`. Uma combinação
+  (operador, tipo) sem opcode é erro de compilação (E0300), nunca um `Nop`.
+- Divisão inteira com wrapping (`i32::MIN / -1 == i32::MIN`); divisão por
+  zero continua a ser erro de runtime.
+- Arrays e structs copiam-se por valor (cópia profunda).
 - `VmOptions { coverage }` activa o mapa de arestas `(func, pc_prev) → (func, pc)`
   usado pelo greybox.
 - Limite de passos: um programa gerado pelo fuzzer não pode pendurar o
@@ -422,8 +477,13 @@ o **mesmo** `Value` e o **mesmo** stdout. Isto é a propriedade
 
 ### LLVM — `src/backend/llvm.rs`
 
-Texto. Serve para `aether dump-llvm` e `--emit llvm`. Não há ligação a
-`inkwell` / `llvm-sys`. Se `opt-18` estiver no PATH, pode-se fazer
+Texto. Serve para `aether dump-llvm` e `--emit llvm`. Produz LLVM 18 IR
+válido: um `alloca` por registrador da IR, `load`/`store`, pronto para
+`mem2reg` (verificado com `llvm-as` em todos os exemplos). Diferenças
+conhecidas face à VM, que continua a ser o contrato de execução: agregados
+vivem na stack e copiar um array/struct copia o ponteiro (há aliasing); sem
+verificação de limites; concatenação de strings não é suportada (aborta);
+`print_f64` usa `%g`. Não há ligação a `inkwell` / `llvm-sys`. Se `opt-18` estiver no PATH, pode-se fazer
 experimentos **fora** do repositório; o CI não depende disso.
 
 ---
@@ -451,6 +511,7 @@ aether fuzz --kind diff --seed 0xDEAD --iters 1
 | `pipeline` | | `compile_source` não pânica |
 | `generated` | `gen` | programa da gramática **compila** |
 | `differential` | `diff` | `-O0` e `-O2` concordam em valor e stdout |
+| `agg` | `aggregate` | programas bem tipados com structs, arrays (também aninhados), `i64`/`f64`/`char`/`string`, conversões, guardas `&&`/`\|\|`, atribuição aninhada e funções com expressão final; oráculo diferencial O0/O2 |
 | `mutated` | `mut` | havoc sobre fonte válida, sem pânico |
 | `structural` | `struct` | mutação da *sketch* (árvore) |
 | `aspect` | `ap` | mutação que preserva tipos / nomes / terminação |
@@ -458,8 +519,9 @@ aether fuzz --kind diff --seed 0xDEAD --iters 1
 | `greybox` | `grey` `graybox` | corpus + energia + cobertura de arestas da VM |
 | `format` | `fmt` `grammar` | fita de bytes = escolhas da EBNF |
 
-`all` **não** inclui greybox (campanha com estado). Greybox e format
-chamam-se à parte.
+`all` inclui `agg` e **não** inclui greybox (campanha com estado) nem
+format; esses chamam-se à parte. As propriedades de lixo, format e
+mutação compilam também em `-O2`.
 
 ### Como correr
 
@@ -469,6 +531,7 @@ aether fuzz --iters 80 --kind format
 aether fuzz --iters 40 --kind greybox
 aether fuzz --iters 200 --kind diff
 aether fuzz --iters 100 --kind mir
+aether fuzz --iters 200 --kind agg
 ```
 
 Ou `make fuzz` (40 iters, `all`, seed 1).
@@ -622,7 +685,7 @@ wrapper se o dump LLVM tiver de o conhecer.
 
 Um relatório útil tem:
 
-1. Versão (`0.2.0`).
+1. Versão (`0.2.2`).
 2. Fonte reduzida (`.ae`).
 3. Comando exacto.
 4. Esperado vs observado.
@@ -636,11 +699,13 @@ Não abra issue de “faltam generics” sem RFC (`ISSUE_TEMPLATE/feature.yml`).
 ## 14. Limitações honestas
 
 Isto **não** é o LLVM, **não** é o rustc, **não** é um produto com SLA
-(`SUPPORT.md`). Em 0.2.0:
+(`SUPPORT.md`). Em 0.2.2:
 
 - sem módulos / `use` / pacotes
-- sem SSA, sem alocação de registradores global, sem inlining
-- LLVM é texto, sem JIT/AOT no CI
+- sem SSA, sem alocação de registradores global; o inlining só cobre
+  folhas de um bloco
+- LLVM é texto, sem JIT/AOT no CI; os agregados fazem aliasing e não há
+  verificação de limites nem concatenação de strings (a VM é o contrato)
 - bytecode instável entre versões (`README` / `CHANGELOG`)
 - stdlib é um ficheiro de referência, não uma biblioteca ligada
 - o pretty-printer não é um formatador de projecto

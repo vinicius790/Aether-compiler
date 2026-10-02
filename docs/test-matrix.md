@@ -55,6 +55,7 @@ humano devem conseguir reproduzir.
 | diff | 50 |
 | mir | 30 |
 | aspect | 30 |
+| agg | 30 |
 
 Semente de smoke no CI: `1`.
 
@@ -68,6 +69,36 @@ Todos os `cNNN.ae` presentes nesse subconjunto têm de sair 0.
 `goldens/*.ir.O0.txt` e `*.ir.O2.txt` são dumps de referência para
 diff manual. Não estão assertados byte-a-byte no CI porque a IR
 textual ainda pode ganhar nomes de bloco. Use-os em review.
+
+## Regressões 0.2.2 (`tests/regressions.rs`)
+
+Um teste por bug corrigido. Cada programa corre em `-O0` e `-O2`; os dois
+têm de concordar e coincidir com o stdout/valor esperado.
+
+| # | Caso | Esperado |
+|---|------|----------|
+| R1 | expressão final (sem `;`) do corpo de uma função | é o valor devolvido |
+| R2 | literal de struct com campos fora da ordem declarada | campos nas posições declaradas, avaliados pela ordem do fonte |
+| R3 | atribuição aninhada `a[i][j] = v`, `o.inner.x = v` | escrita visível depois |
+| R4 | variável de `for` | só existe no corpo do laço |
+| R5 | `&&` / `\|\|` com operando direito com efeito | só avaliado quando necessário |
+| R6 | `let b = a;` com array, depois mutar `b` | `a` inalterado (semântica de valor, também em `-O2`) |
+| R7 | `x - x`, `x * 0`, `x == x` com `f64` NaN | não são dobrados; resultado de NaN preservado |
+| R8 | função com mais de 255 registradores | compila e corre (registradores `u16`) |
+| R9 | literal inteiro fora do intervalo de `i32` | erro E0263; `-2147483648` é válido |
+| R10 | todas as comparações aceites pela sema (`i64`, `f64`, `bool`, `char`, `string`) | executam com o resultado correcto |
+| R11 | negação de `i64` | não trunca a 32 bits |
+| R12 | todas as conversões de `can_cast_to` | executam com o resultado correcto |
+| R13 | chamada de `extern fn` que a VM não implementa | erro de runtime (não imprime) |
+| R14 | `i32::MIN / -1` | `i32::MIN`, sem pânico, em `-O0` e `-O2` |
+| R15 | aninhamento acima de 512 | diagnóstico E0101, sem estouro de pilha |
+| R16 | erro de runtime depois de `print` | CLI imprime o stdout parcial e depois `runtime error: ...` (exit 2) |
+| R17 | `len` de string com caracteres não ASCII | conta caracteres, não bytes |
+| R18 | literais negativos e tipo esperado (`let y: i64 = -1;`, `1 + a` com `a: i64`) | `i64` |
+| R19 | nome de função usado como valor | erro E0264 |
+| R20 | limites de `for` que não são `i32` | erro E0238 |
+| R21 | tipo da expressão final diferente do tipo de retorno | erro E0221 |
+| R22 | folha de um bloco chamada de outra função em `-O2` | inlinada (a chamada desaparece da IR) |
 
 ## Não-regressão conhecida
 

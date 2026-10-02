@@ -1,4 +1,4 @@
-# Especificação da linguagem Aether 0.1
+# Especificação da linguagem Aether 0.2
 
 ## Propósito
 
@@ -49,12 +49,22 @@ Não há ponteiros, referências nem genéricos nesta versão.
 
 Atribuição exige igualdade de tipo. Não há promoção implícita `i32 → i64`.
 Conversões explícitas usam `e as T` e só as pares listadas em `ty.rs`
-(`can_cast_to`) são legais.
+(`can_cast_to`) são legais: `i32 ↔ i64`, `i32`/`i64 → f64`, `f64 → i32`/`i64`,
+`bool → i32`/`i64`, `char → i32` e `i32 → char`. Todas executam na VM.
 
 ### Inferência
 
 `let x = 1;` produz `i32`. `let x: i64 = 1;` produz `i64` porque o literal
 inteiro é flexível entre `i32` e `i64` quando o contexto espera um inteiro.
+
+O tipo esperado propaga-se através do menos unário, de parênteses e dos
+operadores aritméticos e de comparação; um literal inteiro nu adopta o tipo
+do outro operando (`1 + a` com `a: i64` é `i64`).
+
+Um literal negativo é um único literal: `let y: i64 = -1;` é válido e
+`-2147483648` é um `i32` válido. Um literal inteiro cujo tipo resulte `i32`
+e que não caiba em 32 bits é erro (E0263); em contexto `i64` o literal pode
+usar os 64 bits.
 
 ## Operadores e precedência
 
@@ -73,10 +83,22 @@ Do mais frouxo ao mais apertado:
 | 13    | chamada, `[]`, `.`   | esquerda        |
 
 Aritmética exige operandos do mesmo tipo numérico. `%` não se aplica a `f64`.
-`+` também concatena `string`. Comparações produzem `bool`.
+`+` também concatena `string`. Comparações produzem `bool`: `i32`, `i64`,
+`f64` e `char` aceitam as seis (`== != < <= > >=`); `bool` e `string`
+aceitam `==` e `!=`.
 
-Overflow de inteiros na VM é wrapping (two's complement). Divisão por zero
-é erro de runtime.
+`&&` e `||` fazem curto-circuito: o operando direito só é avaliado quando
+é preciso.
+
+Overflow de inteiros na VM é wrapping (two's complement), incluindo a
+divisão (`i32::MIN / -1 == i32::MIN`, sem pânico). Divisão por zero é erro
+de runtime.
+
+Funções não são valores: usar o nome de uma função fora de uma chamada é
+erro (E0264).
+
+Expressões e blocos aninhados mais fundo que 512 níveis são diagnosticados
+pelo parser (E0101).
 
 ## Declarações
 
@@ -85,7 +107,8 @@ let [mut] nome [: tipo] [= expr];
 ```
 
 Reatribuição só é permitida em bindings `mut` e em elementos de array /
-campos de struct obtidos por indexação.
+campos de struct obtidos por indexação, também aninhados
+(`a[i][j] = v`, `o.inner.x = v`).
 
 ## Funções
 
@@ -94,16 +117,24 @@ fn nome(p1: T1, p2: T2) -> R { ... }
 extern fn nome(p1: T1) -> R;
 ```
 
-Argumentos são passados por valor. Structs e arrays são valores (cópia rasa
-da raiz na VM). Toda função com tipo de retorno ≠ `unit` deve retornar em
-todos os caminhos.
+Argumentos são passados por valor. Structs e arrays têm semântica de valor:
+`let b = a;` copia, e na VM a cópia é profunda (arrays aninhados e structs
+dentro de structs também). Toda função com tipo de retorno ≠ `unit` deve
+retornar em todos os caminhos.
+
+A expressão final de um corpo de função, sem `;`, é o valor devolvido e
+tem de ter o tipo de retorno (E0221). Em qualquer outro bloco a expressão
+final é avaliada como instrução.
+
+Chamar uma `extern fn` que a VM não implementa é erro de runtime.
 
 ## Controle de fluxo
 
 - `if expr { ... } [else { ... }]` — `expr: bool`
 - `while expr { ... }`
 - `for nome in expr .. expr { ... }` — intervalo semiaberto `[start, end)`
-  em `i32`; a variável de iteração é `mut i32`
+  em `i32` (os limites têm de ser `i32`, E0238); a variável de iteração é
+  `mut i32` e só existe no corpo do laço
 - `break` / `continue` apenas dentro de laço
 - `return [expr];`
 
@@ -115,7 +146,9 @@ let p = Point { x: 1, y: 2 };
 p.x
 ```
 
-Campos são públicos. Literal deve nomear todos os campos.
+Campos são públicos. Literal deve nomear todos os campos, em qualquer
+ordem: os inicializadores são avaliados na ordem do fonte e guardados na
+posição declarada.
 
 ## Arrays
 
@@ -129,7 +162,8 @@ a[i]
 ## Strings
 
 Literais `"..."` com escapes `\n \t \r \0 \\ \"`. Concatenação `+`.
-`len(s)` devolve `i32`. Indexação devolve `char`.
+`len(s)` devolve `i32` e conta valores escalares Unicode (chars), como a
+indexação, não bytes. Indexação devolve `char`.
 
 ## Built-ins
 
@@ -140,7 +174,9 @@ Literais `"..."` com escapes `\n \t \r \0 \\ \"`. Concatenação `+`.
 
 A VM armazena valores em registradores por frame. Arrays e structs são
 `Value::Array` / `Value::Object` no heap do processo hospedeiro (Rust).
-Não há aliasing observável além da mutação do valor no registrador local.
+Como arrays e structs têm semântica de valor, não há aliasing observável
+entre variáveis: `let b = a;` copia a árvore `Value`. (No emissor LLVM,
+que é só de estudo, copiar um agregado copia o ponteiro e há aliasing.)
 Não há lifetime nem GC explícito: o `Drop` do frame libera as árvores.
 
 ## Modelo de execução
@@ -152,5 +188,7 @@ Não há lifetime nem GC explícito: o `Drop` do frame libera as árvores.
 ## Erros
 
 Erros de compilação abortam a geração de código. Erros de runtime
-(`division by zero`, bounds, `assert`, overflow de pilha) encerram a VM
-com mensagem; não há exceções na linguagem.
+(`division by zero`, bounds, `assert`, overflow de pilha, chamada de
+`extern fn` não implementada) encerram a VM com mensagem; não há exceções
+na linguagem. A CLI imprime o stdout produzido até ali antes de
+`runtime error: ...` e sai com código 2.

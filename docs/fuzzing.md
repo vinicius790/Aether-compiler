@@ -26,12 +26,16 @@ O mapa do ecossistema Rust (`proptest`, `bolero`, `cargo-fuzz`,
 | `gen_well_typed` | programas sintéticos passam na semântica |
 | `gen_tokens` | programas sintéticos não produzem `Invalid` |
 | `opt_equiv_value` / `opt_equiv_stdout` | `-O0` e `-O2` devolvem o mesmo `main` e o mesmo stdout |
+| `agg_*` (kind `agg`) | programas bem tipados com structs, arrays (também aninhados), `i64`/`f64`/`char`/`string`, conversões, guardas `&&` / `\|\|`, atribuição aninhada e funções com expressão final: compilam e `-O0` == `-O2` (valor e stdout) |
 | `mut_no_panic` | havoc de programas válidos não derruba o compilador |
 | `struct_no_panic` | mutação estrutural / crossover não aborta o pipeline |
 | `struct_opt_equiv` | mutantes estruturais que ainda tipam: `-O0` == `-O2` |
 | `aspect_well_typed` / `aspect_opt_equiv` | sketch tipada continua bem tipada; identidades: O0 == O2 |
 | `mir_well_formed` / `mir_opt_equiv_*` | IR gerada é válida e O0 == O2 na VM |
 | `greybox` | corpus + cobertura de arestas da VM; O0 == O2 em cada mutante |
+
+As propriedades de lixo (lexer/parser/pipeline), de formato e de mutação
+compilam também em `-O2`, não só em `-O0`.
 
 ## Como correr
 
@@ -43,6 +47,7 @@ Para uma campanha maior:
 ```bash
 aether fuzz --iters 1000 --seed 1 --kind all
 aether fuzz --iters 400 --kind diff
+aether fuzz --iters 200 --kind agg
 aether fuzz --iters 400 --kind lexer
 aether fuzz --iters 200 --kind struct
 aether fuzz --iters 200 --kind mut
@@ -70,7 +75,9 @@ De propósito, para manter os casos termináveis e bem tipados:
 * recursão;
 * atribuição a parâmetros imutáveis;
 * `if` como expressão (a linguagem não tem);
-* strings/structs/arrays aleatórios (podem entrar no corpus e nas mutações).
+* o gerador clássico (`gen`, `diff`) só produz `i32`/`bool`; structs, arrays,
+  `i64`/`f64`/`char`/`string`, conversões e atribuição aninhada são gerados
+  por `--kind agg` (alias `aggregate`, incluído em `all`).
 
 Ampliar o gerador é bem-vindo, desde que as propriedades diferenciais
 continuem válidas.

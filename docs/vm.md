@@ -1,6 +1,7 @@
 # VM Aether
 
-Máquina de registradores. Cada frame tem `nregs` slots `Value`.
+Máquina de registradores. Cada frame tem `nregs` slots `Value`
+(`nregs` até 65535; registradores `u16`).
 
 ## Valores
 
@@ -10,6 +11,11 @@ Máquina de registradores. Cada frame tem `nregs` slots `Value`.
 
 `Call func dest args` empurra um frame. Os primeiros `arity` registradores
 recebem os argumentos. `Ret` escreve no `ret_reg` do chamador.
+
+## Semântica de valor
+
+Arrays e structs copiam-se por valor (cópia profunda). A aritmética inteira,
+incluindo a divisão, usa wrapping: `i32::MIN / -1 == i32::MIN`.
 
 ## Nativos
 
@@ -29,6 +35,12 @@ recebem os argumentos. `Ret` escreve no `ret_reg` do chamador.
 - 50 milhões de instruções por execução (configurável)
 - 10 mil frames de chamada
 - divisão por zero e índice inválido abortam com `VmError`
+- chamar uma `extern fn` que a VM não implementa é `VmError` (antes
+  comportava-se como `print`)
+- `len` conta caracteres (valores escalares Unicode), não bytes
+
+Num erro de runtime a CLI imprime o stdout produzido até ali, depois
+`runtime error: ...`, e sai com código 2.
 
 ## Inspeção
 

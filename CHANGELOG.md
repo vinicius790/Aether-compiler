@@ -24,7 +24,7 @@ explicitly unstable.
   E0238 (`for` bounds must be `i32`), E0263 (integer literal out of `i32`
   range), E0264 (function name used as a value), E0300 (unsupported
   operator/type combination in the assembler), E0101 for nesting deeper than
-  512 (expressions or blocks)
+  256 (expressions or blocks)
 - Constant folding of `i64` / `f64` / `char` / `string` / `bool` comparisons
   and of `i64` `%`
 

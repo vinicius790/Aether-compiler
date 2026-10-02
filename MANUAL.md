@@ -185,7 +185,7 @@ Regras que costumam surpreender (detalhe em `docs/language.md`):
 - Funções não são valores: usar o nome de uma função como valor é E0264.
 - Os limites de `for` são `i32` (E0238); a variável só existe no corpo.
 - `len` conta caracteres (valores escalares Unicode), como a indexação.
-- Aninhamento acima de 512 níveis (expressões ou blocos) é diagnosticado
+- Aninhamento acima de 256 níveis (expressões ou blocos) é diagnosticado
   (E0101).
 
 ### Controlo

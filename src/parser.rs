@@ -12,7 +12,7 @@ use crate::token::{Token, TokenKind};
 /// array types, `else if` chains) before the parser gives up on a subtree.
 /// The parser, sema and lowering all recurse once per level, so without a
 /// bound a few hundred thousand `(` would overflow the host stack.
-pub const MAX_NESTING: usize = 512;
+pub const MAX_NESTING: usize = 256;
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -1089,7 +1089,7 @@ mod tests {
         let e0101 = diags.iter().filter(|d| d.code == Some("E0101")).count();
         assert_eq!(e0101, 1, "{}", render(&diags));
         let out = render(&diags);
-        assert!(out.contains("nesting too deep (limit 512)"), "{out}");
+        assert!(out.contains("nesting too deep (limit 256)"), "{out}");
     }
 
     #[test]
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[test]
     fn nesting_400_parens_end_to_end() {
-        // The parser itself fits 512 levels in a 2 MiB test thread, but
+        // The parser itself fits 256 levels in a 2 MiB test thread, but
         // sema's `check_expr` frame is several KiB in debug builds and
         // overflows 2 MiB somewhere between 128 and 256 `Group` levels, so
         // the full pipeline runs on an explicit 32 MiB stack here (the CLI's

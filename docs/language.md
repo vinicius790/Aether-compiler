@@ -97,7 +97,7 @@ de runtime.
 Funções não são valores: usar o nome de uma função fora de uma chamada é
 erro (E0264).
 
-Expressões e blocos aninhados mais fundo que 512 níveis são diagnosticados
+Expressões e blocos aninhados mais fundo que 256 níveis são diagnosticados
 pelo parser (E0101).
 
 ## Declarações

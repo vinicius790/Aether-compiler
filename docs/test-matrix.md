@@ -91,7 +91,7 @@ têm de concordar e coincidir com o stdout/valor esperado.
 | R12 | todas as conversões de `can_cast_to` | executam com o resultado correcto |
 | R13 | chamada de `extern fn` que a VM não implementa | erro de runtime (não imprime) |
 | R14 | `i32::MIN / -1` | `i32::MIN`, sem pânico, em `-O0` e `-O2` |
-| R15 | aninhamento acima de 512 | diagnóstico E0101, sem estouro de pilha |
+| R15 | aninhamento acima de 256 | diagnóstico E0101, sem estouro de pilha |
 | R16 | erro de runtime depois de `print` | CLI imprime o stdout parcial e depois `runtime error: ...` (exit 2) |
 | R17 | `len` de string com caracteres não ASCII | conta caracteres, não bytes |
 | R18 | literais negativos e tipo esperado (`let y: i64 = -1;`, `1 + a` com `a: i64`) | `i64` |

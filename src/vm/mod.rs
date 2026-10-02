@@ -1,6 +1,6 @@
 //! Register virtual machine for Aether bytecode.
 
-use crate::backend::bytecode::{BytecodeModule, Immediate, Op};
+use crate::backend::bytecode::{BytecodeModule, CmpOp, Immediate, Op};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Write};
@@ -20,6 +20,21 @@ pub enum Value {
 }
 
 impl Value {
+    /// Source-level type name, used in runtime error messages.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::I32(_) => "i32",
+            Value::I64(_) => "i64",
+            Value::F64(_) => "f64",
+            Value::Bool(_) => "bool",
+            Value::Str(_) => "string",
+            Value::Char(_) => "char",
+            Value::Unit => "unit",
+            Value::Array(_) => "array",
+            Value::Object(_) => "struct",
+        }
+    }
+
     pub fn as_i32(&self) -> i32 {
         match self {
             Value::I32(v) => *v,
@@ -149,7 +164,7 @@ struct Frame {
     func: usize,
     pc: usize,
     regs: Vec<Value>,
-    ret_reg: Option<u8>,
+    ret_reg: Option<u16>,
 }
 
 impl<'a> Vm<'a> {
@@ -248,14 +263,14 @@ impl<'a> Vm<'a> {
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I32(read_i32(frames, lhs) / b), frames, dest);
+                set_reg(Value::I32(read_i32(frames, lhs).wrapping_div(b)), frames, dest);
             }
             Op::RemI32 { dest, lhs, rhs } => {
                 let b = read_i32(frames, rhs);
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I32(read_i32(frames, lhs) % b), frames, dest);
+                set_reg(Value::I32(read_i32(frames, lhs).wrapping_rem(b)), frames, dest);
             }
             Op::NegI32 { dest, src } => {
                 set_reg(Value::I32(read_i32(frames, src).wrapping_neg()), frames, dest);
@@ -268,7 +283,17 @@ impl<'a> Vm<'a> {
                 if b == 0 {
                     return Err(VmError::Runtime("division by zero".into()));
                 }
-                set_reg(Value::I64(read_i64(frames, lhs) / b), frames, dest);
+                set_reg(Value::I64(read_i64(frames, lhs).wrapping_div(b)), frames, dest);
+            }
+            Op::RemI64 { dest, lhs, rhs } => {
+                let b = read_i64(frames, rhs);
+                if b == 0 {
+                    return Err(VmError::Runtime("division by zero".into()));
+                }
+                set_reg(Value::I64(read_i64(frames, lhs).wrapping_rem(b)), frames, dest);
+            }
+            Op::NegI64 { dest, src } => {
+                set_reg(Value::I64(read_i64(frames, src).wrapping_neg()), frames, dest);
             }
             Op::AddF64 { dest, lhs, rhs } => bin_f64(frames, dest, lhs, rhs, |a, b| a + b),
             Op::SubF64 { dest, lhs, rhs } => bin_f64(frames, dest, lhs, rhs, |a, b| a - b),
@@ -298,6 +323,10 @@ impl<'a> Vm<'a> {
             Op::CmpEqBool { dest, lhs, rhs } => {
                 set_reg(Value::Bool(read_bool(frames, lhs) == read_bool(frames, rhs)), frames, dest);
             }
+            Op::Cmp { op, dest, lhs, rhs } => {
+                let r = cmp_values(op, &get_reg(frames, lhs), &get_reg(frames, rhs))?;
+                set_reg(Value::Bool(r), frames, dest);
+            }
             Op::AndBool { dest, lhs, rhs } => {
                 set_reg(Value::Bool(read_bool(frames, lhs) && read_bool(frames, rhs)), frames, dest);
             }
@@ -325,14 +354,19 @@ impl<'a> Vm<'a> {
                 }
                 if self.module.functions[callee].is_native {
                     let argv: Vec<Value> = args.iter().map(|r| get_reg(frames, *r)).collect();
-                    let nid = self.module.functions[callee].native_id.unwrap_or(0);
+                    let Some(nid) = self.module.functions[callee].native_id else {
+                        let name = &self.module.functions[callee].name;
+                        return Err(VmError::Native(format!(
+                            "extern function `{name}` has no implementation in the VM"
+                        )));
+                    };
                     let result = self.call_native(nid, &argv)?;
                     if let Some(d) = dest {
                         set_reg(result, frames, d);
                     }
                 } else {
                     let argv: Vec<Value> = args.iter().map(|r| get_reg(frames, *r)).collect();
-                    let nregs = self.module.functions[callee].nregs.max(args.len() as u8) as usize;
+                    let nregs = (self.module.functions[callee].nregs as usize).max(args.len());
                     let mut regs = vec![Value::Unit; nregs.max(1)];
                     for (i, v) in argv.into_iter().enumerate() {
                         if i < regs.len() {
@@ -390,6 +424,29 @@ impl<'a> Vm<'a> {
             }
             Op::CastBoolToI32 { dest, src } => {
                 set_reg(Value::I32(i32::from(read_bool(frames, src))), frames, dest);
+            }
+            Op::CastI64ToF64 { dest, src } => {
+                set_reg(Value::F64(read_i64(frames, src) as f64), frames, dest);
+            }
+            Op::CastF64ToI64 { dest, src } => {
+                set_reg(Value::I64(read_f64(frames, src) as i64), frames, dest);
+            }
+            Op::CastBoolToI64 { dest, src } => {
+                set_reg(Value::I64(i64::from(read_bool(frames, src))), frames, dest);
+            }
+            Op::CastCharToI32 { dest, src } => {
+                let v = match get_reg(frames, src) {
+                    Value::Char(c) => c as i32,
+                    other => other.as_i32(),
+                };
+                set_reg(Value::I32(v), frames, dest);
+            }
+            Op::CastI32ToChar { dest, src } => {
+                let c = u32::try_from(read_i32(frames, src))
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}');
+                set_reg(Value::Char(c), frames, dest);
             }
             Op::AllocArr { dest, len } => {
                 set_reg(Value::Array(vec![Value::I32(0); len as usize]), frames, dest);
@@ -477,7 +534,7 @@ impl<'a> Vm<'a> {
             }
             6 => {
                 let n = match args.first() {
-                    Some(Value::Str(s)) => s.len() as i32,
+                    Some(Value::Str(s)) => s.chars().count() as i32,
                     Some(Value::Array(xs)) => xs.len() as i32,
                     _ => 0,
                 };
@@ -539,14 +596,14 @@ impl ProfileReport {
     }
 }
 
-fn get_reg(frames: &[Frame], r: u8) -> Value {
+fn get_reg(frames: &[Frame], r: u16) -> Value {
     frames
         .last()
         .and_then(|f| f.regs.get(r as usize).cloned())
         .unwrap_or(Value::Unit)
 }
 
-fn set_reg(v: Value, frames: &mut [Frame], r: u8) {
+fn set_reg(v: Value, frames: &mut [Frame], r: u16) {
     if let Some(f) = frames.last_mut() {
         let i = r as usize;
         if i >= f.regs.len() {
@@ -556,31 +613,70 @@ fn set_reg(v: Value, frames: &mut [Frame], r: u8) {
     }
 }
 
-fn copy_reg(frames: &mut [Frame], dest: u8, src: u8) {
+fn copy_reg(frames: &mut [Frame], dest: u16, src: u16) {
     let v = get_reg(frames, src);
     set_reg(v, frames, dest);
 }
 
-fn read_i32(frames: &[Frame], r: u8) -> i32 { get_reg(frames, r).as_i32() }
-fn read_i64(frames: &[Frame], r: u8) -> i64 { get_reg(frames, r).as_i64() }
-fn read_f64(frames: &[Frame], r: u8) -> f64 { get_reg(frames, r).as_f64() }
-fn read_bool(frames: &[Frame], r: u8) -> bool { get_reg(frames, r).as_bool() }
+fn read_i32(frames: &[Frame], r: u16) -> i32 { get_reg(frames, r).as_i32() }
+fn read_i64(frames: &[Frame], r: u16) -> i64 { get_reg(frames, r).as_i64() }
+fn read_f64(frames: &[Frame], r: u16) -> f64 { get_reg(frames, r).as_f64() }
+fn read_bool(frames: &[Frame], r: u16) -> bool { get_reg(frames, r).as_bool() }
 
 
-fn bin_i32(frames: &mut [Frame], dest: u8, lhs: u8, rhs: u8, f: fn(i32, i32) -> i32) {
+fn bin_i32(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(i32, i32) -> i32) {
     set_reg(Value::I32(f(read_i32(frames, lhs), read_i32(frames, rhs))), frames, dest);
 }
 
-fn bin_i64(frames: &mut [Frame], dest: u8, lhs: u8, rhs: u8, f: fn(i64, i64) -> i64) {
+fn bin_i64(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(i64, i64) -> i64) {
     set_reg(Value::I64(f(read_i64(frames, lhs), read_i64(frames, rhs))), frames, dest);
 }
 
-fn bin_f64(frames: &mut [Frame], dest: u8, lhs: u8, rhs: u8, f: fn(f64, f64) -> f64) {
+fn bin_f64(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(f64, f64) -> f64) {
     set_reg(Value::F64(f(read_f64(frames, lhs), read_f64(frames, rhs))), frames, dest);
 }
 
-fn cmp_i32(frames: &mut [Frame], dest: u8, lhs: u8, rhs: u8, f: fn(i32, i32) -> bool) {
+fn cmp_i32(frames: &mut [Frame], dest: u16, lhs: u16, rhs: u16, f: fn(i32, i32) -> bool) {
     set_reg(Value::Bool(f(read_i32(frames, lhs), read_i32(frames, rhs))), frames, dest);
+}
+
+/// Generic comparison for [`Op::Cmp`]: both operands must carry the same
+/// runtime tag; ordering is defined for numbers, bools, chars and strings.
+fn cmp_values(op: CmpOp, a: &Value, b: &Value) -> Result<bool, VmError> {
+    fn by_ord(op: CmpOp, o: std::cmp::Ordering) -> bool {
+        match op {
+            CmpOp::Eq => o.is_eq(),
+            CmpOp::Ne => o.is_ne(),
+            CmpOp::Lt => o.is_lt(),
+            CmpOp::Le => o.is_le(),
+            CmpOp::Gt => o.is_gt(),
+            CmpOp::Ge => o.is_ge(),
+        }
+    }
+    Ok(match (a, b) {
+        (Value::I32(x), Value::I32(y)) => by_ord(op, x.cmp(y)),
+        (Value::I64(x), Value::I64(y)) => by_ord(op, x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => by_ord(op, x.cmp(y)),
+        (Value::Char(x), Value::Char(y)) => by_ord(op, x.cmp(y)),
+        (Value::Str(x), Value::Str(y)) => by_ord(op, x.cmp(y)),
+        // IEEE semantics: NaN is unordered, so only `!=` holds.
+        (Value::F64(x), Value::F64(y)) => match op {
+            CmpOp::Eq => x == y,
+            CmpOp::Ne => x != y,
+            CmpOp::Lt => x < y,
+            CmpOp::Le => x <= y,
+            CmpOp::Gt => x > y,
+            CmpOp::Ge => x >= y,
+        },
+        (Value::Unit, Value::Unit) => matches!(op, CmpOp::Eq | CmpOp::Le | CmpOp::Ge),
+        _ => {
+            return Err(VmError::Runtime(format!(
+                "cannot compare {} with {}",
+                a.type_name(),
+                b.type_name()
+            )))
+        }
+    })
 }
 
 fn imm_to_value(imm: &Immediate, module: &BytecodeModule) -> Value {
@@ -617,12 +713,20 @@ impl Write for Sink {
     }
 }
 
-pub fn execute_captured(module: &BytecodeModule) -> Result<(Value, String, u64), VmError> {
+/// Run `main` with stdout captured. Unlike [`execute_captured`] the
+/// partial stdout and step count are returned even when the VM fails, so
+/// callers can show what the program printed before the error.
+pub fn run_captured(module: &BytecodeModule) -> (Result<Value, VmError>, String, u64) {
     let slot = Arc::new(Mutex::new(Vec::new()));
     let mut vm = Vm::new(module, VmOptions::default()).with_stdout(Box::new(Sink(slot.clone())));
-    let val = vm.run()?;
+    let result = vm.run();
     let out = String::from_utf8_lossy(&slot.lock().unwrap()).into_owned();
-    Ok((val, out, vm.steps()))
+    (result, out, vm.steps())
+}
+
+pub fn execute_captured(module: &BytecodeModule) -> Result<(Value, String, u64), VmError> {
+    let (result, out, steps) = run_captured(module);
+    result.map(|val| (val, out, steps))
 }
 
 /// Same as [`execute_captured`] but fills an edge-coverage set for greybox.
@@ -683,7 +787,7 @@ mod tests {
         assert!(!d3.has_errors());
         let ir = emit_ir(&hir.unwrap());
         let (ir, _) = optimize(ir, 2);
-        let bc = assemble(&ir);
+        let bc = assemble(&ir).expect("assemble");
         let (v, out, _) = execute_captured(&bc).expect("vm");
         (v, out)
     }
@@ -737,7 +841,7 @@ mod tests {
         let (prog, _) = parse(toks);
         let (hir, _) = analyze(&prog);
         let ir = emit_ir(&hir.unwrap());
-        let bc = assemble(&ir);
+        let bc = assemble(&ir).expect("assemble");
         let (v, _, report) = execute_profiled(&bc).expect("vm");
         assert_eq!(v, Value::I32(8));
         let fib = report
@@ -748,5 +852,106 @@ mod tests {
             .unwrap_or(0);
         assert!(fib >= 1, "{}", report.render());
         assert_ne!(report.digest, 0);
+    }
+
+    fn bytecode_of(src: &str) -> BytecodeModule {
+        let (toks, _) = tokenize(FileId(0), src);
+        let (prog, _) = parse(toks);
+        let (hir, d) = analyze(&prog);
+        assert!(!d.has_errors(), "{d:?}");
+        assemble(&emit_ir(&hir.unwrap())).expect("assemble")
+    }
+
+    #[test]
+    fn generic_cmp_casts_and_i64_ops() {
+        let src = r#"
+            fn main() -> i32 {
+                let a: i64 = 5000000000;
+                print_i64(-a);
+                let c: i64 = 7;
+                let d: i64 = 3;
+                print_i64(c % d);
+                print_bool(c != d);
+                print_bool(c >= d);
+                let s = "abc";
+                print_bool(s == "abc");
+                print_bool('a' < 'b');
+                print_bool(true != false);
+                print_bool(1.5 >= 2.0);
+                print_i32(len("ação"));
+                print_f64(c as f64);
+                print_i32('A' as i32);
+                print_i32((65 as char) as i32);
+                print_i64(true as i64);
+                return 0;
+            }
+        "#;
+        let (_, out) = run_src(src);
+        assert_eq!(
+            out,
+            "-5000000000\n1\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\n4\n7\n65\n65\n1\n"
+        );
+    }
+
+    #[test]
+    fn i32_min_div_minus_one_wraps() {
+        // Unoptimized so the division actually executes on the VM.
+        let bc = bytecode_of(
+            r#"
+            fn main() -> i32 {
+                let a = 0 - 2147483647 - 1;
+                let b = 0 - 1;
+                print_i32(a / b);
+                print_i32(a % b);
+                return 0;
+            }
+        "#,
+        );
+        let (_, out, _) = execute_captured(&bc).expect("vm");
+        assert_eq!(out, "-2147483648\n0\n");
+    }
+
+    #[test]
+    fn extern_call_is_a_vm_error() {
+        let bc = bytecode_of(r#"extern fn foo(x: string); fn main() -> i32 { foo("x"); return 0; }"#);
+        let (res, out, _) = run_captured(&bc);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("extern function `foo`"), "{err}");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn run_captured_keeps_partial_stdout() {
+        let bc = bytecode_of("fn main() -> i32 { print_i32(1); let z = 0; print_i32(5 / z); return 0; }");
+        let (res, out, steps) = run_captured(&bc);
+        assert_eq!(res.unwrap_err().to_string(), "division by zero");
+        assert_eq!(out, "1\n");
+        assert!(steps > 0);
+        assert!(execute_captured(&bc).is_err());
+    }
+
+    #[test]
+    fn cmp_rejects_mismatched_tags() {
+        let err = cmp_values(CmpOp::Eq, &Value::I32(1), &Value::Str("1".into())).unwrap_err();
+        assert_eq!(err.to_string(), "cannot compare i32 with string");
+        assert!(cmp_values(CmpOp::Ne, &Value::F64(f64::NAN), &Value::F64(1.0)).unwrap());
+        assert!(!cmp_values(CmpOp::Lt, &Value::F64(f64::NAN), &Value::F64(1.0)).unwrap());
+    }
+
+    #[test]
+    fn many_registers_fit_in_u16() {
+        let mut src = String::from("fn main() -> i32 {\n");
+        for i in 0..300 {
+            src.push_str(&format!("    let v{i} = {i} + 1;\n"));
+        }
+        src.push_str("    let mut t = 0;\n");
+        for i in 0..300 {
+            src.push_str(&format!("    t = t + v{i};\n"));
+        }
+        src.push_str("    print_i32(t);\n    return t;\n}\n");
+        let bc = bytecode_of(&src);
+        let (v, out, _) = execute_captured(&bc).expect("vm");
+        assert_eq!(v, Value::I32(45150));
+        assert_eq!(out, "45150\n");
     }
 }

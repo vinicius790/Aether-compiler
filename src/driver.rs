@@ -2,15 +2,16 @@
 
 use crate::ast::{dump_program, Program};
 use crate::backend::{assemble, emit_llvm_ir, BytecodeModule};
-use crate::diagnostic::Diagnostics;
+use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::ir::{dump_ir, emit_ir, IrModule};
 use crate::lexer::tokenize;
 use crate::opt::{optimize, OptReport};
 use crate::parser::parse;
 use crate::sema::{analyze, HirProgram};
-use crate::span::{FileId, Session};
+use crate::span::{FileId, Session, Span};
 use crate::token::Token;
-use crate::vm::{execute_captured, Value, VmError};
+use crate::vm::{run_captured, Value, VmError};
+use std::fmt;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,22 @@ impl Compiled {
         !self.diags.has_errors() && self.bytecode.is_some()
     }
 }
+
+/// A VM failure together with whatever the program printed before it.
+#[derive(Debug)]
+pub struct RunError {
+    pub error: VmError,
+    pub stdout: String,
+    pub steps: u64,
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for RunError {}
 
 pub fn compile_source(name: &str, source: &str, opts: &CompileOptions) -> Compiled {
     let mut session = Session::new();
@@ -140,7 +157,14 @@ pub fn compile_source(name: &str, source: &str, opts: &CompileOptions) -> Compil
     timings.opt_us = t4.elapsed().as_micros();
 
     let t5 = Instant::now();
-    let bytecode = assemble(&ir);
+    let bytecode = match assemble(&ir) {
+        Ok(bc) => Some(bc),
+        Err(msg) => {
+            let span = assemble_error_span(&ir, &msg);
+            diags.push(Diagnostic::error(msg, span).with_code("E0300"));
+            None
+        }
+    };
     let llvm = emit_llvm_ir(&ir);
     timings.codegen_us = t5.elapsed().as_micros();
 
@@ -152,12 +176,25 @@ pub fn compile_source(name: &str, source: &str, opts: &CompileOptions) -> Compil
         hir,
         ir: Some(ir),
         ir_unopt: Some(ir_unopt),
-        bytecode: Some(bytecode),
+        bytecode,
         llvm: Some(llvm),
         opt_report: Some(report),
         diags,
         timings,
     }
+}
+
+/// Assembler errors name the offending function in backticks
+/// ("function `f` needs ..."); point the diagnostic at its definition
+/// when that function exists, else at nothing.
+fn assemble_error_span(ir: &IrModule, msg: &str) -> Span {
+    let mut parts = msg.split('`');
+    parts.next();
+    parts
+        .next()
+        .and_then(|name| ir.functions.iter().find(|f| f.name == name))
+        .map(|f| f.span)
+        .unwrap_or(Span::DUMMY)
 }
 
 pub fn compile_file(path: &str, opts: &CompileOptions) -> Result<Compiled, String> {
@@ -170,12 +207,25 @@ pub fn compile_file(path: &str, opts: &CompileOptions) -> Result<Compiled, Strin
     Ok(compile_source(path, &source, opts))
 }
 
-pub fn run_compiled(c: &mut Compiled) -> Result<(Value, String, u64), VmError> {
-    let bc = c.bytecode.as_ref().ok_or(VmError::MissingMain)?;
+pub fn run_compiled(c: &mut Compiled) -> Result<(Value, String, u64), RunError> {
+    let Some(bc) = c.bytecode.as_ref() else {
+        return Err(RunError {
+            error: VmError::MissingMain,
+            stdout: String::new(),
+            steps: 0,
+        });
+    };
     let t = Instant::now();
-    let result = execute_captured(bc);
+    let (result, stdout, steps) = run_captured(bc);
     c.timings.exec_us = t.elapsed().as_micros();
-    result
+    match result {
+        Ok(val) => Ok((val, stdout, steps)),
+        Err(error) => Err(RunError {
+            error,
+            stdout,
+            steps,
+        }),
+    }
 }
 
 pub fn dump_tokens(c: &Compiled) -> String {
@@ -213,5 +263,47 @@ pub fn dump_bc(c: &Compiled) -> String {
     match &c.bytecode {
         Some(bc) => bc.disassemble(),
         None => "<no bytecode>\n".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_error_carries_partial_stdout() {
+        let src = "fn main() -> i32 { print_i32(1); let z = 0; print_i32(5 / z); return 0; }";
+        let mut c = compile_source("t.ae", src, &CompileOptions::default());
+        assert!(c.ok());
+        let e = run_compiled(&mut c).unwrap_err();
+        assert_eq!(e.stdout, "1\n");
+        assert_eq!(e.to_string(), "division by zero");
+        assert!(e.steps > 0);
+    }
+
+    #[test]
+    fn extern_without_impl_is_runtime_error() {
+        let src = r#"extern fn foo(x: string); fn main() -> i32 { foo("x"); return 0; }"#;
+        let mut c = compile_source("t.ae", src, &CompileOptions::default());
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        let e = run_compiled(&mut c).unwrap_err();
+        assert!(e.to_string().contains("extern"), "{e}");
+        assert_eq!(e.stdout, "");
+    }
+
+    #[test]
+    fn assemble_failure_becomes_e0300() {
+        // Compile normally, then re-assemble a module whose register count
+        // exceeds the VM limit to exercise the diagnostic path end to end.
+        let src = "fn main() -> i32 { return 0; }";
+        let c = compile_source("t.ae", src, &CompileOptions::default());
+        let mut ir = c.ir.clone().unwrap();
+        ir.functions[0].reg_count = 70_000;
+        let msg = assemble(&ir).unwrap_err();
+        let span = assemble_error_span(&ir, &msg);
+        assert_eq!(span, ir.functions[0].span);
+        let d = Diagnostic::error(msg, span).with_code("E0300");
+        assert_eq!(d.code, Some("E0300"));
+        assert_eq!(assemble_error_span(&ir, "unknown function `ghost`"), Span::DUMMY);
     }
 }

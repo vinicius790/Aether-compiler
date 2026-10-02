@@ -186,7 +186,7 @@ mod tests {
         let ir = emit_ir(&hir.unwrap());
         let (opt, _) = optimize(ir, 2);
         let text = crate::ir::dump_ir(&opt);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         (v, text)
     }

@@ -382,7 +382,7 @@ pub fn check_ir(m: &IrModule) -> Result<(), String> {
 pub fn eval_ir(module: IrModule, opt_level: u8) -> Result<(Value, String), String> {
     let (ir, _) = optimize(module, opt_level);
     check_ir(&ir).map_err(|e| format!("opt O{opt_level} broke IR: {e}"))?;
-    let bc = assemble(&ir);
+    let bc = assemble(&ir).map_err(|e| e.to_string())?;
     execute_captured(&bc).map(|(v, out, _)| (v, out)).map_err(|e| e.to_string())
 }
 

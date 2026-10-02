@@ -671,7 +671,7 @@ mod tests {
     fn folds_and_false() {
         let ir = compile_ir("fn main() -> i32 { if false && true { return 1; } return 0; }");
         let (opt, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(0));
     }
@@ -706,7 +706,7 @@ mod tests {
         "#;
         let ir = compile_ir(src);
         let (opt, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(8));
     }
@@ -727,7 +727,7 @@ mod tests {
             !text.contains("br %"),
             "opaque (x-x)==0 should become a jump\n{text}"
         );
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(1));
     }
@@ -743,7 +743,7 @@ mod tests {
         "#;
         let ir = compile_ir(src);
         let (opt, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(2));
     }
@@ -794,7 +794,7 @@ mod tests {
         "#;
         let ir = compile_ir(src);
         let (opted, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opted);
+        let bc = crate::backend::assemble(&opted).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(-16));
     }

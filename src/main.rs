@@ -35,7 +35,7 @@ COMMANDS:
     digest <file> [-O<n>]         deterministic stdout+value fingerprint
     repl [-O<n>]
     benchmark [--n <int>]
-    fuzz [--iters N] [--seed N] [--kind all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox|format]
+    fuzz [--iters N] [--seed N] [--kind all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox|format|agg]
     help
     version
 "
@@ -204,6 +204,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
+                    print!("{}", e.stdout);
+                    let _ = io::stdout().flush();
                     eprintln!("runtime error: {e}");
                     Ok(ExitCode::from(2))
                 }
@@ -437,7 +439,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "profile" => {
-            let mut c = compile_file(
+            let c = compile_file(
                 need_file(&a)?,
                 &CompileOptions {
                     opt_level: a.opt,
@@ -480,6 +482,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
+                    print!("{}", e.stdout);
+                    let _ = io::stdout().flush();
                     eprintln!("runtime error: {e}");
                     Ok(ExitCode::from(2))
                 }
@@ -545,7 +549,11 @@ fn repl(opt: u8) -> Result<ExitCode, String> {
                 print!("{out}");
                 println!("=> {val}");
             }
-            Err(e) => eprintln!("runtime error: {e}"),
+            Err(e) => {
+                print!("{}", e.stdout);
+                let _ = io::stdout().flush();
+                eprintln!("runtime error: {e}");
+            }
         }
     }
 }
@@ -599,7 +607,7 @@ fn parse_u64(s: &str) -> Option<u64> {
 fn run_fuzz_cmd(iters: u32, seed: u64, kind: &str) -> Result<ExitCode, String> {
     use aether::fuzz::{run_fuzz, FuzzConfig, FuzzKind};
     let kind = FuzzKind::parse(kind).ok_or_else(|| {
-        format!("unknown fuzz kind `{kind}` (use all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox)")
+        format!("unknown fuzz kind `{kind}` (use all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox|format|agg)")
     })?;
     println!("aether fuzz  iters={iters} seed={seed:#x} kind={kind:?}");
     let report = run_fuzz(&FuzzConfig { iters, seed, kind });

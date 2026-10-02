@@ -61,7 +61,7 @@ pub fn mk() -> Pub { return Pub { v: 1, w: 2.5 }; }
 pub fn mkp() -> Priv { return Priv { v: 9 }; }
 pub extern fn host(x: i32) -> i32;
 extern fn host2(x: i32) -> i32;
-enum Color { Red, Green }
+pub enum Color { Red, Green }
 pub fn red() -> Color { return Color::Red; }
 pub fn tup() -> (Priv, i32) { return (Priv { v: 1 }, 2); }
 ";
@@ -160,7 +160,7 @@ fn main() -> i32 {
     print_i32(h.v);
     let (a, b) = tup();
     print_i32(a.v + b);
-    // enums are not subject to `pub`
+    // a `pub enum` and its variants are usable from other files
     let c = red();
     match c { Color::Red => { print_i32(100); } Color::Green => { print_i32(200); } }
     return 0;
@@ -276,18 +276,16 @@ fn a_private_use_site_is_reported_once() {
 }
 
 #[test]
-fn private_helpers_with_the_same_name_in_two_files_still_clash() {
-    // documented limitation: the namespace is flat even for private items
+fn private_helpers_with_the_same_name_in_two_files_do_not_clash() {
+    // private names are file-scoped: each file calls its own `helper`
     let d = scratch("clash");
     write(&d, "lib.ae", "fn helper() -> i32 { return 1; }\npub fn one() -> i32 { return helper(); }\n");
     let main = write(
         &d,
         "main.ae",
-        "use \"lib\";\nfn helper() -> i32 { return 2; }\nfn main() -> i32 { return one() + helper(); }\n",
+        "use \"lib\";\nfn helper() -> i32 { return 20; }\nfn main() -> i32 { print_i32(one() + helper()); return 0; }\n",
     );
-    let o = run(&["check", &main]);
-    assert_eq!(o.status.code(), Some(1));
-    assert!(err(&o).contains("duplicate function `helper`"), "{}", err(&o));
+    assert_eq!(run_both(&main, &[]), "21\n");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -362,7 +360,7 @@ fn fmt_prints_only_the_main_file_and_keeps_use_lines() {
     let o = run(&["fmt", "examples/modules.ae"]);
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
-    assert!(text.starts_with("use \"../stdlib/vec2.ae\";\nuse \"../stdlib/rng.ae\";\n"), "{text}");
+    assert!(text.contains("\nuse \"../stdlib/vec2.ae\";\nuse \"../stdlib/rng.ae\";\n"), "{text}");
     assert!(!text.contains("struct Vec2"), "{text}");
     assert!(!text.contains("fn rng_next"), "{text}");
     // the formatted program, next to the original, behaves the same

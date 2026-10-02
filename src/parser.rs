@@ -20,6 +20,9 @@ pub struct Parser {
     diags: Diagnostics,
     depth: usize,
     depth_reported: bool,
+    /// The last syntax error, so unwinding out of nested constructs at the
+    /// end of the file reports "expected `}`, found end of file" once.
+    last_error: Option<(String, Span)>,
 }
 
 impl Parser {
@@ -30,6 +33,7 @@ impl Parser {
             diags: Diagnostics::new(),
             depth: 0,
             depth_reported: false,
+            last_error: None,
         }
     }
 
@@ -111,7 +115,10 @@ impl Parser {
                 s.is_pub = is_pub;
                 Item::Struct(s)
             }),
-            TokenKind::Enum => self.parse_enum().map(Item::Enum),
+            TokenKind::Enum => self.parse_enum().map(|mut e| {
+                e.is_pub = is_pub;
+                Item::Enum(e)
+            }),
             TokenKind::Extern => self.parse_extern().map(|mut e| {
                 e.is_pub = is_pub;
                 Item::Extern(e)
@@ -121,7 +128,7 @@ impl Parser {
             _ => {
                 let tok = self.peek().clone();
                 self.error_at(
-                    format!("expected item, found `{}`", tok.lexeme),
+                    format!("expected item, found {}", found(&tok)),
                     tok.span,
                     Some("items start with `fn`, `struct`, `enum`, `extern` or `use`; `pub` may precede fn/struct/enum/extern"),
                 );
@@ -275,6 +282,7 @@ impl Parser {
         }
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(EnumDecl {
+            is_pub: false,
             name,
             variants,
             span: start.merge(end),
@@ -719,6 +727,12 @@ impl Parser {
             }
             TokenKind::Minus => {
                 let start = self.bump().span;
+                if let Some(min) = self.eat_i64_min_magnitude() {
+                    return Some(Pattern {
+                        kind: PatternKind::Literal(Literal::Int(i64::MIN)),
+                        span: start.merge(min),
+                    });
+                }
                 let e = self.parse_literal()?;
                 let lit = match e.kind {
                     ExprKind::Literal(Literal::Int(v)) => Literal::Int(v.wrapping_neg()),
@@ -736,7 +750,7 @@ impl Parser {
             _ => {
                 let tok = self.peek().clone();
                 self.error_at(
-                    format!("expected pattern, found `{}`", tok.lexeme),
+                    format!("expected pattern, found {}", found(&tok)),
                     tok.span,
                     Some("patterns: `_`, a name, a literal, `Enum::Variant(p, ...)` or `(p, q)`"),
                 );
@@ -951,11 +965,7 @@ impl Parser {
             TokenKind::Int => {
                 let value = parse_int(&tok.lexeme);
                 if value.is_none() {
-                    self.error_at(
-                        "invalid integer literal",
-                        tok.span,
-                        Some("integer literals must fit in 64 bits; forms: 255, 1_000, 0xFF, 0b1010, 0o17"),
-                    );
+                    self.int_literal_error(&tok);
                 }
                 Literal::Int(value.unwrap_or(0))
             }
@@ -1072,6 +1082,17 @@ impl Parser {
         if !self.check(TokenKind::RBracket) {
             loop {
                 elements.push(self.parse_expr()?);
+                if elements.len() == 1 && self.eat(TokenKind::Semicolon) {
+                    // `[value; count]`
+                    let count = self.parse_array_len()?;
+                    let end = self.expect(TokenKind::RBracket)?.span;
+                    let value = Box::new(elements.pop().expect("one element"));
+                    let expr = Expr {
+                        kind: ExprKind::ArrayRepeat { value, count },
+                        span: start.merge(end),
+                    };
+                    return self.parse_postfix(expr);
+                }
                 if !self.eat(TokenKind::Comma) {
                     break;
                 }
@@ -1090,6 +1111,16 @@ impl Parser {
 
     fn parse_unary(&mut self, op: UnOp) -> Option<Expr> {
         let start = self.bump().span;
+        if op == UnOp::Neg {
+            // `-9223372036854775808` is `i64::MIN`: one literal, although
+            // its magnitude alone does not fit in `i64`
+            if let Some(end) = self.eat_i64_min_magnitude() {
+                return Some(Expr {
+                    kind: ExprKind::Literal(Literal::Int(i64::MIN)),
+                    span: start.merge(end),
+                });
+            }
+        }
         let expr = self.parse_prec(PREC_UNARY)?;
         let span = start.merge(expr.span);
         Some(Expr {
@@ -1121,7 +1152,7 @@ impl Parser {
             );
         } else {
             self.error_at(
-                format!("expected expression, found `{}`", tok.lexeme),
+                format!("expected expression, found {}", found(&tok)),
                 tok.span,
                 None,
             );
@@ -1179,7 +1210,8 @@ impl Parser {
                             let mut parts = Vec::new();
                             for part in tok.lexeme.split('.') {
                                 match part.parse::<usize>() {
-                                    Ok(i) if !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()) => {
+                                    // canonical decimal only: `t.01` is not `t.1`
+                                    Ok(i) if part.bytes().all(|c| c.is_ascii_digit()) && i.to_string() == part => {
                                         parts.push(Ident::new(i.to_string(), tok.span));
                                     }
                                     _ => {
@@ -1274,8 +1306,7 @@ impl Parser {
                 let start = self.bump().span;
                 let elem = Box::new(self.parse_type()?);
                 self.expect(TokenKind::Semicolon)?;
-                let len_tok = self.expect(TokenKind::Int)?;
-                let len = parse_int(&len_tok.lexeme).unwrap_or(0);
+                let len = self.parse_array_len()?;
                 let end = self.expect(TokenKind::RBracket)?.span;
                 Some(TypeExpr {
                     kind: TypeExprKind::Array { elem, len },
@@ -1312,10 +1343,49 @@ impl Parser {
             _ => {
                 let tok = self.peek().clone();
                 self.error_at(
-                    format!("expected type, found `{}`", tok.lexeme),
+                    format!("expected type, found {}", found(&tok)),
                     tok.span,
                     Some("valid types: i32, i64, f64, bool, string, unit, [T; N], (T1, T2), or a struct/enum name"),
                 );
+                None
+            }
+        }
+    }
+
+    /// After a `-`: consumes the integer literal `9223372036854775808`
+    /// (= 2^63, in any radix) and returns its span, so the caller can build
+    /// `i64::MIN`. Any other token is left alone.
+    fn eat_i64_min_magnitude(&mut self) -> Option<Span> {
+        let tok = self.peek();
+        if tok.kind == TokenKind::Int && parse_int_u128(&tok.lexeme) == Some(1u128 << 63) {
+            return Some(self.bump().span);
+        }
+        None
+    }
+
+    fn int_literal_error(&mut self, tok: &Token) {
+        if parse_int_u128(&tok.lexeme).is_some() {
+            self.error_at(
+                "integer literal out of range for i64",
+                tok.span,
+                Some("invalid integer literal: the largest is 9223372036854775807 (`-9223372036854775808` is allowed)"),
+            );
+        } else {
+            self.error_at(
+                "invalid integer literal",
+                tok.span,
+                Some("forms: 255, 1_000, 0xFF, 0b1010, 0o17"),
+            );
+        }
+    }
+
+    /// The `N` of `[T; N]` / `[value; N]`: a non-negative integer literal.
+    fn parse_array_len(&mut self) -> Option<i64> {
+        let tok = self.expect(TokenKind::Int)?;
+        match parse_int(&tok.lexeme) {
+            Some(n) => Some(n),
+            None => {
+                self.int_literal_error(&tok);
                 None
             }
         }
@@ -1328,7 +1398,7 @@ impl Parser {
         } else {
             let tok = self.peek().clone();
             self.error_at(
-                format!("expected identifier, found `{}`", tok.lexeme),
+                format!("expected identifier, found {}", found(&tok)),
                 tok.span,
                 None,
             );
@@ -1344,7 +1414,7 @@ impl Parser {
         } else {
             let tok = self.peek().clone();
             self.error_at(
-                format!("expected {}, found `{}`", kind.as_str(), tok.lexeme),
+                format!("expected {}, found {}", describe(kind), found(&tok)),
                 tok.span,
                 None,
             );
@@ -1425,6 +1495,12 @@ impl Parser {
     }
 
     fn error_at(&mut self, message: impl Into<String>, span: Span, help: Option<&str>) {
+        let message = message.into();
+        let key = Some((message.clone(), span));
+        if self.last_error == key {
+            return;
+        }
+        self.last_error = key;
         let mut d = Diagnostic::error(message, span).with_code("E0100");
         if let Some(h) = help {
             d = d.with_help(h);
@@ -1540,6 +1616,47 @@ fn parse_int(lexeme: &str) -> Option<i64> {
         _ => (10, digits.as_str()),
     };
     i64::from_str_radix(body, radix).ok()
+}
+
+/// Like [`parse_int`] but wider, to tell an out-of-range literal from a
+/// malformed one (and to recognise the magnitude of `i64::MIN`).
+fn parse_int_u128(lexeme: &str) -> Option<u128> {
+    let digits: String = lexeme.chars().filter(|c| *c != '_').collect();
+    let (radix, body) = match digits.get(..2) {
+        Some("0x") => (16, &digits[2..]),
+        Some("0b") => (2, &digits[2..]),
+        Some("0o") => (8, &digits[2..]),
+        _ => (10, digits.as_str()),
+    };
+    if body.is_empty() || !body.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    // too long for u128 still counts as "out of range"
+    Some(u128::from_str_radix(body, radix).unwrap_or(u128::MAX))
+}
+
+/// What the parser expected, for "expected X, found Y": punctuation and
+/// keywords in backticks, token classes (`identifier`) as words.
+fn describe(kind: TokenKind) -> String {
+    match kind {
+        TokenKind::Ident
+        | TokenKind::Int
+        | TokenKind::Float
+        | TokenKind::String
+        | TokenKind::Char
+        | TokenKind::Eof
+        | TokenKind::Invalid => kind.as_str().to_string(),
+        _ => format!("`{}`", kind.as_str()),
+    }
+}
+
+/// The token found instead: its text in backticks, or `end of file`.
+fn found(tok: &Token) -> String {
+    if tok.kind == TokenKind::Eof {
+        "end of file".to_string()
+    } else {
+        format!("`{}`", tok.lexeme)
+    }
 }
 
 fn parse_float(lexeme: &str) -> Option<f64> {

@@ -7,6 +7,23 @@ use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::span::{FileId, Span};
 use crate::token::{Token, TokenKind};
 
+/// `// ...` (to the end of the line, `\n` excluded) or `/* ... */` (not
+/// nested: the first `*/` closes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentKind {
+    Line,
+    Block,
+}
+
+/// A comment kept by [`tokenize_with_comments`]: its exact source text
+/// (delimiters included) and span. The parser never sees comments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Comment {
+    pub kind: CommentKind,
+    pub text: String,
+    pub span: Span,
+}
+
 pub struct Lexer<'src> {
     file: FileId,
     src: &'src str,
@@ -15,6 +32,8 @@ pub struct Lexer<'src> {
     line: u32,
     column: u32,
     diags: Diagnostics,
+    /// `Some` only for [`tokenize_with_comments`].
+    comments: Option<Vec<Comment>>,
 }
 
 impl<'src> Lexer<'src> {
@@ -29,6 +48,7 @@ impl<'src> Lexer<'src> {
             line: 1,
             column: 1,
             diags: Diagnostics::new(),
+            comments: None,
         }
     }
 
@@ -379,9 +399,11 @@ impl<'src> Lexer<'src> {
                     self.bump();
                 }
                 '/' if self.peek_char_at(1) == '/' => {
+                    let (start, line, column) = (self.pos, self.line, self.column);
                     while !self.is_eof() && self.peek_char() != '\n' {
                         self.bump();
                     }
+                    self.keep_comment(CommentKind::Line, start, line, column);
                 }
                 '/' if self.peek_char_at(1) == '*' => {
                     let start = self.pos;
@@ -399,6 +421,7 @@ impl<'src> Lexer<'src> {
                         }
                         self.bump();
                     }
+                    self.keep_comment(CommentKind::Block, start, line, column);
                     if !closed {
                         self.diags.push(
                             Diagnostic::error(
@@ -412,6 +435,17 @@ impl<'src> Lexer<'src> {
                 }
                 _ => return,
             }
+        }
+    }
+
+    fn keep_comment(&mut self, kind: CommentKind, start: usize, line: u32, column: u32) {
+        let span = self.span_from(start, line, column);
+        if let Some(c) = self.comments.as_mut() {
+            c.push(Comment {
+                kind,
+                text: self.src[start..self.pos].to_string(),
+                span,
+            });
         }
     }
 
@@ -460,6 +494,24 @@ impl<'src> Lexer<'src> {
 
 pub fn tokenize(file: FileId, src: &str) -> (Vec<Token>, Diagnostics) {
     Lexer::new(file, src).tokenize()
+}
+
+/// [`tokenize`] plus the comments it skipped, in source order (used by
+/// `aether fmt`). The tokens and diagnostics are exactly `tokenize`'s.
+pub fn tokenize_with_comments(file: FileId, src: &str) -> (Vec<Token>, Vec<Comment>, Diagnostics) {
+    let mut lx = Lexer::new(file, src);
+    lx.comments = Some(Vec::new());
+    let mut tokens = Vec::new();
+    loop {
+        let tok = lx.next_token();
+        let is_eof = tok.kind == TokenKind::Eof;
+        tokens.push(tok);
+        if is_eof {
+            break;
+        }
+    }
+    let comments = lx.comments.take().unwrap_or_default();
+    (tokens, comments, lx.diags)
 }
 
 #[cfg(test)]

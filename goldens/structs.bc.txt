@@ -42,18 +42,18 @@ fn ceil #19 arity=1 regs=1
 
 fn pow_i32 #20 arity=1 regs=1
 
-fn main #21 arity=0 regs=10
-  0000  allocobj r0, 2
-  0001  loadimm r1, I32(3)
-  0002  storefld r0.0, r1
+fn main #21 arity=0 regs=6
+  0000  allocobj r1, 2
+  0001  loadimm r2, I32(3)
+  0002  storefld r1.0, r2
   0003  loadimm r2, I32(4)
-  0004  storefld r0.1, r2
-  0005  loadfld r3, r0.0
-  0006  loadfld r4, r0.0
-  0007  muli32 r5, r3, r4
-  0008  loadfld r6, r0.1
-  0009  loadfld r7, r0.1
-  0010  muli32 r8, r6, r7
-  0011  addi32 r9, r5, r8
-  0012  native #2 -> None [9]
-  0013  ret r9
+  0004  storefld r1.1, r2
+  0005  loadfld r2, r1.0
+  0006  loadfld r3, r1.0
+  0007  muli32 r4, r2, r3
+  0008  loadfld r2, r1.1
+  0009  loadfld r3, r1.1
+  0010  muli32 r5, r2, r3
+  0011  addi32 r0, r4, r5
+  0012  native #2 -> None [0]
+  0013  ret r0

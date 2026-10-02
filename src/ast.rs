@@ -95,6 +95,9 @@ pub struct FieldDecl {
 /// payloads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDecl {
+    /// `pub` was written: the enum (and so its variants) may be named from
+    /// other files (E0281 otherwise, like a struct).
+    pub is_pub: bool,
     pub name: Ident,
     pub variants: Vec<VariantDecl>,
     pub span: Span,
@@ -274,6 +277,11 @@ pub enum ExprKind {
     },
     Array {
         elements: Vec<Expr>,
+    },
+    /// `[value; count]`: `value` is evaluated once and copied `count` times.
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: i64,
     },
     StructLit {
         name: Ident,
@@ -657,6 +665,7 @@ fn expr_str(expr: &Expr) -> String {
             let e: Vec<_> = elements.iter().map(expr_str).collect();
             format!("[{}]", e.join(", "))
         }
+        ExprKind::ArrayRepeat { value, count } => format!("[{}; {count}]", expr_str(value)),
         ExprKind::StructLit { name, fields } => {
             let f: Vec<_> = fields
                 .iter()

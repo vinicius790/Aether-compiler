@@ -70,7 +70,17 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
         ..Default::default()
     };
     if level == 0 {
-        report.insts_after = insts_before;
+        // No optimization, except that a function too big for the VM's
+        // 16-bit register numbers is compacted (otherwise E0300).
+        let regs_before = regalloc::reg_total(&module);
+        if regalloc::pass_regalloc_oversized(&mut module, crate::backend::bytecode::MAX_REGS) {
+            report.passes.push(PassStats {
+                name: format!("regalloc (regs {}→{})", regs_before, regalloc::reg_total(&module)),
+                insts_before,
+                insts_after: count_insts(&module),
+            });
+        }
+        report.insts_after = count_insts(&module);
         return (module, report);
     }
 

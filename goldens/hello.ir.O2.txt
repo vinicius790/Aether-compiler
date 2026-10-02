@@ -1,8 +1,8 @@
 fn main() -> i32 {
 bb0:
-  %0 = const "hello, aether"
-  call println(%0)
-  %1 = const 0_i32
-  ret %1
+  %1 = const "hello, aether"
+  call println(%1)
+  %0 = const 0_i32
+  ret %0
 }
 

@@ -47,8 +47,85 @@ pub fn pass_regalloc(module: &mut IrModule) {
     }
     rets.entry("len".to_string()).or_insert(Type::I32);
     for f in &mut module.functions {
+        coalesce_concat(f);
         if let Some((map, count)) = plan(f, &rets) {
             apply(f, &map, count);
+        }
+    }
+}
+
+/// Register compaction for `-O0`: only functions that declare more
+/// registers than the bytecode can encode are renumbered (a 70000-element
+/// array literal lowers to one register per element); everything else keeps
+/// the unoptimized numbering.
+pub fn pass_regalloc_oversized(module: &mut IrModule, limit: u32) -> bool {
+    if module.functions.iter().all(|f| f.reg_count <= limit) {
+        return false;
+    }
+    let rets: HashMap<String, Type> = module
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f.return_ty.clone()))
+        .collect();
+    for f in module.functions.iter_mut().filter(|f| f.reg_count > limit) {
+        if let Some((map, count)) = plan(f, &rets) {
+            apply(f, &map, count);
+        }
+    }
+    true
+}
+
+/// `%t = +.string %a, %b; %a = mov %t` with `%t` dead afterwards becomes
+/// `%a = +.string %a, %b`, so the VM can append to `%a`'s text in place
+/// (`s = s + x` in a loop is then linear instead of quadratic).
+fn coalesce_concat(f: &mut IrFunction) {
+    let is_pair = |x: &Inst, y: &Inst| match (x, y) {
+        (Inst::Bin { dest, op: crate::ast::BinOp::Add, ty: Type::String, lhs, .. }, Inst::Move { dest: md, src }) => {
+            src == dest && md == lhs && dest != lhs
+        }
+        _ => false,
+    };
+    if !f.blocks.iter().any(|bb| bb.insts.windows(2).any(|w| is_pair(&w[0], &w[1]))) {
+        return;
+    }
+    let lv = liveness::analyze_function(f);
+    for bb in &mut f.blocks {
+        // Backward scan: is the pair's `t` dead right after its move?
+        let mut live: LiveSet = lv.live_out.get(&bb.id.0).cloned().unwrap_or_default();
+        if let Some(r) = term_reg(&bb.term) {
+            live.insert(r.0);
+        }
+        let mut fold = vec![false; bb.insts.len()];
+        for k in (0..bb.insts.len()).rev() {
+            if k >= 1 && is_pair(&bb.insts[k - 1], &bb.insts[k]) {
+                if let Inst::Move { src, .. } = &bb.insts[k] {
+                    fold[k - 1] = !live.contains(&src.0);
+                }
+            }
+            if let Some(d) = bb.insts[k].dest_reg() {
+                live.remove(&d.0);
+            }
+            for u in bb.insts[k].uses() {
+                live.insert(u.0);
+            }
+        }
+        if !fold.contains(&true) {
+            continue;
+        }
+        let old = std::mem::take(&mut bb.insts);
+        let mut skip = false;
+        for (k, mut inst) in old.into_iter().enumerate() {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if fold[k] {
+                if let Inst::Bin { dest, lhs, .. } = &mut inst {
+                    *dest = *lhs;
+                }
+                skip = true;
+            }
+            bb.insts.push(inst);
         }
     }
 }
@@ -218,22 +295,31 @@ fn touch(r: Reg, mentioned: &mut [bool], order: &mut Vec<u32>) -> bool {
     true
 }
 
+/// Color-type tag for a register whose type is unknown: such a register gets
+/// a color of its own that nothing else may share.
+const UNKNOWN: u32 = u32::MAX;
+
 /// First color that is not forbidden (`stamp[c] == epoch`), not a parameter
 /// register, and holds either nothing yet or exactly the register's type.
-fn pick_color(
-    stamp: &[u32],
-    epoch: u32,
-    reserved: &[bool],
-    color_type: &[Option<Type>],
-    ty: &Option<Type>,
-) -> Option<usize> {
+fn pick_color(stamp: &[u32], epoch: u32, reserved: &[bool], color_type: &[Option<u32>], ty: Option<u32>) -> Option<usize> {
     (0..color_type.len())
         .filter(|&c| !reserved[c] && stamp[c] != epoch)
-        .find(|&c| match (&color_type[c], ty) {
+        .find(|&c| match (color_type[c], ty) {
             (None, _) => true,
-            (Some(held), Some(t)) => held == t,
+            (Some(held), Some(t)) => held == t && t != UNKNOWN,
             (Some(_), None) => false,
         })
+}
+
+/// Hull of a block-local register's live range inside its block, in
+/// program points: instruction `j` reads its operands at `2j` and writes its
+/// destination at `2j + 1`, and an operand stays occupied until `2j + 1`, so
+/// an instruction's destination never shares a register with its own
+/// operands (a bytecode expansion may write the destination early).
+#[derive(Clone, Copy)]
+struct Hull {
+    start: u32,
+    end: u32,
 }
 
 /// Computes `(old -> new)` and the new register count, or `None` to leave the
@@ -243,15 +329,30 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
         return None;
     }
     let n = f.reg_count as usize;
-    let types = reg_types(f, rets);
+    // Intern the register types: colors are matched by small ids instead of
+    // comparing (possibly deeply nested) `Type`s.
+    let mut type_ids: HashMap<Type, u32> = HashMap::new();
+    let types: Vec<Option<u32>> = reg_types(f, rets)
+        .into_iter()
+        .map(|t| {
+            t.map(|t| {
+                let next = type_ids.len() as u32;
+                *type_ids.entry(t).or_insert(next)
+            })
+        })
+        .collect();
     let mut ids = HashSet::new();
     if !f.blocks.iter().all(|b| ids.insert(b.id.0)) {
         return None;
     }
 
     // First-appearance order; parameters first. Any register >= reg_count
-    // aborts the pass for this function.
+    // aborts the pass for this function. `home[r]` is the only block that
+    // mentions r, or `MULTI` when several do.
+    const NONE: u32 = u32::MAX;
+    const MULTI: u32 = u32::MAX - 1;
     let mut mentioned = vec![false; n];
+    let mut home = vec![NONE; n];
     let mut order: Vec<u32> = Vec::new();
     let mut is_param = vec![false; n];
     for (_, _, r) in &f.params {
@@ -263,23 +364,23 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
             return None; // duplicate parameter register
         }
         is_param[i] = true;
+        home[i] = MULTI;
     }
-    for bb in &f.blocks {
-        for inst in &bb.insts {
-            for u in inst.uses() {
-                if !touch(u, &mut mentioned, &mut order) {
-                    return None;
-                }
-            }
-            if let Some(d) = inst.dest_reg() {
-                if !touch(d, &mut mentioned, &mut order) {
-                    return None;
-                }
-            }
-        }
-        if let Some(r) = term_reg(&bb.term) {
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        let regs = bb
+            .insts
+            .iter()
+            .flat_map(|inst| inst.uses().into_iter().chain(inst.dest_reg()))
+            .chain(term_reg(&bb.term));
+        for r in regs {
             if !touch(r, &mut mentioned, &mut order) {
                 return None;
+            }
+            let h = &mut home[r.0 as usize];
+            if *h == NONE {
+                *h = bi as u32;
+            } else if *h != bi as u32 {
+                *h = MULTI;
             }
         }
     }
@@ -289,7 +390,28 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
 
     let lv = refined_liveness(f)?;
 
-    // blocks_of[r] = indices of the blocks where r is live (block granularity).
+    // A register live across any block boundary, or mentioned in several
+    // blocks, is *global*: it interferes at block granularity (live anywhere
+    // in a block = occupies its color for the whole block). Every other
+    // register is *local* to one block and gets an instruction-level hull,
+    // so long straight-line code reuses a handful of registers.
+    let mut global = vec![false; n];
+    for (i, h) in home.iter().enumerate() {
+        global[i] = *h == MULTI;
+    }
+    for bb in &f.blocks {
+        for set in [lv.live_in.get(&bb.id.0), lv.live_out.get(&bb.id.0)].into_iter().flatten() {
+            for &r in set {
+                let i = r as usize;
+                if i >= n || !mentioned[i] {
+                    return None;
+                }
+                global[i] = true;
+            }
+        }
+    }
+
+    // blocks_of[r] = blocks where global r is live (block granularity).
     let mut blocks_of: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (bi, bb) in f.blocks.iter().enumerate() {
         let mut set: HashSet<u32> = HashSet::new();
@@ -300,28 +422,24 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
             set.extend(s.iter().copied());
         }
         for inst in &bb.insts {
-            for u in inst.uses() {
-                set.insert(u.0);
-            }
+            set.extend(inst.uses().into_iter().map(|u| u.0).filter(|u| global[*u as usize]));
             if let Some(d) = inst.dest_reg() {
-                set.insert(d.0);
+                if global[d.0 as usize] {
+                    set.insert(d.0);
+                }
             }
         }
         if let Some(r) = term_reg(&bb.term) {
             set.insert(r.0);
         }
         for r in set {
-            let i = r as usize;
-            if i >= n || !mentioned[i] {
-                return None;
-            }
-            blocks_of[i].push(bi as u32);
+            blocks_of[r as usize].push(bi as u32);
         }
     }
 
-    // Greedy coloring. `used[b]` lists the colors already given to registers
-    // live in block b (sparse: a dense per-block bitset costs blocks x
-    // registers bits, gigabytes for a function with tens of thousands of
+    // Greedy coloring of the globals. `used[b]` lists the colors given to
+    // globals live in block b (sparse: a dense per-block bitset costs blocks
+    // x registers bits, gigabytes for a function with tens of thousands of
     // blocks). A register's forbidden set is the union over its blocks, kept
     // as an epoch stamp per color, plus every parameter register.
     let mut used: Vec<Vec<u32>> = vec![Vec::new(); f.blocks.len()];
@@ -329,10 +447,9 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
     let mut epoch = 0u32;
     let mut map = vec![u32::MAX; n];
     let mut max_color = 0usize;
-    // Type held by each color; a register of unknown type gets a color of its
-    // own (`Type::Error` marks it so nothing else matches it).
-    let mut color_type: Vec<Option<Type>> = vec![None; n];
-    for &r in &order {
+    // Type id held by each color (`UNKNOWN` = private color).
+    let mut color_type: Vec<Option<u32>> = vec![None; n];
+    for &r in order.iter().filter(|r| global[**r as usize]) {
         let i = r as usize;
         let color = if is_param[i] {
             i
@@ -343,13 +460,113 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
                     stamp[c as usize] = epoch;
                 }
             }
-            pick_color(&stamp, epoch, &is_param, &color_type, &types[i])?
+            pick_color(&stamp, epoch, &is_param, &color_type, types[i])?
         };
-        color_type[color] = Some(types[i].clone().unwrap_or(Type::Error));
+        color_type[color] = Some(types[i].unwrap_or(UNKNOWN));
         map[i] = color as u32;
         max_color = max_color.max(color);
         for &b in &blocks_of[i] {
             used[b as usize].push(color as u32);
+        }
+    }
+    // Colors handed out so far (fresh colors are taken from here upwards).
+    let mut ncolors = color_type.iter().rposition(|t| t.is_some()).map_or(0, |c| c + 1);
+
+    // Linear scan of the locals, block by block. The globals' colors are
+    // busy for the whole block; a local's color is free again once its hull
+    // ends. Locals of different blocks never interfere.
+    let mut hull: Vec<Hull> = vec![Hull { start: u32::MAX, end: 0 }; n];
+    for (bi, bb) in f.blocks.iter().enumerate() {
+        let mut locals: Vec<u32> = Vec::new();
+        let mut note = |r: Reg, start: u32, end: u32, locals: &mut Vec<u32>| {
+            let i = r.0 as usize;
+            if global[i] {
+                return;
+            }
+            let h = &mut hull[i];
+            if h.start == u32::MAX {
+                locals.push(r.0);
+                h.start = start;
+            }
+            h.start = h.start.min(start);
+            h.end = h.end.max(end);
+        };
+        for (j, inst) in bb.insts.iter().enumerate() {
+            let p = u32::try_from(j).ok()?.checked_mul(2)?;
+            for u in inst.uses() {
+                note(u, p, p + 1, &mut locals);
+            }
+            if let Some(d) = inst.dest_reg() {
+                note(d, p + 1, p + 1, &mut locals);
+            }
+        }
+        if locals.is_empty() {
+            continue;
+        }
+        epoch += 1;
+        for &c in &used[bi] {
+            stamp[c as usize] = epoch;
+        }
+        locals.sort_by_key(|r| hull[*r as usize].start);
+        // (end, color) of the locals currently holding a color
+        let mut active: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>> =
+            std::collections::BinaryHeap::new();
+        // colors released in this block, per type id
+        let mut free: HashMap<u32, std::collections::BTreeSet<u32>> = HashMap::new();
+        // per type id: how far the scan over existing colors has got
+        let mut cursor: HashMap<u32, usize> = HashMap::new();
+        for &r in &locals {
+            let i = r as usize;
+            let h = hull[i];
+            while let Some(std::cmp::Reverse((end, c))) = active.peek().copied() {
+                if end >= h.start {
+                    break;
+                }
+                active.pop();
+                if let Some(Some(t)) = color_type.get(c as usize) {
+                    if *t != UNKNOWN {
+                        free.entry(*t).or_default().insert(c);
+                    }
+                }
+            }
+            let color = match types[i] {
+                None => None,
+                Some(t) => {
+                    let reused = free.get_mut(&t).and_then(|s| s.pop_first());
+                    reused.or_else(|| {
+                        let cur = cursor.entry(t).or_insert(0);
+                        while *cur < ncolors {
+                            let c = *cur;
+                            *cur += 1;
+                            if !is_param[c] && stamp[c] != epoch && color_type[c] == Some(t) {
+                                return Some(c as u32);
+                            }
+                        }
+                        None
+                    })
+                }
+            };
+            let color = match color {
+                Some(c) => c as usize,
+                None => {
+                    // a fresh color past everything handed out so far
+                    while ncolors < n && is_param[ncolors] {
+                        ncolors += 1;
+                    }
+                    if ncolors >= n {
+                        return None;
+                    }
+                    ncolors += 1;
+                    // busy for the rest of this block unless released: the
+                    // cursors must not hand it out a second time
+                    stamp[ncolors - 1] = epoch;
+                    ncolors - 1
+                }
+            };
+            color_type[color] = Some(types[i].unwrap_or(UNKNOWN));
+            map[i] = color as u32;
+            max_color = max_color.max(color);
+            active.push(std::cmp::Reverse((h.end, color as u32)));
         }
     }
 

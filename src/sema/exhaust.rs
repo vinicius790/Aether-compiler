@@ -124,7 +124,7 @@ fn ctor_args(c: &Ctor, ty: &Type) -> Vec<Type> {
 fn head_text(c: &Ctor, ty: &Type) -> String {
     match (c, ty) {
         (Ctor::Variant(i), Type::Enum { name, variants }) => match variants.get(*i) {
-            Some((v, _)) => format!("{name}::{v}"),
+            Some((v, _)) => format!("{}::{v}", crate::ty::source_name(name)),
             None => "_".into(),
         },
         (Ctor::Tuple, _) => String::new(),

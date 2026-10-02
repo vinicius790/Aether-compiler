@@ -15,13 +15,16 @@ o próprio pipeline (`opt -O2`) sobre o texto gerado — isso é separado.
 | copy-prop    | substitui usos de `Move` pelo origem; não redirecciona a base de um store de elemento/campo e descarta aliases dos dois lados de um store (semântica de valor) |
 | cf-simplify  | encadeia blocos vazios; apaga inatingíveis |
 | dce          | remove instruções puras cujo destino nunca é lido |
+| regalloc     | compacta registradores por função: intervalos de vida ao nível do bloco (vivo se live-in/live-out/definido/usado no bloco), coloração gulosa por ordem de aparição, parâmetros mantêm `r0..rN`; registradores nunca mencionados são descartados; a VM aloca `reg_count` slots por frame |
 
 ## Ordem
 
 `-O1`: const-fold, copy-prop, dce.
 
 `-O2`: const-fold, algebraic, cf-simplify, inline, local-cse, copy-prop,
-const-prop, cf-simplify, dce, const-fold, dce.
+const-prop, cf-simplify, dce, const-fold, dce — e, uma única vez depois do
+ponto fixo, regalloc (a linha de stats mostra `regalloc (regs A→B)`: o total
+de registradores antes e depois; a contagem de instruções não muda).
 
 O cf-simplify corre **antes** do inline: o lowering deixa um bloco morto
 depois de cada `return`, e sem limpá-lo nenhuma função parecia uma folha de

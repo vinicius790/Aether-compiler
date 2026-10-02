@@ -1,6 +1,6 @@
 fn main() -> i32 {
 bb0:
-  %10 = const 8_i32
-  ret %10
+  %0 = const 8_i32
+  ret %0
 }
 

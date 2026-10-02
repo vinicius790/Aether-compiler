@@ -17,8 +17,8 @@ fn len #6 arity=1 regs=1
 
 fn assert #7 arity=1 regs=1
 
-fn main #8 arity=0 regs=4
+fn main #8 arity=0 regs=2
   0000  loadstr r0, str[0]
   0001  native #1 -> None [0]
-  0002  loadimm r2, I32(0)
-  0003  ret r2
+  0002  loadimm r1, I32(0)
+  0003  ret r1

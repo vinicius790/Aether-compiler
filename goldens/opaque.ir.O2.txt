@@ -2,7 +2,7 @@ fn main() -> i32 {
 bb0:
   jmp bb4
 bb4:
-  %9 = const 1_i32
-  ret %9
+  %0 = const 1_i32
+  ret %0
 }
 

@@ -6,6 +6,7 @@
 
 pub mod inline;
 pub mod liveness;
+pub mod regalloc;
 
 use crate::ast::{BinOp, UnOp};
 use crate::ir::{ConstValue, Inst, IrFunction, IrModule, Reg, Terminator};
@@ -130,6 +131,18 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
         if count_insts(&module) == round_before {
             break;
         }
+    }
+    if level >= 2 {
+        // Register compaction runs once, after the fixpoint: it only renumbers
+        // registers, so no earlier pass can benefit from it.
+        let regs_before = regalloc::reg_total(&module);
+        let before = count_insts(&module);
+        regalloc::pass_regalloc(&mut module);
+        report.passes.push(PassStats {
+            name: format!("regalloc (regs {}→{})", regs_before, regalloc::reg_total(&module)),
+            insts_before: before,
+            insts_after: count_insts(&module),
+        });
     }
     report.insts_after = count_insts(&module);
     (module, report)

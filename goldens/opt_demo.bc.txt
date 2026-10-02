@@ -16,7 +16,7 @@ fn len #6 arity=1 regs=1
 
 fn assert #7 arity=1 regs=1
 
-fn main #8 arity=0 regs=16
-  0000  loadimm r12, I32(19)
-  0001  native #2 -> None [12]
-  0002  ret r12
+fn main #8 arity=0 regs=1
+  0000  loadimm r0, I32(19)
+  0001  native #2 -> None [0]
+  0002  ret r0

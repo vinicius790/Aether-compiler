@@ -16,23 +16,23 @@ fn len #6 arity=1 regs=1
 
 fn assert #7 arity=1 regs=1
 
-fn fib #8 arity=1 regs=11
+fn fib #8 arity=1 regs=9
   0000  loadimm r1, I32(2)
   0001  lti32 r2, r0, r1
   0002  jz r2, 4
   0003  jmp 5
   0004  ret r0
-  0005  loadimm r3, I32(1)
-  0006  subi32 r4, r0, r3
-  0007  call f8 -> Some(5) [4]
-  0008  loadimm r6, I32(2)
-  0009  subi32 r7, r0, r6
-  0010  call f8 -> Some(8) [7]
-  0011  addi32 r9, r5, r8
-  0012  ret r9
+  0005  loadimm r1, I32(1)
+  0006  subi32 r3, r0, r1
+  0007  call f8 -> Some(4) [3]
+  0008  loadimm r5, I32(2)
+  0009  subi32 r6, r0, r5
+  0010  call f8 -> Some(7) [6]
+  0011  addi32 r8, r4, r7
+  0012  ret r8
 
-fn main #9 arity=0 regs=5
-  0000  loadimm r1, I32(10)
-  0001  call f8 -> Some(2) [1]
-  0002  native #2 -> None [2]
-  0003  ret r2
+fn main #9 arity=0 regs=2
+  0000  loadimm r0, I32(10)
+  0001  call f8 -> Some(1) [0]
+  0002  native #2 -> None [1]
+  0003  ret r1

@@ -16,31 +16,31 @@ fn len #6 arity=1 regs=1
 
 fn assert #7 arity=1 regs=1
 
-fn main #8 arity=0 regs=17
+fn main #8 arity=0 regs=6
   0000  loadimm r0, I32(0)
-  0001  loadimm r2, I32(0)
+  0001  loadimm r1, I32(0)
   0002  jmp 3
-  0003  loadimm r4, I32(10)
-  0004  lti32 r5, r2, r4
-  0005  jz r5, 7
+  0003  loadimm r2, I32(10)
+  0004  lti32 r3, r1, r2
+  0005  jz r3, 7
   0006  jmp 13
-  0007  addi32 r6, r0, r2
-  0008  mov r0, r6
-  0009  loadimm r7, I32(1)
-  0010  addi32 r8, r2, r7
-  0011  mov r2, r8
+  0007  addi32 r2, r0, r1
+  0008  mov r0, r2
+  0009  loadimm r4, I32(1)
+  0010  addi32 r5, r1, r4
+  0011  mov r1, r5
   0012  jmp 3
-  0013  loadimm r9, I32(0)
-  0014  loadimm r11, I32(5)
+  0013  loadimm r1, I32(0)
+  0014  loadimm r2, I32(5)
   0015  jmp 16
-  0016  lti32 r12, r9, r11
-  0017  jz r12, 19
+  0016  lti32 r3, r1, r2
+  0017  jz r3, 19
   0018  jmp 25
-  0019  addi32 r13, r0, r9
-  0020  mov r0, r13
+  0019  addi32 r4, r0, r1
+  0020  mov r0, r4
   0021  jmp 22
-  0022  loadimm r14, I32(1)
-  0023  addi32 r9, r9, r14
+  0022  loadimm r4, I32(1)
+  0023  addi32 r1, r1, r4
   0024  jmp 16
   0025  native #2 -> None [0]
   0026  ret r0

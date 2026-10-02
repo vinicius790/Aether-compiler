@@ -73,12 +73,15 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
         return (module, report);
     }
 
+    // cf-simplify runs before inline: lowering leaves a dead block after every
+    // `return`, and the inliner only accepts single-block leaves.
     let passes: Vec<(&str, fn(&mut IrModule))> = if level >= 2 {
         vec![
             ("const-fold", pass_const_fold),
             ("algebraic", pass_algebraic),
-            ("local-cse", pass_local_cse),
+            ("cf-simplify", pass_cf_simplify),
             ("inline", crate::opt::inline::pass_inline),
+            ("local-cse", pass_local_cse),
             ("copy-prop", pass_copy_prop),
             ("const-prop", pass_const_prop),
             ("cf-simplify", pass_cf_simplify),
@@ -108,51 +111,50 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
     (module, report)
 }
 
-fn fold_bin(op: BinOp, ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option<ConstValue> {
+/// Compare two constants of the same type the way the VM would.
+fn fold_cmp<T: PartialOrd>(op: BinOp, a: T, b: T) -> Option<ConstValue> {
+    Some(ConstValue::Bool(match op {
+        BinOp::Eq => a == b,
+        BinOp::Ne => a != b,
+        BinOp::Lt => a < b,
+        BinOp::Le => a <= b,
+        BinOp::Gt => a > b,
+        BinOp::Ge => a >= b,
+        _ => return None,
+    }))
+}
+
+/// Integer arithmetic wraps, exactly like the VM (`i32::MIN / -1` included).
+/// Division by zero is left to the VM, which reports it at runtime.
+fn fold_bin(op: BinOp, _ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option<ConstValue> {
+    use ConstValue::*;
     match (op, lhs, rhs) {
-        (BinOp::Add, ConstValue::I32(a), ConstValue::I32(b)) => {
-            Some(ConstValue::I32(a.wrapping_add(*b)))
-        }
-        (BinOp::Sub, ConstValue::I32(a), ConstValue::I32(b)) => {
-            Some(ConstValue::I32(a.wrapping_sub(*b)))
-        }
-        (BinOp::Mul, ConstValue::I32(a), ConstValue::I32(b)) => {
-            Some(ConstValue::I32(a.wrapping_mul(*b)))
-        }
-        (BinOp::Div, ConstValue::I32(a), ConstValue::I32(b)) if *b != 0 => Some(ConstValue::I32(a / b)),
-        (BinOp::Rem, ConstValue::I32(a), ConstValue::I32(b)) if *b != 0 => Some(ConstValue::I32(a % b)),
-        (BinOp::Add, ConstValue::I64(a), ConstValue::I64(b)) => {
-            Some(ConstValue::I64(a.wrapping_add(*b)))
-        }
-        (BinOp::Sub, ConstValue::I64(a), ConstValue::I64(b)) => {
-            Some(ConstValue::I64(a.wrapping_sub(*b)))
-        }
-        (BinOp::Mul, ConstValue::I64(a), ConstValue::I64(b)) => {
-            Some(ConstValue::I64(a.wrapping_mul(*b)))
-        }
-        (BinOp::Div, ConstValue::I64(a), ConstValue::I64(b)) if *b != 0 => Some(ConstValue::I64(a / b)),
-        (BinOp::Add, ConstValue::F64(a), ConstValue::F64(b)) => Some(ConstValue::F64(a + b)),
-        (BinOp::Sub, ConstValue::F64(a), ConstValue::F64(b)) => Some(ConstValue::F64(a - b)),
-        (BinOp::Mul, ConstValue::F64(a), ConstValue::F64(b)) => Some(ConstValue::F64(a * b)),
-        (BinOp::Div, ConstValue::F64(a), ConstValue::F64(b)) if *b != 0.0 => {
-            Some(ConstValue::F64(a / b))
-        }
-        (BinOp::Eq, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a == b)),
-        (BinOp::Ne, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a != b)),
-        (BinOp::Lt, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a < b)),
-        (BinOp::Le, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a <= b)),
-        (BinOp::Gt, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a > b)),
-        (BinOp::Ge, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a >= b)),
-        (BinOp::Eq, ConstValue::Bool(a), ConstValue::Bool(b)) => Some(ConstValue::Bool(a == b)),
-        (BinOp::And, ConstValue::Bool(a), ConstValue::Bool(b)) => Some(ConstValue::Bool(*a && *b)),
-        (BinOp::Or, ConstValue::Bool(a), ConstValue::Bool(b)) => Some(ConstValue::Bool(*a || *b)),
-        (BinOp::Add, ConstValue::String(a), ConstValue::String(b)) => {
-            Some(ConstValue::String(format!("{a}{b}")))
-        }
-        _ => {
-            let _ = ty;
-            None
-        }
+        (BinOp::Add, I32(a), I32(b)) => Some(I32(a.wrapping_add(*b))),
+        (BinOp::Sub, I32(a), I32(b)) => Some(I32(a.wrapping_sub(*b))),
+        (BinOp::Mul, I32(a), I32(b)) => Some(I32(a.wrapping_mul(*b))),
+        (BinOp::Div, I32(a), I32(b)) if *b != 0 => Some(I32(a.wrapping_div(*b))),
+        (BinOp::Rem, I32(a), I32(b)) if *b != 0 => Some(I32(a.wrapping_rem(*b))),
+        (BinOp::Add, I64(a), I64(b)) => Some(I64(a.wrapping_add(*b))),
+        (BinOp::Sub, I64(a), I64(b)) => Some(I64(a.wrapping_sub(*b))),
+        (BinOp::Mul, I64(a), I64(b)) => Some(I64(a.wrapping_mul(*b))),
+        (BinOp::Div, I64(a), I64(b)) if *b != 0 => Some(I64(a.wrapping_div(*b))),
+        (BinOp::Rem, I64(a), I64(b)) if *b != 0 => Some(I64(a.wrapping_rem(*b))),
+        (BinOp::Add, F64(a), F64(b)) => Some(F64(a + b)),
+        (BinOp::Sub, F64(a), F64(b)) => Some(F64(a - b)),
+        (BinOp::Mul, F64(a), F64(b)) => Some(F64(a * b)),
+        (BinOp::Div, F64(a), F64(b)) => Some(F64(a / b)),
+        (BinOp::And, Bool(a), Bool(b)) => Some(Bool(*a && *b)),
+        (BinOp::Or, Bool(a), Bool(b)) => Some(Bool(*a || *b)),
+        (BinOp::Add, String(a), String(b)) => Some(String(format!("{a}{b}"))),
+        (_, I32(a), I32(b)) => fold_cmp(op, a, b),
+        (_, I64(a), I64(b)) => fold_cmp(op, a, b),
+        (_, F64(a), F64(b)) => fold_cmp(op, a, b),
+        (_, Char(a), Char(b)) => fold_cmp(op, a, b),
+        (BinOp::Eq, Bool(a), Bool(b)) => Some(Bool(a == b)),
+        (BinOp::Ne, Bool(a), Bool(b)) => Some(Bool(a != b)),
+        (BinOp::Eq, String(a), String(b)) => Some(Bool(a == b)),
+        (BinOp::Ne, String(a), String(b)) => Some(Bool(a != b)),
+        _ => None,
     }
 }
 
@@ -268,48 +270,55 @@ pub fn pass_algebraic(module: &mut IrModule) {
                 {
                     let lconst = consts.get(&lhs.0);
                     let rconst = consts.get(&rhs.0);
-                    // x + 0 / x * 1 / x * 0 / x - 0
+                    // Integer identities only: for f64 `x - x`, `x * 0` and
+                    // `x == x` are not constants when `x` is NaN or infinite.
+                    let is_int = ty.is_integer();
+                    let same = lhs.0 == rhs.0;
+                    let zero = int_const(&ty, 0);
                     let rewritten = match (op, lconst, rconst) {
                         // Opaque identities: same register, no const required.
-                        (BinOp::Sub, _, _) if lhs.0 == rhs.0 => Some(Inst::LoadConst {
-                            dest,
-                            value: ConstValue::I32(0),
-                        }),
-                        (BinOp::Eq, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
+                        (BinOp::Sub, _, _) if same && is_int => {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::Eq, _, _) | (BinOp::Le, _, _) | (BinOp::Ge, _, _)
+                            if same && is_int =>
+                        {
                             Some(Inst::LoadConst {
                                 dest,
                                 value: ConstValue::Bool(true),
                             })
                         }
-                        (BinOp::Ne, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
+                        (BinOp::Ne, _, _) | (BinOp::Lt, _, _) | (BinOp::Gt, _, _)
+                            if same && is_int =>
+                        {
                             Some(Inst::LoadConst {
                                 dest,
                                 value: ConstValue::Bool(false),
                             })
                         }
-                        (BinOp::Lt, _, _) | (BinOp::Gt, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
-                            Some(Inst::LoadConst {
-                                dest,
-                                value: ConstValue::Bool(false),
-                            })
+                        (BinOp::Add, _, Some(c)) if is_int && is_int_const(c, 0) => {
+                            Some(Inst::Move { dest, src: lhs })
                         }
-                        (BinOp::Le, _, _) | (BinOp::Ge, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
-                            Some(Inst::LoadConst {
-                                dest,
-                                value: ConstValue::Bool(true),
-                            })
+                        (BinOp::Add, Some(c), _) if is_int && is_int_const(c, 0) => {
+                            Some(Inst::Move { dest, src: rhs })
                         }
-                        (BinOp::Add, _, Some(ConstValue::I32(0))) => Some(Inst::Move { dest, src: lhs }),
-                        (BinOp::Add, Some(ConstValue::I32(0)), _) => Some(Inst::Move { dest, src: rhs }),
-                        (BinOp::Sub, _, Some(ConstValue::I32(0))) => Some(Inst::Move { dest, src: lhs }),
-                        (BinOp::Mul, _, Some(ConstValue::I32(1))) => Some(Inst::Move { dest, src: lhs }),
-                        (BinOp::Mul, Some(ConstValue::I32(1)), _) => Some(Inst::Move { dest, src: rhs }),
-                        (BinOp::Mul, _, Some(ConstValue::I32(0)))
-                        | (BinOp::Mul, Some(ConstValue::I32(0)), _) => Some(Inst::LoadConst {
-                            dest,
-                            value: ConstValue::I32(0),
-                        }),
-                        (BinOp::Div, _, Some(ConstValue::I32(1))) => Some(Inst::Move { dest, src: lhs }),
+                        (BinOp::Sub, _, Some(c)) if is_int && is_int_const(c, 0) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::Mul, _, Some(c)) if is_int && is_int_const(c, 1) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::Mul, Some(c), _) if is_int && is_int_const(c, 1) => {
+                            Some(Inst::Move { dest, src: rhs })
+                        }
+                        (BinOp::Mul, _, Some(c)) | (BinOp::Mul, Some(c), _)
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::Div, _, Some(c)) if is_int && is_int_const(c, 1) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
                         (BinOp::And, _, Some(ConstValue::Bool(true))) => Some(Inst::Move { dest, src: lhs }),
                         (BinOp::And, Some(ConstValue::Bool(true)), _) => Some(Inst::Move { dest, src: rhs }),
                         (BinOp::And, _, Some(ConstValue::Bool(false)))
@@ -324,7 +333,7 @@ pub fn pass_algebraic(module: &mut IrModule) {
                             dest,
                             value: ConstValue::Bool(true),
                         }),
-                        (BinOp::Mul, _, Some(ConstValue::I32(2))) if ty == Type::I32 => {
+                        (BinOp::Mul, _, Some(c)) if is_int && is_int_const(c, 2) => {
                             Some(Inst::Bin {
                                 dest,
                                 op: BinOp::Add,
@@ -348,6 +357,22 @@ pub fn pass_algebraic(module: &mut IrModule) {
                 }
             }
         }
+    }
+}
+
+fn int_const(ty: &Type, v: i64) -> ConstValue {
+    if *ty == Type::I64 {
+        ConstValue::I64(v)
+    } else {
+        ConstValue::I32(v as i32)
+    }
+}
+
+fn is_int_const(c: &ConstValue, v: i64) -> bool {
+    match c {
+        ConstValue::I32(x) => i64::from(*x) == v,
+        ConstValue::I64(x) => *x == v,
+        _ => false,
     }
 }
 
@@ -387,13 +412,23 @@ pub fn pass_local_cse(module: &mut IrModule) {
     }
 }
 
+/// Replaces uses of a `Move` destination by its source within a block.
+///
+/// Aggregates have value semantics (`Move` copies the array/struct), so a
+/// store through a register must neither be redirected to the register it
+/// was copied from, nor leave aliases alive on either side of the copy.
 pub fn pass_copy_prop(module: &mut IrModule) {
     for f in &mut module.functions {
         for bb in &mut f.blocks {
-        let mut alias: HashMap<u32, u32> = HashMap::new();
+            let mut alias: HashMap<u32, u32> = HashMap::new();
             for inst in &mut bb.insts {
                 // resolve uses
                 rewrite_uses(inst, &alias);
+                if let Inst::IndexStore { base, .. } | Inst::FieldStore { base, .. } = inst {
+                    let b = base.0;
+                    alias.retain(|k, v| *k != b && *v != b);
+                    continue;
+                }
                 if let Inst::Move { dest, src } = inst {
                     if dest.0 != src.0 {
                         alias.retain(|_, v| *v != dest.0);
@@ -447,18 +482,13 @@ fn rewrite_uses(inst: &mut Inst, alias: &HashMap<u32, u32>) {
             map(base);
             map(index);
         }
-        Inst::IndexStore {
-            base, index, value, ..
-        } => {
-            map(base);
+        // the base of a store is mutated in place: never redirect it
+        Inst::IndexStore { index, value, .. } => {
             map(index);
             map(value);
         }
         Inst::FieldLoad { base, .. } => map(base),
-        Inst::FieldStore { base, value, .. } => {
-            map(base);
-            map(value);
-        }
+        Inst::FieldStore { value, .. } => map(value),
         _ => {}
     }
 }

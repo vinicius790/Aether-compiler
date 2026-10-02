@@ -372,8 +372,20 @@ impl<'a> Analyzer<'a> {
                     },
                 );
             }
-            let hb = self.check_block(body);
+            let hb = self.check_block_with(body, Some(&return_ty));
             self.scopes.pop();
+            if let Some(tail) = &hb.tail {
+                if !return_ty.assignable_from(&tail.ty) {
+                    self.err(
+                        format!(
+                            "tail expression has type `{}`, but `{}` returns `{return_ty}`",
+                            tail.ty, f.name.name
+                        ),
+                        tail.span,
+                        "E0221",
+                    );
+                }
+            }
             if return_ty != Type::Unit && !block_always_returns(&hb) {
                 self.err(
                     format!("function `{}` may not return a value of type `{return_ty}` on all paths", f.name.name),
@@ -395,13 +407,27 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// A nested block: a trailing expression without `;` is evaluated as a
+    /// statement. Only a function body (`check_block_with`) keeps it as a tail.
     fn check_block(&mut self, block: &Block) -> HirBlock {
+        self.check_block_with(block, None)
+    }
+
+    fn check_block_with(&mut self, block: &Block, tail_expected: Option<&Type>) -> HirBlock {
         self.scopes.push();
         let mut stmts = Vec::new();
         for s in &block.stmts {
             stmts.push(self.check_stmt(s));
         }
-        let tail = block.tail.as_ref().map(|e| self.check_expr(e, None));
+        let mut tail = block
+            .tail
+            .as_ref()
+            .map(|e| self.check_expr(e, tail_expected));
+        if tail_expected.is_none() {
+            if let Some(e) = tail.take() {
+                stmts.push(HirStmt::Expr(e));
+            }
+        }
         self.scopes.pop();
         HirBlock {
             stmts,
@@ -572,11 +598,19 @@ impl<'a> Analyzer<'a> {
             } => {
                 let s = self.check_expr(start, Some(&Type::I32));
                 let e = self.check_expr(end, Some(&Type::I32));
-                if !s.ty.is_integer() && !s.ty.is_error() {
-                    self.err("for-range start must be an integer", start.span, "E0238");
+                if s.ty != Type::I32 && !s.ty.is_error() {
+                    self.err(
+                        format!("for-range start must be `i32`, found `{}`", s.ty),
+                        start.span,
+                        "E0238",
+                    );
                 }
-                if !e.ty.is_integer() && !e.ty.is_error() {
-                    self.err("for-range end must be an integer", end.span, "E0238");
+                if e.ty != Type::I32 && !e.ty.is_error() {
+                    self.err(
+                        format!("for-range end must be `i32`, found `{}`", e.ty),
+                        end.span,
+                        "E0238",
+                    );
                 }
                 self.scopes.push();
                 self.scopes.define(
@@ -637,14 +671,45 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// An integer literal takes the expected integer type (`i32` by default)
+    /// and must fit in it.
+    fn int_literal(&mut self, value: i64, expected: Option<&Type>, span: Span) -> HirExpr {
+        let ty = expected
+            .cloned()
+            .filter(|t| t.is_integer())
+            .unwrap_or(Type::I32);
+        if ty == Type::I32 && i32::try_from(value).is_err() {
+            self.err(
+                format!("integer literal `{value}` is out of range for `i32`"),
+                span,
+                "E0263",
+            );
+        }
+        HirExpr {
+            kind: HirExprKind::Literal(Literal::Int(value)),
+            ty,
+            span,
+        }
+    }
+
     fn check_expr(&mut self, expr: &Expr, expected: Option<&Type>) -> HirExpr {
-        let mut hir = match &expr.kind {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Int(v)) => return self.int_literal(*v, expected, expr.span),
+            // `-5` is one literal, so `let x: i64 = -1;` and `-2147483648` type-check
+            ExprKind::Unary {
+                op: UnOp::Neg,
+                expr: inner,
+            } => {
+                if let Some(v) = int_literal_value(inner) {
+                    return self.int_literal(v.wrapping_neg(), expected, expr.span);
+                }
+            }
+            _ => {}
+        }
+        let hir = match &expr.kind {
             ExprKind::Literal(lit) => {
                 let ty = match lit {
-                    Literal::Int(_) => expected
-                        .cloned()
-                        .filter(|t| t.is_integer())
-                        .unwrap_or(Type::I32),
+                    Literal::Int(_) => unreachable!("handled above"),
                     Literal::Float(_) => Type::F64,
                     Literal::Bool(_) => Type::Bool,
                     Literal::String(_) => Type::String,
@@ -664,12 +729,15 @@ impl<'a> Analyzer<'a> {
                         ty: sym.ty.clone(),
                         span: expr.span,
                     }
-                } else if let Some((_, ty, _, _)) =
-                    self.functions.iter().find(|(n, _, _, _)| n == &id.name)
-                {
+                } else if self.functions.iter().any(|(n, _, _, _)| n == &id.name) {
+                    self.err(
+                        format!("function `{}` cannot be used as a value", id.name),
+                        id.span,
+                        "E0264",
+                    );
                     HirExpr {
                         kind: HirExprKind::Local(id.name.clone()),
-                        ty: ty.clone(),
+                        ty: Type::Error,
                         span: expr.span,
                     }
                 } else {
@@ -686,8 +754,18 @@ impl<'a> Analyzer<'a> {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.check_expr(lhs, None);
-                let r = self.check_expr(rhs, Some(&l.ty));
+                // Arithmetic inherits the expected numeric type; a bare integer
+                // literal on either side adopts the type of the other operand.
+                let hint = expected.filter(|t| t.is_numeric() && !op.is_cmp() && !op.is_logical());
+                let (l, r) = if int_literal_value(lhs).is_some() && int_literal_value(rhs).is_none() {
+                    let r = self.check_expr(rhs, hint);
+                    let l = self.check_expr(lhs, Some(&r.ty));
+                    (l, r)
+                } else {
+                    let l = self.check_expr(lhs, hint);
+                    let r = self.check_expr(rhs, Some(&l.ty));
+                    (l, r)
+                };
                 let ty = match binop_result(*op, &l.ty, &r.ty) {
                     Some(t) => t,
                     None => {
@@ -710,7 +788,8 @@ impl<'a> Analyzer<'a> {
                 }
             }
             ExprKind::Unary { op, expr: inner } => {
-                let e = self.check_expr(inner, None);
+                let hint = expected.filter(|t| *op == UnOp::Neg && t.is_numeric());
+                let e = self.check_expr(inner, hint);
                 let ty = match unop_result(*op, &e.ty) {
                     Some(t) => t,
                     None => {
@@ -909,13 +988,6 @@ impl<'a> Analyzer<'a> {
             }
             ExprKind::Group(inner) => self.check_expr(inner, expected),
         };
-        if let Some(exp) = expected {
-            if hir.ty == Type::I32 && *exp == Type::I64 {
-                if let HirExprKind::Literal(Literal::Int(_)) = &hir.kind {
-                    hir.ty = Type::I64;
-                }
-            }
-        }
         hir
     }
 
@@ -1044,6 +1116,19 @@ impl<'a> Analyzer<'a> {
     fn err(&mut self, message: impl Into<String>, span: Span, code: &'static str) {
         self.diags
             .push(Diagnostic::error(message, span).with_code(code));
+    }
+}
+
+/// Value of a (possibly negated or parenthesised) integer literal.
+fn int_literal_value(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Literal(Literal::Int(v)) => Some(*v),
+        ExprKind::Group(inner) => int_literal_value(inner),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => int_literal_value(expr).map(i64::wrapping_neg),
+        _ => None,
     }
 }
 

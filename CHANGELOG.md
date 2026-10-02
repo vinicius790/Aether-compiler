@@ -9,6 +9,8 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- `tests/audit_llvm.rs`: differential VM vs LLVM (`lli`) test — hand-written edge cases, all examples/stdlib,
+  and (ignored, `AETHER_LLVM_DIFF_N`) generated agg/lang programs; 1200 generated programs verified identical
 - LLVM backend closer to the VM; VM/opt runtime fixes (broken pipe exits cleanly, instruction-level register allocation)
 - Uninitialised arrays/structs/tuples zero-filled (`let e: E;` is E0232); `[expr; N]`; `[]`/`[T; 0]`; `i64::MIN` literal;
   `t.01` rejected; EOF diagnostics; `pub enum` follows E0281; private items are file-scoped

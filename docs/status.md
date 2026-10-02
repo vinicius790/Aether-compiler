@@ -44,30 +44,23 @@
 
 ## Limitações conhecidas
 
+Limites de desenho (não são bugs):
+
 - Inferência de tipos apenas em `let` a partir do inicializador (não Hindley–Milner).
 - Funções de primeira classe / closures: não implementadas.
-- Módulos: `use "path";` junta ficheiros num espaço de nomes plano; `pub` é
-  aceite mas a visibilidade não é verificada (pendente); não há `mod` nem
-  nomes qualificados.
+- Módulos: `use "path";` junta ficheiros; `pub` é verificado entre ficheiros
+  (`E0281`) e os nomes privados são por ficheiro; não há `mod` nem nomes
+  qualificados (`a::f`).
 - Strings são imutáveis e concatenáveis; não há fatiamento.
 - Arrays têm tamanho fixo conhecido em tempo de compilação.
-- `match` é instrução, não expressão; padrões aninhados (literal dentro de
-  variante) não são suportados; enums não podem ser recursivos (não há
-  indireção).
-- LLVM: um enum cujas variantes põem tipos diferentes na mesma ranhura de
-  carga (`Circle(f64)` / `Rect(i32, i32)`) é só-VM — o emissor declara a
-  struct com o tipo da primeira variante e emite `; UNSUPPORTED` + `abort`
-  na alocação.
-- A IR não é SSA. O emissor LLVM aloca um `alloca` por registrador da IR
-  (`load`/`store`), pronto para `mem2reg`; **não é um gerador LLVM de
-  produção**. A VM é o backend de execução e o contrato.
-- LLVM: agregados vivem na stack e copiar um array/struct copia o ponteiro
-  (aliasing, ao contrário da semântica de valor da VM); sem verificação de
-  limites; concatenação de strings não suportada (aborta); `print_f64` usa `%g`.
-- Não há GC: arrays e structs vivem nos registradores da VM (árvores `Value`,
-  cópia profunda ao atribuir).
-- Inlining só de funções folha de um bloco; sem SSA nem alocação de
-  registradores global.
+- Enums não podem ser recursivos (não há indireção / heap explícito).
+- A IR não é SSA; o emissor LLVM usa um `alloca` por registrador (pronto para
+  `mem2reg`). A VM é o backend de execução de referência; o LLVM é verificado
+  contra ela por `tests/audit_llvm.rs` (casos de borda, exemplos, stdlib e
+  programas gerados) mas não é um gerador de produção (sem limites de passos
+  nem de profundidade de pilha; `--backend llvm` tem `--timeout`).
+- Não há GC: arrays, structs e strings são valores copy-on-write (`Rc`).
+- Inlining só de funções folha de um bloco.
 - Bytecode e ISA instáveis entre versões.
 - CI executa `cargo test` (incluindo as propriedades); não publica artefatos.
 

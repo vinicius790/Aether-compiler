@@ -19,16 +19,18 @@ o próprio pipeline (`opt -O2`) sobre o texto gerado — isso é separado.
 
 ## Ordem
 
-`-O1`: const-fold, copy-prop, dce.
+`-O1`: const-fold, copy-prop, dce. Em `-O0` e `-O1` a regalloc só corre sobre
+funções que declaram mais de 65535 registradores (o limite do bytecode), para
+que um literal de array enorme não dê E0300.
 
 Soundness (auditada): const-fold usa a mesma semântica que a VM (wrapping,
 deslocamentos mascarados, NaN/-0.0 por IEEE, divisão por zero deixada à VM) e
 só constrói strings até 64 KiB; algebraic nunca toca em `f64`; a liveness
 itera até ao ponto fixo (um limite de varreduras deixava o DCE apagar
 definições vivas quando o layout dos blocos corria contra o fluxo);
-dead-fn não remove nada num módulo sem `main`. A regalloc usa intervalos ao
-nível do bloco: um bloco enorme de temporários simultâneos (literal com mais
-de ~20 mil elementos) continua a exceder os 65535 registradores e dá E0300.
+dead-fn não remove nada num módulo sem `main`. Depois da regalloc só uma
+função com mais de 65535 valores vivos ao mesmo tempo dá E0300 (um literal de
+array de 80 000 elementos compila em todos os níveis).
 
 `-O2`: const-fold, algebraic, cf-simplify, inline, local-cse, copy-prop,
 const-prop, cf-simplify, dce, const-fold, dce — e, uma única vez depois do

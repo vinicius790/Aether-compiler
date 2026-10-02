@@ -156,11 +156,11 @@ impl Diagnostics {
                 w,
                 "{lvl_col}{}{reset}{bold}: {code}{}{reset}",
                 d.level.label(),
-                d.message
+                printable(&d.message)
             )?;
 
             if !d.span.is_dummy() {
-                let file_name = session.file_name(d.span.file);
+                let file_name = printable(session.file_name(d.span.file));
                 writeln!(
                     w,
                     "  {blue}-->{reset} {file_name}:{}:{}",
@@ -171,27 +171,37 @@ impl Diagnostics {
                     let src_line = file.line_contents(line_no);
                     let width = line_no.to_string().len().max(2);
                     writeln!(w, "  {blue}{:>width$} |{reset}", "")?;
+                    // control characters in the source (a stray `\r`, an
+                    // ESC inside a string literal) are shown as U+FFFD: printed
+                    // raw they would move the cursor or recolour the terminal
+                    let shown: String = src_line.chars().map(visible).collect();
                     writeln!(
                         w,
-                        "  {blue}{line_no:>width$} |{reset} {src_line}"
+                        "  {blue}{line_no:>width$} |{reset} {shown}"
                     )?;
                     // columns count characters; tabs are copied into the
-                    // padding so the carets line up under any tab width
+                    // padding so the carets line up under any tab width, and
+                    // wide (CJK, emoji) characters take two cells
                     let col = d.span.column.max(1) as usize;
+                    let line_chars = src_line.chars().count();
                     let pad: String = src_line
                         .chars()
                         .take(col - 1)
-                        .map(|c| if c == '\t' { '\t' } else { ' ' })
-                        .chain(std::iter::repeat(' ').take((col - 1).saturating_sub(src_line.chars().count())))
+                        .map(|c| if c == '\t' { "\t".to_string() } else { " ".repeat(cell_width(c)) })
+                        .chain(std::iter::repeat(" ".to_string()).take((col - 1).saturating_sub(line_chars)))
                         .collect();
-                    let rest = src_line.chars().count().saturating_sub(col - 1);
-                    let span_chars = file
+                    let rest: usize = src_line.chars().skip(col - 1).map(cell_width).sum();
+                    let span_cells: usize = file
                         .source
                         .get(d.span.start.0 as usize..d.span.end.0 as usize)
                         .unwrap_or("")
                         .lines()
-                        .next().unwrap_or("").chars().count();
-                    let carets = "^".repeat(span_chars.max(1).min(rest.max(1)));
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .map(cell_width)
+                        .sum();
+                    let carets = "^".repeat(span_cells.max(1).min(rest.max(1)));
                     writeln!(
                         w,
                         "  {blue}{:>width$} |{reset} {pad}{lvl_col}{carets}{reset}",
@@ -202,15 +212,68 @@ impl Diagnostics {
 
             for note in &d.notes {
                 let ncol = if color { Level::Note.color() } else { "" };
-                writeln!(w, "  {ncol}note{reset}: {note}")?;
+                writeln!(w, "  {ncol}note{reset}: {}", printable(note))?;
             }
             if let Some(help) = &d.help {
                 let hcol = if color { Level::Help.color() } else { "" };
-                writeln!(w, "  {hcol}help{reset}: {help}")?;
+                writeln!(w, "  {hcol}help{reset}: {}", printable(help))?;
             }
             writeln!(w)?;
         }
         Ok(())
+    }
+}
+
+/// How a source character is shown in a diagnostic: control characters
+/// other than tab become U+FFFD (one cell, like the character it replaces
+/// in the column count).
+fn visible(c: char) -> char {
+    if c.is_control() && c != '\t' {
+        '\u{FFFD}'
+    } else {
+        c
+    }
+}
+
+/// A message, note, help or file name as printed: control characters
+/// other than newline are escaped (`\u{1b}`), so text taken from the
+/// source (an `unexpected character` that is an ESC or NUL, a `use` path)
+/// cannot drive the terminal.
+fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() && c != '\n' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Terminal cells a source character takes in a diagnostic: 0 for
+/// combining marks and zero-width characters, 2 for East Asian wide and
+/// emoji characters, else 1 (an approximation of `wcwidth` without tables).
+fn cell_width(c: char) -> usize {
+    let u = c as u32;
+    match u {
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200B..=0x200F | 0x20D0..=0x20FF
+        | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
     }
 }
 
@@ -238,5 +301,63 @@ mod tests {
         assert!(out.contains("error: expected expression"));
         assert!(out.contains("t.ae:1:9"));
         assert!(out.contains("help: add a value after `=`"));
+    }
+
+    #[test]
+    fn control_characters_are_not_printed_raw() {
+        let mut sess = Session::new();
+        let src = "let s = \"\u{1b}[31m\rX\"; bad\n";
+        let id = sess.add_file("t.ae".into(), src.into());
+        let start = src.find("bad").unwrap() as u32;
+        let col = src[..start as usize].chars().count() as u32 + 1;
+        let mut diags = Diagnostics::new();
+        diags.push(Diagnostic::error("e", Span::new(id, start, start + 3, 1, col)));
+        let out = diags.render(&sess, false);
+        assert!(!out.contains('\u{1b}') && !out.contains('\r'), "{out:?}");
+        let lines: Vec<&str> = out.lines().collect();
+        let src_line = lines.iter().find(|l| l.contains("bad")).unwrap();
+        let caret_line = lines.iter().find(|l| l.contains('^')).unwrap();
+        // the carets sit under `bad`: same char offset in both lines
+        assert_eq!(
+            src_line.chars().position(|c| c == 'b'),
+            caret_line.chars().position(|c| c == '^'),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn messages_escape_control_characters() {
+        let mut sess = Session::new();
+        let src = "x\u{1b}y\n";
+        let id = sess.add_file("t\u{7}.ae".into(), src.into());
+        let mut diags = Diagnostics::new();
+        diags.push(
+            Diagnostic::error("unexpected character `\u{1b}`", Span::new(id, 1, 2, 1, 2))
+                .with_note("n\u{0}")
+                .with_help("h\u{9b}"),
+        );
+        let out = diags.render(&sess, false);
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("unexpected character `\\u{1b}`"), "{out}");
+        assert!(out.contains("t\\u{7}.ae:1:2"), "{out}");
+    }
+
+    #[test]
+    fn carets_account_for_wide_characters() {
+        let mut sess = Session::new();
+        let src = "let s = \"日本\"; bad\n";
+        let id = sess.add_file("t.ae".into(), src.into());
+        let start = src.find("bad").unwrap() as u32;
+        let col = src[..start as usize].chars().count() as u32 + 1;
+        let mut diags = Diagnostics::new();
+        diags.push(Diagnostic::error("e", Span::new(id, start, start + 3, 1, col)));
+        let out = diags.render(&sess, false);
+        let caret_line = out.lines().find(|l| l.contains('^')).unwrap();
+        // the two wide chars take 4 cells, so the carets start 2 cells
+        // further right than the char count before `bad`
+        let caret_cells = caret_line.chars().take_while(|c| *c != '^').count();
+        let plain = out.lines().find(|l| l.contains("bad")).unwrap();
+        let chars_before = plain.chars().take_while(|c| *c != 'b').count();
+        assert_eq!(caret_cells, chars_before + 2, "{out}");
     }
 }

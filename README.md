@@ -17,9 +17,10 @@ Source → Lexer → Parser → AST → Sema / Types → IR → Optimizer
 
 Aether is designed so every layer is inspectable and testable. The VM is
 the execution contract. LLVM emission is for inspection and experiment,
-not a production code generator: the text is valid LLVM 18 IR (checked with
-`llvm-as` on every example), but aggregates alias and there are no bounds
-checks (see [`docs/status.md`](docs/status.md)).
+not a production code generator: the text is valid LLVM IR (LLVM 15+, checked
+with `llvm-as`/`lli` 18) with the VM's value semantics, bounds checks and
+runtime messages, verified against the VM by `tests/audit_llvm.rs`, but it has
+no step or call-depth budget (see [`docs/llvm.md`](docs/llvm.md)).
 
 **Handbook (what exists and how to use it):** [`MANUAL.md`](MANUAL.md).
 
@@ -42,14 +43,15 @@ fn main() -> i32 {
 }
 ```
 
-Types: `i32`, `i64`, `f64`, `bool`, `string`, `char`, `unit`, `[T; N]`, `struct`.  
-Control: `if`/`else`, `while`, `for i in a..b`, `return`, `break`, `continue`.  
-Built-ins: `print`, `println`, `print_i32`, `print_i64`, `print_f64`, `print_bool`, `len`, `assert`.
+Types: `i32`, `i64`, `f64`, `bool`, `string`, `char`, `unit`, `[T; N]`, `struct`, tuples, `enum` with payloads.  
+Control: `if`/`else`, `while`, `for i in a..b`, `match` (statement and expression), `if let`, `return`, `break`, `continue`, `yield`.  
+Modules: `use "path.ae";` with `pub` items.  
+Built-ins: `print`, `println`, `print_i32`, `print_i64`, `print_f64`, `print_bool`, `print_char`, `len`, `assert`, `to_string`, `abs`, `min`, `max`, `sqrt`, … ([`docs/language.md`](docs/language.md)).
 
 ## Requirements
 
 - Rust 1.75+ (edition 2021). See `rust-toolchain.toml`.
-- Optional: LLVM 18 (`opt-18`, `lli-18`) if you want to feed the textual backend to `opt`.
+- Optional: LLVM (`lli`, `opt`; tested with 18) for `aether run --backend llvm` and `tests/audit_llvm.rs`.
 
 No crates.io dependencies. The compiler, VM, and fuzzer are std-only.
 
@@ -92,8 +94,8 @@ aether fuzz --kind greybox --iters 40
 aether fuzz --kind format --iters 80
 ```
 
-Exit codes: `0` ok, `1` compile error, `2` runtime error (including an
-exceeded `--max-steps` / `--max-depth`). On a runtime error the stdout
+Exit codes: `0` ok, `1` compile error, bad usage or fuzz failure, `2` runtime
+error (including an exceeded `--max-steps` / `--max-depth`). On a runtime error the stdout
 produced so far is printed before `runtime error: ...`.
 
 Full tool list: [`docs/tools.md`](docs/tools.md) · [`docs/cli.md`](docs/cli.md).
@@ -126,13 +128,14 @@ In-tree, deterministic, no nightly:
 |------|-------------------|
 | `lexer` `parser` `pipeline` | no-panic on junk |
 | `gen` `diff` | well-typed programs; O0 ≡ O2 |
+| `lang` | enums, `match` (also as an expression), tuples, bit ops, built-ins, multi-file programs; O0 ≡ O1 ≡ O2, `fmt` fixpoint |
 | `agg` | well-typed programs with structs, arrays, `i64`/`f64`/`char`/`string`, casts, `&&`/`\|\|` guards, nested assignment, tail-expression functions; O0 ≡ O2 |
 | `mut` `struct` `aspect` | havoc / tree / type-preserving mutation |
 | `mir` | direct IR generation, decoy blocks |
 | `greybox` | VM edge coverage + energy schedule |
 | `format` | EBNF choice-tape (grammar-as-format) |
 
-`agg` (alias `aggregate`) is part of `all`. The junk, format and mutation
+`all` runs every kind except `greybox` and `format`. The junk, format and mutation
 properties also compile at `-O2`.
 
 See [`docs/fuzzing.md`](docs/fuzzing.md), [`docs/greybox.md`](docs/greybox.md), [`docs/aspect-mir.md`](docs/aspect-mir.md).
@@ -143,11 +146,11 @@ See [`docs/fuzzing.md`](docs/fuzzing.md), [`docs/greybox.md`](docs/greybox.md), 
 src/          compiler library + CLI
   lexer.rs parser.rs ast.rs sema/ ir/ opt/ backend/ vm/ fuzz/
 examples/     programs used as tests
-stdlib/       reference routines (no module system yet)
+stdlib/       reference routines and importable files (`use "stdlib/prelude.ae";`)
 benchmarks/   timing programs
 docs/         specification and design notes
 tests/        integration tests against the `aether` binary
-              (cli_examples, tools, corpus, regressions)
+              (cli_examples, tools, corpus, regressions, audit_*)
 .github/      CI and contribution templates
 ```
 

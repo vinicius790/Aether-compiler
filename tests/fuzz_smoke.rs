@@ -40,12 +40,8 @@ fn smoke(kind: FuzzKind, iters: u32, seed: u64) {
 }
 
 /// `aether fmt` output must recompile to the same behaviour and be a fixed
-/// point. Ignored while the pretty printer drops `let` type annotations and
-/// prints `3.0` as `3` (see docs/fuzzing.md, "Known compiler findings");
-/// run with `cargo test --test fuzz_smoke -- --ignored` after it is fixed
-/// and then remove the `#[ignore]`.
+/// point.
 #[test]
-#[ignore = "pretty printer bugs, docs/fuzzing.md"]
 fn smoke_fmt_roundtrip() {
     smoke_with(FuzzKind::Lang, 30, 12, true);
     smoke_with(FuzzKind::Aggregate, 30, 11, true);

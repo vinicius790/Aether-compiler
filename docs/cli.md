@@ -26,10 +26,10 @@ aether <comando> [opções] [arquivo]
 | `profile FILE [-On]` | contagem de chamadas + digest da execução |
 | `digest FILE [-On]` | impressão digital determinística de stdout + valor |
 | `bench FILE [--n N]` | `-O0` vs `-O2`: µs min/mediana, passos da VM, instruções IR, speedup |
-| `repl [-On]` | REPL com estado (`:items`, `:reset`, `:quit`) |
+| `repl [-On]` | REPL com estado (`:items`, `:reset`, `:help`, `:quit`) |
 | `benchmark --n N` | Fibonacci `-O0` vs `-O2` |
 | `fuzz [--iters N] [--seed N] [--kind …]` | propriedades / fuzz (`all` inclui `agg`) |
-| `help` / `version` | meta |
+| `help` / `version` | meta (também `-h`/`--help` depois de qualquer comando, `--version`/`-V`) |
 
 ## Opções
 
@@ -37,21 +37,26 @@ aether <comando> [opções] [arquivo]
 |-------|----------|--------|
 | `-On` / `-O n` | todos os que compilam | nível do otimizador 0, 1 ou 2 (omissão: 2; outro valor é erro) |
 | `--color` / `--no-color` | todos | cores ANSI nos diagnósticos; omissão: só se o stderr for um terminal e `NO_COLOR` não estiver definido |
-| `--include FILE` (repetível) | check, run, compile, dump-*, optimize, verify, cfg, stats, profile, digest, bench | compila `FILE` junto com o ficheiro principal (ver abaixo) |
-| `--max-steps N` | run, profile, digest, bench | orçamento de instruções da VM (omissão: 50 000 000) |
-| `--max-depth N` | run, profile, digest, bench | profundidade máxima de chamadas (omissão: 10 000) |
+| `--include FILE`, `-I FILE`, `--include=FILE` (repetível) | check, run, compile, dump-*, optimize, verify, cfg, stats, profile, digest, bench | compila `FILE` junto com o ficheiro principal (ver abaixo) |
+| `--max-steps N` | run, profile, digest, bench, benchmark, repl | orçamento de instruções da VM (omissão: 50 000 000) |
+| `--max-depth N` | run, profile, digest, bench, benchmark, repl | profundidade máxima de chamadas (omissão: 10 000) |
 | `--backend vm\|llvm` | run | `vm` (omissão) executa o bytecode; `llvm` emite LLVM IR e corre-o com `lli` |
 | `--timings` / `--stats` | run | tempos por fase / valor, passos e relatório do otimizador (stderr) |
 | `--unopt` | dump-ir | IR antes dos passes |
-| `--emit`, `-o` | compile | artefacto e ficheiro de saída |
+| `--emit`, `-o` / `--output` | compile | artefacto e ficheiro de saída |
 | `--n N` | bench (omissão 5), benchmark (omissão 20) | repetições / argumento de `fib` |
 | `--iters`, `--seed`, `--kind` | fuzz | configuração do fuzzer |
 
 Opções mal formadas são erros (`exit 1`): nível `-O` fora de 0..2, valor em
 falta (`--emit`, `-o`, `--n`, `--backend`...), `--max-steps 0`/`--max-depth 0`,
-`--n 0` em `bench`, um segundo ficheiro operando (usar `--include`).
+`--n 0` em `bench`, um segundo ficheiro operando (usar `--include`), um
+ficheiro em `version`/`repl`/`benchmark`/`fuzz`, `--include=` vazio. Sem
+comando, `aether` imprime a ajuda no stderr e sai com `1`; `aether help` e
+`-h`/`--help` depois de qualquer comando imprimem-na no stdout com `0`.
 
-Códigos de saída: `0` ok, `1` erro de compilação, `2` erro de runtime.
+Códigos de saída: `0` ok, `1` erro de compilação, uso errado da CLI ou falha
+do `fuzz`, `2` erro de runtime (também em `benchmark`). Um stdout fechado
+(`aether run f.ae | head -1`) termina em silêncio com `0`.
 Num erro de runtime a CLI imprime o stdout produzido até ali antes de
 `runtime error: ...`. Exceder `--max-steps` ou `--max-depth` é um erro de
 runtime (`exit 2`) e o stdout parcial é preservado.
@@ -76,11 +81,13 @@ que o usa (via `use` ou `--include`) só é acessível se for `pub`; senão
 `E0281` ("`NOME` is private to `FICHEIRO`", com a ajuda "mark it `pub` in
 FICHEIRO"). Os itens do mesmo ficheiro são sempre acessíveis; os itens
 privados do ficheiro principal não são acessíveis a ficheiros incluídos.
-Aplica-se a funções, `extern fn` e `struct` (o tipo, o literal `S { .. }` e as
-anotações de tipo); os campos de uma `pub struct` são públicos e os `enum` não
-têm visibilidade. As importações são transitivas e planas: `a` vê os itens
-`pub` de `b` e de tudo o que `b` importa. Nomes privados iguais em dois
-ficheiros continuam a colidir (`duplicate function`).
+Aplica-se a funções, `extern fn`, `struct` e `enum` (o tipo, o literal
+`S { .. }` / `E::A` e as anotações de tipo); os campos de uma `pub struct` e
+as variantes de um `pub enum` são públicos. As importações são transitivas e
+planas: `a` vê os itens `pub` de `b` e de tudo o que `b` importa. Os itens
+privados pertencem ao seu ficheiro: dois ficheiros podem ter cada um a sua
+`fn h()` privada sem colidir (cada um chama a sua); um item `pub` colide com
+qualquer item do mesmo nome noutro ficheiro (`duplicate function`).
 
 ### Ficheiros e entradas estranhas
 
@@ -130,12 +137,13 @@ Emite o LLVM IR textual (o mesmo de `dump-llvm`) e executa-o com
 Sem `lli` a CLI imprime um erro claro e sai com `1`. Sob `lli` o valor
 devolvido por `main` é o código de saída do processo (módulo 256): é o
 resultado do programa, não uma falha, e `run` sai com `0` como na VM
-(`--stats` imprime `exit = N`). Um sinal (`abort()` de um `assert` falhado)
-é um erro de runtime (`exit 2`); um estado ≠ 0 acompanhado de mensagens do
+(`--stats` imprime `exit = N`). Um erro de runtime (`abort()` depois de o
+runtime escrever `runtime error: ...`, a mesma mensagem da VM) e um SIGSEGV
+(pilha nativa esgotada) são erros de runtime (`exit 2`); um estado ≠ 0 acompanhado de mensagens do
 `lli` no stderr (módulo rejeitado) é `exit 1`. `--max-steps`/`--max-depth`
 não se aplicam a este motor. A API é `aether::driver::run_llvm_ir`, que
 devolve stdout, stderr e o estado (`LliStatus::Exited(n)` / `Signaled(sig)`)
-em separado.
+em separado. Contrato e limites: [`llvm.md`](llvm.md).
 
 ## `bench`
 
@@ -172,11 +180,12 @@ aether>
   as anteriores mantêm-se.
 - Qualquer outra entrada é um bloco de instruções embrulhado num `main`
   novo e executado contra as definições guardadas; a CLI imprime o stdout e
-  `=> valor`. Uma expressão sem `;` (`dbl(3)`) mostra o seu valor `i32`, ou é
-  só avaliada pelos efeitos (`print_i32(5)`).
+  `=> valor`. Uma expressão final sem `;` (`dbl(3)`, `let x = 2; x * 3`)
+  mostra o seu valor `i32`, ou é só avaliada pelos efeitos (`print_i32(5)`).
 - Cada definição vive num pseudo-ficheiro próprio (`<repl:nome>`), mas no REPL
   todos os itens são públicos entre si: `E0281` não se aplica.
 - Uma entrada com `fn main` corre como programa completo (nada é guardado).
 - `:items` lista os nomes guardados, `:reset` esquece-os, `:help` ajuda,
-  `:quit` (ou `:exit`) sai. `-On` e `--max-steps`/`--max-depth` aplicam-se
+  `:quit` (ou `:exit`, `:q`) sai; outro `:comando` é reportado como
+  desconhecido. `-On` e `--max-steps`/`--max-depth` aplicam-se
   a cada execução.

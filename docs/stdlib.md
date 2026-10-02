@@ -61,13 +61,14 @@ AETHER_INCLUDE=stdlib/prelude.ae aether run game.ae
 | `lerp` | `(a: f64, b: f64, t: f64) -> f64` | `a + (b - a) * t` |
 | `sign` | `(x: i32) -> i32` | -1, 0 ou 1 |
 | `is_even` | `(x: i32) -> bool` | |
-| `gcd` | `(a: i32, b: i32) -> i32` | Euclides; nunca negativo |
+| `gcd` | `(a: i32, b: i32) -> i32` | Euclides; nunca negativo, excepto quando o resultado seria 2^31 (`gcd(i32::MIN, 0)`), que dá `i32::MIN` |
 | `clamp_f64` | `(x: f64, lo: f64, hi: f64) -> f64` | |
 | `wrap_index` | `(i: i32, n: i32) -> i32` | módulo para `0..n` (`-1` → `n - 1`) |
 | `sum_to` | `(n: i32) -> i32` | `0 + 1 + … + (n - 1)` |
 
 `abs`, `min`, `max` e `clamp` não estão no prelúdio porque são built-ins;
-definir uma função com um destes nomes é um erro. `aether check
+uma função do programa com um destes nomes substitui o built-in (é o que
+`stdlib/math.ae` faz). `aether check
 stdlib/prelude.ae` sozinho falha com “missing entry point” — é esse o
 objetivo: o `main` vem do programa que o inclui.
 

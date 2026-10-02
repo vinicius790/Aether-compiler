@@ -1,4 +1,4 @@
-# Matriz de testes Aether 0.2
+# Matriz de testes Aether
 
 Cada linha é um contrato. Se o comando à direita falhar, a versão está
 partida. Isto não substitui `cargo test`; organiza o que o CI e um
@@ -114,4 +114,14 @@ têm de concordar e coincidir com o stdout/valor esperado.
 | shrink a apagar helper chamado | `uses_in_expr` no sketch |
 | overflow do pretty wrap | `map_leaves` post-order |
 | `check_ir` ids após retain | existência por id, não índice |
-| A1 | `tests/audit_match.rs` | match/enum/tuplas/padrões aninhados: -O0 = -O2 = esperado |
+
+## Auditorias
+
+| Teste | Contrato |
+|-------|----------|
+| `tests/audit_match.rs` | match/enum/tuplas/padrões aninhados: -O0 = -O2 = esperado |
+| `tests/audit_lang2.rs` | agregados zerados, `[v; N]`, arrays vazios, `i64::MIN`, `pub enum`, nomes privados por ficheiro |
+| `tests/audit_vm.rs` | núcleo de execução: valores, aritmética, strings, limites, `run_budget`, host |
+| `tests/audit_modules.rs` | `use`, `pub` (E0281), `fmt`, entradas estranhas, diagnósticos, CLI |
+| `tests/audit_llvm.rs` | LLVM (`lli`) = VM em stdout e em falhas (saltado sem `lli`) |
+| `tests/audit_a3.rs` | cada linha de `docs/diagnostics.md` (código e mensagem), erros de uso da CLI, REPL, `benchmark`, `dump-tokens`, versões iguais em todos os ficheiros |

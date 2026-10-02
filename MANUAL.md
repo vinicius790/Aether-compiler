@@ -128,7 +128,7 @@ O que `cargo test` cobre:
   `docs/test-matrix.md`); cada programa corre em `-O0` e `-O2`, que têm de
   concordar e coincidir com o stdout/valor esperado
 
-Ordem de magnitude no estado 0.2.2: dezenas de testes, todos no mesmo
+Ordem de magnitude em 0.3.0: centenas de testes, todos no mesmo
 processo `cargo test`. Se algum falhar, o repositório **não** está utilizável;
 não ignore e não “ajuste o assert”.
 
@@ -322,23 +322,25 @@ Opções comuns:
 | `--timings` | tempos por fase |
 | `--stats` | estatísticas |
 | `--emit ir\|bytecode\|llvm` | artefacto de `compile` |
-| `-o PATH` | ficheiro de saída |
-| `--include FILE` | compila `FILE` junto com o principal; repetível (`check`, `run`, `compile`, `dump-*`, `optimize`, `verify`, `cfg`, `stats`, `profile`, `digest`, `bench`). `AETHER_INCLUDE=a.ae:b.ae` acrescenta includes por omissão |
-| `--max-steps N` | orçamento de instruções da VM (`run`, `profile`, `digest`, `bench`; omissão 50 000 000) |
-| `--max-depth N` | profundidade máxima de chamadas (`run`, `profile`, `digest`, `bench`; omissão 10 000) |
+| `-o PATH` / `--output PATH` | ficheiro de saída |
+| `--include FILE` (`-I FILE`, `--include=FILE`) | compila `FILE` junto com o principal; repetível (`check`, `run`, `compile`, `dump-*`, `optimize`, `verify`, `cfg`, `stats`, `profile`, `digest`, `bench`). `AETHER_INCLUDE=a.ae:b.ae` acrescenta includes por omissão |
+| `--max-steps N` | orçamento de instruções da VM (`run`, `profile`, `digest`, `bench`, `benchmark`, `repl`; omissão 50 000 000) |
+| `--max-depth N` | profundidade máxima de chamadas (os mesmos comandos; omissão 10 000) |
 | `--backend vm\|llvm` | motor de `run`: VM de bytecode (omissão) ou LLVM via `lli` |
 | `--iters N` | iterações do fuzzer (omissão: 200) |
 | `--seed N` | semente (aceita `0x…`) |
 | `--kind …` | suíte de fuzz |
 | `--n N` | repetições de `bench` (omissão 5) / argumento de `benchmark` (Fibonacci, omissão 20) |
 
-Códigos de saída: `0` ok, `1` erro de compilação / fuzz failure, `2` erro de
+Códigos de saída: `0` ok, `1` erro de compilação, uso errado ou falha do fuzz, `2` erro de
 runtime (incluindo `--max-steps` / `--max-depth` excedidos). Num erro de
 runtime a CLI imprime primeiro o stdout produzido até ali e depois
 `runtime error: ...`.
 
 Opções mal formadas (`-O9`, `--max-steps 0`, `--n x`, valor em falta, um segundo
-ficheiro) são erros com `exit 1`, nunca omissões silenciosas. Ficheiros acima de
+ficheiro, um ficheiro em `version`/`repl`/`benchmark`/`fuzz`) são erros com
+`exit 1`, nunca omissões silenciosas; `aether` sem comando imprime a ajuda no
+stderr com `exit 1`, `help`/`--help` no stdout com `exit 0`. Ficheiros acima de
 8 MiB, que não sejam UTF-8 válido, diretórios e ficheiros em falta dão uma
 única linha `cannot read ...`; um BOM UTF-8 inicial é ignorado.
 
@@ -535,14 +537,16 @@ o **mesmo** `Value` e o **mesmo** stdout. Isto é a propriedade
 
 ### LLVM — `src/backend/llvm.rs`
 
-Texto. Serve para `aether dump-llvm` e `--emit llvm`. Produz LLVM 18 IR
-válido: um `alloca` por registrador da IR, `load`/`store`, pronto para
-`mem2reg` (verificado com `llvm-as` em todos os exemplos). Diferenças
-conhecidas face à VM, que continua a ser o contrato de execução: agregados
-vivem na stack e copiar um array/struct copia o ponteiro (há aliasing); sem
-verificação de limites; concatenação de strings não é suportada (aborta);
-`print_f64` usa `%g`. Não há ligação a `inkwell` / `llvm-sys`. Se `opt-18` estiver no PATH, pode-se fazer
-experimentos **fora** do repositório; o CI não depende disso.
+Texto. Serve para `aether dump-llvm`, `--emit llvm` e `run --backend llvm`
+(`opt` + `lli`). Produz LLVM IR válido (LLVM 15+, verificado com `llvm-as` /
+`lli` 18): um `alloca` por registrador da IR, `load`/`store`, pronto para
+`mem2reg`. Tem a semântica da VM, que continua a ser o contrato de execução:
+agregados copiados por valor, verificação de limites, concatenação de strings,
+as mesmas mensagens `runtime error: ...` e floats formatados como o `Display`
+do Rust; `tests/audit_llvm.rs` compara os dois backends. Diferenças que
+restam: sem orçamento de passos nem de profundidade (só `--timeout`), `yield`
+não faz nada, `extern fn` sem implementação (`docs/llvm.md`). Não há ligação
+a `inkwell` / `llvm-sys`; o CI não depende de LLVM.
 
 ---
 
@@ -570,6 +574,7 @@ aether fuzz --kind diff --seed 0xDEAD --iters 1
 | `generated` | `gen` | programa da gramática **compila** |
 | `differential` | `diff` | `-O0` e `-O2` concordam em valor e stdout |
 | `agg` | `aggregate` | programas bem tipados com structs, arrays (também aninhados), `i64`/`f64`/`char`/`string`, conversões, guardas `&&`/`\|\|`, atribuição aninhada e funções com expressão final; oráculo diferencial O0/O2 |
+| `lang` | `language` | enums, `match` (também como expressão), `if let`, tuplas, operadores bit a bit, built-ins, programas multi-ficheiro; O0/O1/O2, `verify`, `fmt` como ponto fixo |
 | `mutated` | `mut` | havoc sobre fonte válida, sem pânico |
 | `structural` | `struct` | mutação da *sketch* (árvore) |
 | `aspect` | `ap` | mutação que preserva tipos / nomes / terminação |
@@ -577,7 +582,7 @@ aether fuzz --kind diff --seed 0xDEAD --iters 1
 | `greybox` | `grey` `graybox` | corpus + energia + cobertura de arestas da VM |
 | `format` | `fmt` `grammar` | fita de bytes = escolhas da EBNF |
 
-`all` inclui `agg` e **não** inclui greybox (campanha com estado) nem
+`all` inclui `agg` e `lang` e **não** inclui greybox (campanha com estado) nem
 format; esses chamam-se à parte. As propriedades de lixo, format e
 mutação compilam também em `-O2`.
 
@@ -743,7 +748,7 @@ wrapper se o dump LLVM tiver de o conhecer.
 
 Um relatório útil tem:
 
-1. Versão (`0.2.2`).
+1. Versão (`aether version`, p.ex. `0.3.0`).
 2. Fonte reduzida (`.ae`).
 3. Comando exacto.
 4. Esperado vs observado.
@@ -757,15 +762,17 @@ Não abra issue de “faltam generics” sem RFC (`ISSUE_TEMPLATE/feature.yml`).
 ## 14. Limitações honestas
 
 Isto **não** é o LLVM, **não** é o rustc, **não** é um produto com SLA
-(`SUPPORT.md`). Em 0.2.2:
+(`SUPPORT.md`). Em 0.3.0:
 
-- sem módulos / `use` / pacotes
+- módulos são só ficheiros (`use "path";`, espaço de nomes plano com `pub`);
+  sem pacotes nem genéricos
 - sem SSA, sem alocação de registradores global; o inlining só cobre
   folhas de um bloco
-- LLVM é texto, sem JIT/AOT no CI; os agregados fazem aliasing e não há
-  verificação de limites nem concatenação de strings (a VM é o contrato)
+- LLVM é texto, sem JIT/AOT no CI e sem orçamento de passos/profundidade
+  (só `--timeout`); a VM é o contrato (`docs/llvm.md`)
 - bytecode instável entre versões (`README` / `CHANGELOG`)
-- stdlib é um ficheiro de referência, não uma biblioteca ligada
+- a stdlib são ficheiros-fonte importados com `use` / `--include`, não uma
+  biblioteca ligada
 - o pretty-printer não é um formatador de projecto
 - o greybox é in-process e pequeno; não substitui OSS-Fuzz
 - a linguagem cabe na cabeça; a profundidade está na integração das camadas
@@ -787,6 +794,8 @@ máximo baixo**, não 80k. Contar: `bash scripts/count_lines.sh`. Qualidade
 | Passes | `docs/optimizations.md` |
 | VM | `docs/vm.md` |
 | Comandos | `docs/cli.md`, `docs/tools.md` |
+| Códigos de erro / aviso | `docs/diagnostics.md` |
+| Backend LLVM | `docs/llvm.md` |
 | Fuzzer | `docs/fuzzing.md`, `docs/greybox.md`, `docs/aspect-mir.md` |
 | Comparação com cargo-fuzz / Jazzer | `docs/fuzzers-rust.md` |
 | O que está feito / em falta | `docs/status.md` |

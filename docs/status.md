@@ -91,5 +91,6 @@ de funções mortas.
 
 Feito em 0.3.0: módulos de ficheiro (`use "path";`).
 
-1. Visibilidade (`pub` verificado) e nomes qualificados nos módulos.
+1. Nomes qualificados nos módulos (`a::f`); a visibilidade `pub` já é verificada
+   entre ficheiros desde 0.3.0 (`E0281`).
 2. Relatórios de cobertura LLVM / `cargo-fuzz` sobre a IR (o greybox da VM já existe).

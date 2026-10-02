@@ -21,9 +21,9 @@
 
 use super::rng::FuzzRng;
 
-/// Generate `match` as an expression. The `match` agent landed statements
-/// only; flip this when expression `match` exists.
-pub const ALLOW_MATCH_EXPR: bool = false;
+/// Generate `match` as an expression (`(match (e) & 3 { 0 => a, 1 => b, _ => c })`)
+/// inside other expressions. On since `match` became an expression (0.3.0).
+pub const ALLOW_MATCH_EXPR: bool = true;
 
 #[derive(Clone, PartialEq, Debug)]
 enum Ty {

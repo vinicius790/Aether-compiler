@@ -118,11 +118,18 @@ pub fn compile_source(name: &str, source: &str, opts: &CompileOptions) -> Compil
 /// (a bare label such as `<repl>`) relative to the current directory.
 /// Duplicate item names across files surface through the usual sema errors.
 pub fn compile_sources(files: Vec<(String, String)>, opts: &CompileOptions) -> Compiled {
+    // a name that is a file on disk counts as already loaded, so a `use`
+    // that leads back to it (a cycle through the main file) does not read
+    // and compile it a second time
+    let mut seen = HashSet::new();
     let units = files
         .into_iter()
         .map(|(name, source)| {
             let path = Path::new(&name);
             let dir = if path.is_file() {
+                if let Ok(canonical) = std::fs::canonicalize(path) {
+                    seen.insert(canonical);
+                }
                 path.parent().map(Path::to_path_buf)
             } else {
                 None
@@ -130,7 +137,7 @@ pub fn compile_sources(files: Vec<(String, String)>, opts: &CompileOptions) -> C
             Unit { name, source, dir }
         })
         .collect();
-    compile_units(units, HashSet::new(), opts, false)
+    compile_units(units, seen, opts, false)
 }
 
 /// Like [`compile_sources`], but every item of every file counts as `pub`

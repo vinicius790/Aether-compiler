@@ -1541,7 +1541,7 @@ impl<'a> Analyzer<'a> {
         // Arithmetic inherits the expected numeric type; a bare integer
         // literal on either side adopts the type of the other operand.
         let hint = expected.filter(|t| t.is_numeric() && !op.is_cmp() && !op.is_logical());
-        let (l, r) = if is_int_literal_expr(lhs) && !is_int_literal_expr(rhs) {
+        let (l, r) = if is_untyped_int_operand(lhs) && !is_untyped_int_operand(rhs) {
             let r = self.check_expr(rhs, hint);
             let l = self.check_expr(lhs, Some(&r.ty));
             (l, r)
@@ -2067,6 +2067,20 @@ fn is_int_literal_expr(e: &Expr) -> bool {
             is_int_literal_expr(lhs) && is_int_literal_expr(rhs)
         }
         _ => false,
+    }
+}
+
+/// [`is_int_literal_expr`], but a `match` whose arms are all bare integer
+/// literals (`match k { 0 => 1, _ => 2 }`) also counts: as a binary operand
+/// it adopts the other operand's type like a literal would.
+fn is_untyped_int_operand(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Match { arms, .. } => !arms.is_empty() && arms.iter().all(is_simple_literal_arm),
+        ExprKind::Group(inner) | ExprKind::Unary { expr: inner, .. } => is_untyped_int_operand(inner),
+        ExprKind::Binary { op, lhs, rhs } if !op.is_cmp() && !op.is_logical() => {
+            is_untyped_int_operand(lhs) && is_untyped_int_operand(rhs)
+        }
+        _ => is_int_literal_expr(e),
     }
 }
 

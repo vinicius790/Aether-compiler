@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | yes       |
-| 0.1.x   | no        |
+| 0.3.x   | yes       |
+| < 0.3   | no        |
 
 Aether is a research compiler. The VM is the only supported execution
 engine. The LLVM textual backend is not a security boundary.

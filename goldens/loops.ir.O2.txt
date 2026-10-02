@@ -1,33 +1,33 @@
 fn main() -> i32 {
 bb0:
   %0 = const 0_i32
-  %2 = const 0_i32
+  %1 = const 0_i32
   jmp bb1
 bb1:
-  %4 = const 10_i32
-  %5 = <.i32 %2, %4
-  br %5, bb2, bb3
+  %2 = const 10_i32
+  %3 = <.i32 %1, %2
+  br %3, bb2, bb3
 bb2:
-  %6 = +.i32 %0, %2
-  %0 = mov %6
-  %7 = const 1_i32
-  %8 = +.i32 %2, %7
-  %2 = mov %8
+  %2 = +.i32 %0, %1
+  %0 = mov %2
+  %4 = const 1_i32
+  %5 = +.i32 %1, %4
+  %1 = mov %5
   jmp bb1
 bb3:
-  %9 = const 0_i32
-  %11 = const 5_i32
+  %1 = const 0_i32
+  %2 = const 5_i32
   jmp bb4
 bb4:
-  %12 = <.i32 %9, %11
-  br %12, bb5, bb7
+  %3 = <.i32 %1, %2
+  br %3, bb5, bb7
 bb5:
-  %13 = +.i32 %0, %9
-  %0 = mov %13
+  %4 = +.i32 %0, %1
+  %0 = mov %4
   jmp bb6
 bb6:
-  %14 = const 1_i32
-  %9 = +.i32 %9, %14
+  %4 = const 1_i32
+  %1 = +.i32 %1, %4
   jmp bb4
 bb7:
   call print_i32(%0)

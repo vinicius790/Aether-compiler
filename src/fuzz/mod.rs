@@ -14,8 +14,12 @@
 //! 4. **Differential optimisation** — `-O0` and `-O2` agree on the value
 //!    returned by `main` and on captured stdout.
 //! 5. **Mutation of valid programs** — bit-flips and junk insertion still
-//!    do not panic.
+//!    do not panic, at `-O0` and at `-O2`.
+//! 6. **Aggregate synthesis** — struct / array / `i64` / `f64` / `char` /
+//!    `string` programs compile without diagnostics and agree across
+//!    optimisation levels.
 
+mod agg;
 mod format;
 mod gen;
 mod greybox;
@@ -24,6 +28,7 @@ mod mutate;
 mod rng;
 mod sketch;
 
+pub use agg::gen_aggregate_program;
 pub use gen::gen_program;
 pub use greybox::{run_greybox, GreyboxReport};
 pub use mir::{check_ir, decoy_stats, gen_ir};
@@ -53,12 +58,14 @@ pub enum FuzzKind {
     Mir,
     Greybox,
     Format,
+    Aggregate,
 }
 
 impl FuzzKind {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "all" => FuzzKind::All,
+            "agg" | "aggregate" => FuzzKind::Aggregate,
             "lexer" => FuzzKind::Lexer,
             "parser" => FuzzKind::Parser,
             "pipeline" => FuzzKind::Pipeline,
@@ -86,6 +93,7 @@ impl FuzzKind {
                 FuzzKind::Structural,
                 FuzzKind::Aspect,
                 FuzzKind::Mir,
+                FuzzKind::Aggregate,
             ]
         } else {
             vec![self]
@@ -175,6 +183,7 @@ pub fn run_fuzz(cfg: &FuzzConfig) -> FuzzReport {
                 FuzzKind::Aspect => prop_aspect(&mut case_rng),
                 FuzzKind::Mir => prop_mir(&mut case_rng),
                 FuzzKind::Format => prop_format(&mut case_rng),
+                FuzzKind::Aggregate => prop_aggregate(&mut case_rng),
                 FuzzKind::Greybox | FuzzKind::All => unreachable!(),
             };
             match result {
@@ -207,22 +216,89 @@ fn kind_salt(kind: FuzzKind) -> u64 {
         FuzzKind::Mir => 0x99,
         FuzzKind::Greybox => 0xAA,
         FuzzKind::Format => 0xBB,
+        FuzzKind::Aggregate => 0xCC,
     }
+}
+
+/// Compile hostile input at `-O0` and `-O2`; `Err(level)` names the level
+/// that panicked. The optimizer only ever sees well-typed IR, so junk that
+/// fails sema exercises the same path at both levels, but anything that
+/// slips through must survive the full pass pipeline too.
+fn compile_both_levels(name: &str, src: &str) -> Result<(), u8> {
+    for level in [0u8, 2] {
+        let opts = CompileOptions {
+            opt_level: level,
+            color: false,
+        };
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _ = tokenize(FileId(0), src);
+            let _ = compile_source(name, src, &opts);
+        }));
+        if caught.is_err() {
+            return Err(level);
+        }
+    }
+    Ok(())
 }
 
 fn prop_format(rng: &mut FuzzRng) -> Result<(), FuzzFailure> {
     let src = format::gen_format(rng);
+    match compile_both_levels("<fmt>", &src) {
+        Ok(()) => Ok(()),
+        Err(level) => Err(fail(
+            "format_no_panic",
+            format!("grammar-tape input panicked the compiler at -O{level}"),
+            &src,
+        )),
+    }
+}
+
+fn prop_aggregate(rng: &mut FuzzRng) -> Result<(), FuzzFailure> {
+    let src = gen_aggregate_program(rng);
     let opts = CompileOptions {
         opt_level: 0,
         color: false,
     };
-    let caught = catch_unwind(AssertUnwindSafe(|| {
-        let _ = tokenize(FileId(0), &src);
-        let _ = compile_source("<fmt>", &src, &opts);
-    }));
-    match caught {
-        Ok(()) => Ok(()),
-        Err(_) => Err(fail("format_no_panic", "grammar-tape input panicked the compiler", &src)),
+    let caught = catch_unwind(AssertUnwindSafe(|| compile_source("<agg>", &src, &opts)));
+    let compiled = match caught {
+        Ok(c) => c,
+        Err(_) => {
+            return Err(fail(
+                "agg_compile",
+                "aggregate program panicked the compiler",
+                &src,
+            ))
+        }
+    };
+    if !compiled.diags.is_empty() {
+        return Err(fail(
+            "agg_well_typed",
+            format!(
+                "aggregate program produced diagnostics:\n{}",
+                compiled.diags.render(&compiled.session, false)
+            ),
+            &src,
+        ));
+    }
+    match eval_levels(&src) {
+        Ok((v0, o0, v2, o2)) => {
+            if v0 != v2 {
+                return Err(fail(
+                    "agg_opt_equiv",
+                    format!("-O0 returned {v0:?}, -O2 returned {v2:?}"),
+                    &src,
+                ));
+            }
+            if o0 != o2 {
+                return Err(fail(
+                    "agg_opt_equiv",
+                    format!("stdout differs:\n-O0: {o0:?}\n-O2: {o2:?}"),
+                    &src,
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => Err(fail("agg_opt_equiv", e, &src)),
     }
 }
 
@@ -298,7 +374,7 @@ fn prop_parser(rng: &mut FuzzRng) -> Result<(), FuzzFailure> {
 fn prop_pipeline(rng: &mut FuzzRng) -> Result<(), FuzzFailure> {
     let src = random_source(rng);
     let opts = CompileOptions {
-        opt_level: 1,
+        opt_level: 2,
         color: false,
     };
     let caught = catch_unwind(AssertUnwindSafe(|| compile_source("<fuzz>", &src, &opts)));
@@ -528,17 +604,13 @@ fn prop_mir(rng: &mut FuzzRng) -> Result<(), FuzzFailure> {
 fn prop_mutated(rng: &mut FuzzRng) -> Result<(), FuzzFailure> {
     let base = gen_program(rng);
     let src = mutate_source(rng, &base);
-    let opts = CompileOptions {
-        opt_level: 0,
-        color: false,
-    };
-    let caught = catch_unwind(AssertUnwindSafe(|| {
-        let _ = tokenize(FileId(0), &src);
-        let _ = compile_source("<mut>", &src, &opts);
-    }));
-    match caught {
+    match compile_both_levels("<mut>", &src) {
         Ok(()) => Ok(()),
-        Err(_) => Err(fail("mut_no_panic", "mutated source panicked the compiler", &src)),
+        Err(level) => Err(fail(
+            "mut_no_panic",
+            format!("mutated source panicked the compiler at -O{level}"),
+            &src,
+        )),
     }
 }
 
@@ -684,6 +756,9 @@ const CORPUS: &[&str] = &[
     "fn main() -> i32 { let mut x = 0; x = x; return x; }",
     "🚀 fn main() -> i32 { return 0; }",
     "fn main() -> i32 { return 0; }\nfn main() -> i32 { return 1; }",
+    // unterminated block followed by the next item (used to spin forever)
+    "fn h0(p0: i32) -> i32 { return 8;\nfn main() -> i32 { return h0(1); }",
+    "fn main() -> i32 { struct S { x: i32 }",
 ];
 
 fn corpus_case(i: usize) -> &'static str {
@@ -818,6 +893,34 @@ mod tests {
         });
         assert!(report.ok(), "{}", format_failures(&report));
         assert!(report.extra.contains("edges="));
+    }
+
+    #[test]
+    fn aggregate_programs_typecheck() {
+        // Well-typedness only: the differential result is covered by the
+        // `aether fuzz --kind agg` campaign, not by this unit test.
+        let mut rng = FuzzRng::new(53 ^ kind_salt(FuzzKind::Aggregate));
+        let mut rejected = Vec::new();
+        for case in 0..40u32 {
+            let case_seed = rng.next_u64();
+            let mut case_rng = FuzzRng::new(case_seed);
+            if let Err(f) = prop_aggregate(&mut case_rng) {
+                if f.property != "agg_opt_equiv" {
+                    rejected.push(format!(
+                        "[{}] seed={case_seed} case={case}\n{}\n---\n{}\n",
+                        f.property, f.detail, f.source
+                    ));
+                }
+            }
+        }
+        assert!(rejected.is_empty(), "{}", rejected.join("\n"));
+    }
+
+    #[test]
+    fn aggregate_kind_is_in_all_suite_and_parses() {
+        assert_eq!(FuzzKind::parse("agg"), Some(FuzzKind::Aggregate));
+        assert_eq!(FuzzKind::parse("aggregate"), Some(FuzzKind::Aggregate));
+        assert!(FuzzKind::All.suite().contains(&FuzzKind::Aggregate));
     }
 
     #[test]

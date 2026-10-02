@@ -5,7 +5,7 @@ type: software
 authors:
   - name: Aether Contributors
 license: MIT
-version: 0.2.0
+version: 0.2.2
 date-released: "2026-09-19"
 abstract: >
   Aether is a small statically typed imperative language with a complete

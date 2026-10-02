@@ -77,6 +77,7 @@ pub enum HirStmt {
     },
     Break(Span),
     Continue(Span),
+    Yield(Span),
     Block(HirBlock),
 }
 
@@ -295,14 +296,39 @@ impl<'a> Analyzer<'a> {
                 ret: Box::new(Type::Unit),
             },
         );
+        // runtime::NATIVES ids 8.. (see the table there)
+        use Type::{Char, F64, I32, I64};
+        self.register_builtin("print_char", fn_ty(vec![Char], Type::Unit));
+        self.register_builtin("to_string", fn_ty(vec![I32], Type::String));
+        self.register_builtin("i64_to_string", fn_ty(vec![I64], Type::String));
+        self.register_builtin("f64_to_string", fn_ty(vec![F64], Type::String));
+        self.register_builtin("char_to_string", fn_ty(vec![Char], Type::String));
+        self.register_builtin("abs", fn_ty(vec![I32], I32));
+        self.register_builtin("min", fn_ty(vec![I32, I32], I32));
+        self.register_builtin("max", fn_ty(vec![I32, I32], I32));
+        self.register_builtin("clamp", fn_ty(vec![I32, I32, I32], I32));
+        self.register_builtin("sqrt", fn_ty(vec![F64], F64));
+        self.register_builtin("floor", fn_ty(vec![F64], F64));
+        self.register_builtin("ceil", fn_ty(vec![F64], F64));
+        self.register_builtin("pow_i32", fn_ty(vec![I32, I32], I32));
     }
 
+    /// Built-ins are registered after user functions, so a user `fn` with
+    /// the same name shadows the built-in (e.g. `stdlib/math.ae` defines its
+    /// own `abs`/`min`/`max`/`clamp`).
     fn register_builtin(&mut self, name: &str, ty: Type) {
         if self.functions.iter().any(|(n, _, _, _)| n == name) {
             return;
         }
         self.functions
             .push((name.to_string(), ty, Span::DUMMY, true));
+    }
+
+    /// `name` resolves to a built-in (not shadowed by a user function).
+    fn is_builtin(&self, name: &str) -> bool {
+        self.functions
+            .iter()
+            .any(|(n, _, span, is_extern)| n == name && *is_extern && *span == Span::DUMMY)
     }
 
     fn register_fn(
@@ -372,8 +398,20 @@ impl<'a> Analyzer<'a> {
                     },
                 );
             }
-            let hb = self.check_block(body);
+            let hb = self.check_block_with(body, Some(&return_ty));
             self.scopes.pop();
+            if let Some(tail) = &hb.tail {
+                if !return_ty.assignable_from(&tail.ty) {
+                    self.err(
+                        format!(
+                            "tail expression has type `{}`, but `{}` returns `{return_ty}`",
+                            tail.ty, f.name.name
+                        ),
+                        tail.span,
+                        "E0221",
+                    );
+                }
+            }
             if return_ty != Type::Unit && !block_always_returns(&hb) {
                 self.err(
                     format!("function `{}` may not return a value of type `{return_ty}` on all paths", f.name.name),
@@ -395,13 +433,27 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    /// A nested block: a trailing expression without `;` is evaluated as a
+    /// statement. Only a function body (`check_block_with`) keeps it as a tail.
     fn check_block(&mut self, block: &Block) -> HirBlock {
+        self.check_block_with(block, None)
+    }
+
+    fn check_block_with(&mut self, block: &Block, tail_expected: Option<&Type>) -> HirBlock {
         self.scopes.push();
         let mut stmts = Vec::new();
         for s in &block.stmts {
             stmts.push(self.check_stmt(s));
         }
-        let tail = block.tail.as_ref().map(|e| self.check_expr(e, None));
+        let mut tail = block
+            .tail
+            .as_ref()
+            .map(|e| self.check_expr(e, tail_expected));
+        if tail_expected.is_none() {
+            if let Some(e) = tail.take() {
+                stmts.push(HirStmt::Expr(e));
+            }
+        }
         self.scopes.pop();
         HirBlock {
             stmts,
@@ -572,11 +624,19 @@ impl<'a> Analyzer<'a> {
             } => {
                 let s = self.check_expr(start, Some(&Type::I32));
                 let e = self.check_expr(end, Some(&Type::I32));
-                if !s.ty.is_integer() && !s.ty.is_error() {
-                    self.err("for-range start must be an integer", start.span, "E0238");
+                if s.ty != Type::I32 && !s.ty.is_error() {
+                    self.err(
+                        format!("for-range start must be `i32`, found `{}`", s.ty),
+                        start.span,
+                        "E0238",
+                    );
                 }
-                if !e.ty.is_integer() && !e.ty.is_error() {
-                    self.err("for-range end must be an integer", end.span, "E0238");
+                if e.ty != Type::I32 && !e.ty.is_error() {
+                    self.err(
+                        format!("for-range end must be `i32`, found `{}`", e.ty),
+                        end.span,
+                        "E0238",
+                    );
                 }
                 self.scopes.push();
                 self.scopes.define(
@@ -607,6 +667,7 @@ impl<'a> Analyzer<'a> {
                 }
                 HirStmt::Break(*span)
             }
+            Stmt::Yield { span } => HirStmt::Yield(*span),
             Stmt::Continue { span } => {
                 if self.loop_depth == 0 {
                     self.err("`continue` outside of a loop", *span, "E0240");
@@ -637,286 +698,368 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// `len(e)` accepts a `string` or any `[T; N]` and yields `i32`. The
+    /// registered signature only says `string`, so the call is special-cased
+    /// here unless a user function named `len` shadows the built-in.
+    fn check_len_call(&mut self, args: &[Expr], span: Span) -> HirExpr {
+        if args.len() != 1 {
+            self.err(
+                format!("function `len` takes 1 argument(s), found {}", args.len()),
+                span,
+                "E0257",
+            );
+        }
+        let checked: Vec<HirExpr> = args.iter().map(|a| self.check_expr(a, None)).collect();
+        if let Some(arg) = checked.first() {
+            if !matches!(arg.ty, Type::String | Type::Array { .. } | Type::Error) {
+                self.err(
+                    format!(
+                        "argument 1 to `len` has type `{}`, expected `string` or an array",
+                        arg.ty
+                    ),
+                    args[0].span,
+                    "E0258",
+                );
+            }
+        }
+        HirExpr {
+            kind: HirExprKind::Call {
+                name: "len".into(),
+                args: checked,
+            },
+            ty: Type::I32,
+            span,
+        }
+    }
+
+    /// An integer literal takes the expected integer type (`i32` by default)
+    /// and must fit in it.
+    fn int_literal(&mut self, value: i64, expected: Option<&Type>, span: Span) -> HirExpr {
+        let ty = expected
+            .cloned()
+            .filter(|t| t.is_integer())
+            .unwrap_or(Type::I32);
+        if ty == Type::I32 && i32::try_from(value).is_err() {
+            self.err(
+                format!("integer literal `{value}` is out of range for `i32`"),
+                span,
+                "E0263",
+            );
+        }
+        HirExpr {
+            kind: HirExprKind::Literal(Literal::Int(value)),
+            ty,
+            span,
+        }
+    }
+
+    // `check_expr` recurses once per nesting level, so it is kept to a thin
+    // dispatcher: debug builds reserve stack for every arm of a `match` up
+    // front, and with the arms inlined its frame was several KiB, which
+    // overflowed a 2 MiB thread at ~200 nested parentheses. Each `check_*`
+    // helper owns its own locals instead.
+
     fn check_expr(&mut self, expr: &Expr, expected: Option<&Type>) -> HirExpr {
-        let mut hir = match &expr.kind {
-            ExprKind::Literal(lit) => {
-                let ty = match lit {
-                    Literal::Int(_) => expected
-                        .cloned()
-                        .filter(|t| t.is_integer())
-                        .unwrap_or(Type::I32),
-                    Literal::Float(_) => Type::F64,
-                    Literal::Bool(_) => Type::Bool,
-                    Literal::String(_) => Type::String,
-                    Literal::Char(_) => Type::Char,
-                    Literal::Unit => Type::Unit,
-                };
-                HirExpr {
-                    kind: HirExprKind::Literal(lit.clone()),
-                    ty,
-                    span: expr.span,
-                }
-            }
-            ExprKind::Ident(id) => {
-                if let Some(sym) = self.scopes.lookup(&id.name) {
-                    HirExpr {
-                        kind: HirExprKind::Local(id.name.clone()),
-                        ty: sym.ty.clone(),
-                        span: expr.span,
-                    }
-                } else if let Some((_, ty, _, _)) =
-                    self.functions.iter().find(|(n, _, _, _)| n == &id.name)
-                {
-                    HirExpr {
-                        kind: HirExprKind::Local(id.name.clone()),
-                        ty: ty.clone(),
-                        span: expr.span,
-                    }
-                } else {
-                    self.err(
-                        format!("cannot find value `{0}` in this scope", id.name),
-                        id.span,
-                        "E0243",
-                    );
-                    HirExpr {
-                        kind: HirExprKind::Local(id.name.clone()),
-                        ty: Type::Error,
-                        span: expr.span,
-                    }
-                }
-            }
-            ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.check_expr(lhs, None);
-                let r = self.check_expr(rhs, Some(&l.ty));
-                let ty = match binop_result(*op, &l.ty, &r.ty) {
-                    Some(t) => t,
-                    None => {
-                        self.err(
-                            format!("operator `{op}` is not defined for `{}` and `{}`", l.ty, r.ty),
-                            expr.span,
-                            "E0244",
-                        );
-                        Type::Error
-                    }
-                };
-                HirExpr {
-                    kind: HirExprKind::Binary {
-                        op: *op,
-                        lhs: Box::new(l),
-                        rhs: Box::new(r),
-                    },
-                    ty,
-                    span: expr.span,
-                }
-            }
-            ExprKind::Unary { op, expr: inner } => {
-                let e = self.check_expr(inner, None);
-                let ty = match unop_result(*op, &e.ty) {
-                    Some(t) => t,
-                    None => {
-                        self.err(
-                            format!("unary `{}` is not defined for `{}`", op.as_str(), e.ty),
-                            expr.span,
-                            "E0245",
-                        );
-                        Type::Error
-                    }
-                };
-                HirExpr {
-                    kind: HirExprKind::Unary {
-                        op: *op,
-                        expr: Box::new(e),
-                    },
-                    ty,
-                    span: expr.span,
-                }
-            }
+        match &expr.kind {
+            ExprKind::Literal(Literal::Int(v)) => self.int_literal(*v, expected, expr.span),
+            ExprKind::Literal(lit) => self.check_literal(lit, expr.span),
+            ExprKind::Ident(id) => self.check_ident(id, expr.span),
+            ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, expr.span),
+            ExprKind::Unary { op, expr: inner } => self.check_unary(*op, inner, expected, expr.span),
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
-            ExprKind::Index { base, index } => {
-                let b = self.check_expr(base, None);
-                let i = self.check_expr(index, Some(&Type::I32));
-                if !i.ty.is_integer() && !i.ty.is_error() {
-                    self.err("array index must be an integer", index.span, "E0246");
-                }
-                let ty = match &b.ty {
-                    Type::Array { elem, .. } => *elem.clone(),
-                    Type::String => Type::Char,
-                    Type::Error => Type::Error,
-                    other => {
-                        self.err(format!("cannot index into `{other}`"), base.span, "E0247");
-                        Type::Error
-                    }
-                };
-                HirExpr {
-                    kind: HirExprKind::Index {
-                        base: Box::new(b),
-                        index: Box::new(i),
-                    },
-                    ty,
-                    span: expr.span,
-                }
+            ExprKind::Index { base, index } => self.check_index(base, index, expr.span),
+            ExprKind::Field { base, field } => self.check_field(base, field, expr.span),
+            ExprKind::Array { elements } => self.check_array(elements, expr.span),
+            ExprKind::StructLit { name, fields } => self.check_struct_lit(name, fields, expr.span),
+            ExprKind::Cast { expr: inner, ty } => self.check_cast(inner, ty, expr.span),
+            ExprKind::Group(inner) => self.check_expr(inner, expected),
+        }
+    }
+
+    fn check_literal(&mut self, lit: &Literal, span: Span) -> HirExpr {
+        let ty = match lit {
+            Literal::Int(_) => Type::I32, // handled by `int_literal`
+            Literal::Float(_) => Type::F64,
+            Literal::Bool(_) => Type::Bool,
+            Literal::String(_) => Type::String,
+            Literal::Char(_) => Type::Char,
+            Literal::Unit => Type::Unit,
+        };
+        HirExpr {
+            kind: HirExprKind::Literal(lit.clone()),
+            ty,
+            span,
+        }
+    }
+
+    fn check_ident(&mut self, id: &Ident, span: Span) -> HirExpr {
+        let ty = if let Some(sym) = self.scopes.lookup(&id.name) {
+            sym.ty.clone()
+        } else {
+            if self.functions.iter().any(|(n, _, _, _)| n == &id.name) {
+                self.err(
+                    format!("function `{}` cannot be used as a value", id.name),
+                    id.span,
+                    "E0264",
+                );
+            } else {
+                self.err(
+                    format!("cannot find value `{0}` in this scope", id.name),
+                    id.span,
+                    "E0243",
+                );
             }
-            ExprKind::Field { base, field } => {
-                let b = self.check_expr(base, None);
-                match b.ty.field(&field.name) {
-                    Some((idx, fty)) => HirExpr {
-                        ty: fty.clone(),
-                        kind: HirExprKind::Field {
-                            base: Box::new(b),
-                            field: field.name.clone(),
-                            index: idx,
-                        },
-                        span: expr.span,
-                    },
-                    None => {
-                        if !b.ty.is_error() {
-                            self.err(
-                                format!("no field `{}` on type `{}`", field.name, b.ty),
-                                field.span,
-                                "E0248",
-                            );
-                        }
-                        HirExpr {
-                            kind: HirExprKind::Field {
-                                base: Box::new(b),
-                                field: field.name.clone(),
-                                index: 0,
-                            },
-                            ty: Type::Error,
-                            span: expr.span,
-                        }
-                    }
-                }
+            Type::Error
+        };
+        HirExpr {
+            kind: HirExprKind::Local(id.name.clone()),
+            ty,
+            span,
+        }
+    }
+
+    fn check_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        expected: Option<&Type>,
+        span: Span,
+    ) -> HirExpr {
+        // Arithmetic inherits the expected numeric type; a bare integer
+        // literal on either side adopts the type of the other operand.
+        let hint = expected.filter(|t| t.is_numeric() && !op.is_cmp() && !op.is_logical());
+        let (l, r) = if is_int_literal_expr(lhs) && !is_int_literal_expr(rhs) {
+            let r = self.check_expr(rhs, hint);
+            let l = self.check_expr(lhs, Some(&r.ty));
+            (l, r)
+        } else {
+            let l = self.check_expr(lhs, hint);
+            let r = self.check_expr(rhs, Some(&l.ty));
+            (l, r)
+        };
+        let ty = match binop_result(op, &l.ty, &r.ty) {
+            Some(t) => t,
+            None => {
+                self.err(
+                    format!("operator `{op}` is not defined for `{}` and `{}`", l.ty, r.ty),
+                    span,
+                    "E0244",
+                );
+                Type::Error
             }
-            ExprKind::Array { elements } => {
-                let mut checked = Vec::new();
-                let mut elem_ty = Type::Error;
-                for (i, e) in elements.iter().enumerate() {
-                    let hint = if i == 0 { None } else { Some(&elem_ty) };
-                    let c = self.check_expr(e, hint);
-                    if i == 0 {
-                        elem_ty = c.ty.clone();
-                    } else if !elem_ty.assignable_from(&c.ty) {
-                        self.err(
-                            format!("array element has type `{}`, expected `{elem_ty}`", c.ty),
-                            e.span,
-                            "E0249",
-                        );
-                    }
-                    checked.push(c);
-                }
-                if elements.is_empty() {
-                    self.err("cannot infer type of empty array", expr.span, "E0250");
-                }
-                HirExpr {
-                    ty: Type::Array {
-                        elem: Box::new(elem_ty),
-                        len: elements.len() as i64,
-                    },
-                    kind: HirExprKind::Array { elements: checked },
-                    span: expr.span,
-                }
+        };
+        HirExpr {
+            kind: HirExprKind::Binary {
+                op,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+            },
+            ty,
+            span,
+        }
+    }
+
+    fn check_unary(&mut self, op: UnOp, inner: &Expr, expected: Option<&Type>, span: Span) -> HirExpr {
+        // `-5` is one literal, so `let x: i64 = -1;` and `-2147483648` type-check
+        if op == UnOp::Neg {
+            if let Some(v) = int_literal_value(inner) {
+                return self.int_literal(v.wrapping_neg(), expected, span);
             }
-            ExprKind::StructLit { name, fields } => {
-                let sty = self.lookup_struct(&name.name);
-                match sty {
-                    Some(Type::Struct {
-                        name: sname,
-                        fields: decl_fields,
-                    }) => {
-                        let mut out_fields = Vec::new();
-                        for (fname, fexpr) in fields {
-                            match decl_fields.iter().find(|(n, _)| n == &fname.name) {
-                                Some((_, fty)) => {
-                                    let e = self.check_expr(fexpr, Some(fty));
-                                    if !fty.assignable_from(&e.ty) {
-                                        self.err(
-                                            format!(
-                                                "field `{}` has type `{fty}`, found `{}`",
-                                                fname.name, e.ty
-                                            ),
-                                            fexpr.span,
-                                            "E0251",
-                                        );
-                                    }
-                                    out_fields.push((fname.name.clone(), e));
-                                }
-                                None => {
-                                    self.err(
-                                        format!("struct `{sname}` has no field `{}`", fname.name),
-                                        fname.span,
-                                        "E0252",
-                                    );
-                                }
-                            }
-                        }
-                        for (n, _) in &decl_fields {
-                            if !out_fields.iter().any(|(fnm, _)| fnm == n) {
-                                self.err(
-                                    format!("missing field `{n}` in `{sname}` literal"),
-                                    expr.span,
-                                    "E0253",
-                                );
-                            }
-                        }
-                        HirExpr {
-                            ty: Type::Struct {
-                                name: sname,
-                                fields: decl_fields,
-                            },
-                            kind: HirExprKind::StructLit {
-                                name: name.name.clone(),
-                                fields: out_fields,
-                            },
-                            span: expr.span,
-                        }
-                    }
-                    _ => {
-                        self.err(
-                            format!("unknown struct `{}`", name.name),
-                            name.span,
-                            "E0254",
-                        );
-                        HirExpr {
-                            kind: HirExprKind::StructLit {
-                                name: name.name.clone(),
-                                fields: Vec::new(),
-                            },
-                            ty: Type::Error,
-                            span: expr.span,
-                        }
-                    }
-                }
+        }
+        // `-` keeps a numeric hint, `!` an integer one (`let m: i64 = !0;`)
+        let hint = expected.filter(|t| match op {
+            UnOp::Neg => t.is_numeric(),
+            UnOp::Not => t.is_integer(),
+        });
+        let e = self.check_expr(inner, hint);
+        let ty = match unop_result(op, &e.ty) {
+            Some(t) => t,
+            None => {
+                self.err(
+                    format!("unary `{}` is not defined for `{}`", op.as_str(), e.ty),
+                    span,
+                    "E0245",
+                );
+                Type::Error
             }
-            ExprKind::Cast { expr: inner, ty } => {
-                let to = self.resolve_type(ty);
-                let e = self.check_expr(inner, None);
-                if !e.ty.can_cast_to(&to) && !e.ty.is_error() {
+        };
+        HirExpr {
+            kind: HirExprKind::Unary {
+                op,
+                expr: Box::new(e),
+            },
+            ty,
+            span,
+        }
+    }
+
+    fn check_index(&mut self, base: &Expr, index: &Expr, span: Span) -> HirExpr {
+        let b = self.check_expr(base, None);
+        let i = self.check_expr(index, Some(&Type::I32));
+        if !i.ty.is_integer() && !i.ty.is_error() {
+            self.err("array index must be an integer", index.span, "E0246");
+        }
+        let ty = match &b.ty {
+            Type::Array { elem, .. } => *elem.clone(),
+            Type::String => Type::Char,
+            Type::Error => Type::Error,
+            other => {
+                self.err(format!("cannot index into `{other}`"), base.span, "E0247");
+                Type::Error
+            }
+        };
+        HirExpr {
+            kind: HirExprKind::Index {
+                base: Box::new(b),
+                index: Box::new(i),
+            },
+            ty,
+            span,
+        }
+    }
+
+    fn check_field(&mut self, base: &Expr, field: &Ident, span: Span) -> HirExpr {
+        let b = self.check_expr(base, None);
+        let (index, ty) = match b.ty.field(&field.name) {
+            Some((idx, fty)) => (idx, fty.clone()),
+            None => {
+                if !b.ty.is_error() {
                     self.err(
-                        format!("cannot cast `{}` to `{to}`", e.ty),
-                        expr.span,
-                        "E0255",
+                        format!("no field `{}` on type `{}`", field.name, b.ty),
+                        field.span,
+                        "E0248",
                     );
                 }
-                HirExpr {
-                    kind: HirExprKind::Cast {
-                        expr: Box::new(e),
-                        to: to.clone(),
-                    },
-                    ty: to,
-                    span: expr.span,
-                }
+                (0, Type::Error)
             }
-            ExprKind::Group(inner) => self.check_expr(inner, expected),
         };
-        if let Some(exp) = expected {
-            if hir.ty == Type::I32 && *exp == Type::I64 {
-                if let HirExprKind::Literal(Literal::Int(_)) = &hir.kind {
-                    hir.ty = Type::I64;
+        HirExpr {
+            kind: HirExprKind::Field {
+                base: Box::new(b),
+                field: field.name.clone(),
+                index,
+            },
+            ty,
+            span,
+        }
+    }
+
+    fn check_array(&mut self, elements: &[Expr], span: Span) -> HirExpr {
+        let mut checked = Vec::new();
+        let mut elem_ty = Type::Error;
+        for (i, e) in elements.iter().enumerate() {
+            let hint = if i == 0 { None } else { Some(&elem_ty) };
+            let c = self.check_expr(e, hint);
+            if i == 0 {
+                elem_ty = c.ty.clone();
+            } else if !elem_ty.assignable_from(&c.ty) {
+                self.err(
+                    format!("array element has type `{}`, expected `{elem_ty}`", c.ty),
+                    e.span,
+                    "E0249",
+                );
+            }
+            checked.push(c);
+        }
+        if elements.is_empty() {
+            self.err("cannot infer type of empty array", span, "E0250");
+        }
+        HirExpr {
+            ty: Type::Array {
+                elem: Box::new(elem_ty),
+                len: elements.len() as i64,
+            },
+            kind: HirExprKind::Array { elements: checked },
+            span,
+        }
+    }
+
+    fn check_struct_lit(&mut self, name: &Ident, fields: &[(Ident, Expr)], span: Span) -> HirExpr {
+        let (sname, decl_fields) = match self.lookup_struct(&name.name) {
+            Some(Type::Struct { name, fields }) => (name, fields),
+            _ => {
+                self.err(
+                    format!("unknown struct `{}`", name.name),
+                    name.span,
+                    "E0254",
+                );
+                return HirExpr {
+                    kind: HirExprKind::StructLit {
+                        name: name.name.clone(),
+                        fields: Vec::new(),
+                    },
+                    ty: Type::Error,
+                    span,
+                };
+            }
+        };
+        let mut out_fields = Vec::new();
+        for (fname, fexpr) in fields {
+            match decl_fields.iter().find(|(n, _)| n == &fname.name) {
+                Some((_, fty)) => {
+                    let e = self.check_expr(fexpr, Some(fty));
+                    if !fty.assignable_from(&e.ty) {
+                        self.err(
+                            format!(
+                                "field `{}` has type `{fty}`, found `{}`",
+                                fname.name, e.ty
+                            ),
+                            fexpr.span,
+                            "E0251",
+                        );
+                    }
+                    out_fields.push((fname.name.clone(), e));
+                }
+                None => {
+                    self.err(
+                        format!("struct `{sname}` has no field `{}`", fname.name),
+                        fname.span,
+                        "E0252",
+                    );
                 }
             }
         }
-        hir
+        for (n, _) in &decl_fields {
+            if !out_fields.iter().any(|(fnm, _)| fnm == n) {
+                self.err(
+                    format!("missing field `{n}` in `{sname}` literal"),
+                    span,
+                    "E0253",
+                );
+            }
+        }
+        HirExpr {
+            ty: Type::Struct {
+                name: sname,
+                fields: decl_fields,
+            },
+            kind: HirExprKind::StructLit {
+                name: name.name.clone(),
+                fields: out_fields,
+            },
+            span,
+        }
+    }
+
+    fn check_cast(&mut self, inner: &Expr, ty: &TypeExpr, span: Span) -> HirExpr {
+        let to = self.resolve_type(ty);
+        let e = self.check_expr(inner, None);
+        if !e.ty.can_cast_to(&to) && !e.ty.is_error() {
+            self.err(
+                format!("cannot cast `{}` to `{to}`", e.ty),
+                span,
+                "E0255",
+            );
+        }
+        HirExpr {
+            kind: HirExprKind::Cast {
+                expr: Box::new(e),
+                to: to.clone(),
+            },
+            ty: to,
+            span,
+        }
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Expr], span: Span) -> HirExpr {
@@ -938,6 +1081,9 @@ impl<'a> Analyzer<'a> {
                 };
             }
         };
+        if name == "len" && self.is_builtin("len") {
+            return self.check_len_call(args, span);
+        }
         let fty = self
             .functions
             .iter()
@@ -1047,6 +1193,41 @@ impl<'a> Analyzer<'a> {
     }
 }
 
+fn fn_ty(params: Vec<Type>, ret: Type) -> Type {
+    Type::Fn {
+        params,
+        ret: Box::new(ret),
+    }
+}
+
+/// Value of a (possibly negated or parenthesised) integer literal.
+fn int_literal_value(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Literal(Literal::Int(v)) => Some(*v),
+        ExprKind::Group(inner) => int_literal_value(inner),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => int_literal_value(expr).map(i64::wrapping_neg),
+        _ => None,
+    }
+}
+
+/// An expression made only of integer literals, parentheses, unary minus or
+/// bitwise not, arithmetic and bitwise operators — it has no type of its own
+/// and adopts the other operand's.
+fn is_int_literal_expr(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Literal(Literal::Int(_)) => true,
+        ExprKind::Group(inner) => is_int_literal_expr(inner),
+        ExprKind::Unary { expr, .. } => is_int_literal_expr(expr),
+        ExprKind::Binary { op, lhs, rhs } if !op.is_cmp() && !op.is_logical() => {
+            is_int_literal_expr(lhs) && is_int_literal_expr(rhs)
+        }
+        _ => false,
+    }
+}
+
 fn block_always_returns(block: &HirBlock) -> bool {
     if block.tail.is_some() {
         return true;
@@ -1126,5 +1307,77 @@ mod tests {
         let src = "fn main() -> i32 { return missing; }";
         let (_, msg) = sema(src);
         assert!(msg.contains("cannot find value"));
+    }
+
+    #[test]
+    fn user_fn_shadows_builtin() {
+        // stdlib/math.ae defines abs/min/max/clamp itself; the user versions win
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/stdlib/math.ae")).unwrap();
+        let (hir, msg) = sema(&src);
+        let hir = hir.unwrap_or_else(|| panic!("{msg}"));
+        assert!(hir.functions.iter().any(|f| f.name == "abs" && !f.is_extern));
+        // a shadowing user fn may even change the signature
+        let src = r#"
+            fn abs(x: f64) -> f64 { if x < 0.0 { return 0.0 - x; } return x; }
+            fn len(a: i32) -> i32 { return a; }
+            fn main() -> i32 { let y = abs(1.5); return len(3); }
+        "#;
+        let (hir, msg) = sema(src);
+        assert!(hir.is_some(), "{msg}");
+        // without the user fn the built-in signature applies
+        let (hir, msg) = sema("fn main() -> i32 { return abs(1.5); }");
+        assert!(hir.is_none());
+        assert!(msg.contains("expected `i32`"), "{msg}");
+    }
+
+    #[test]
+    fn new_builtins_type_check() {
+        let src = r#"
+            fn main() -> i32 {
+                print_char('a');
+                let s = to_string(42) + i64_to_string(7 as i64) + f64_to_string(1.5) + char_to_string('x');
+                let a = abs(0 - 3) + min(1, 2) + max(1, 2) + clamp(5, 0, 3) + pow_i32(2, 10);
+                let f = sqrt(2.0) + floor(1.5) + ceil(1.5);
+                let n: i32 = len(s) + len([1, 2, 3]) + len([[1], [2]]);
+                return a + n;
+            }
+        "#;
+        let (hir, msg) = sema(src);
+        assert!(hir.is_some(), "{msg}");
+        let (_, msg) = sema("fn main() -> i32 { return len(3); }");
+        assert!(msg.contains("expected `string` or an array"), "{msg}");
+        let (_, msg) = sema("fn main() -> i32 { return len(); }");
+        assert!(msg.contains("takes 1 argument"), "{msg}");
+    }
+
+    #[test]
+    fn bitwise_operators_type_check() {
+        let ok = r#"
+            fn f(a: i32, b: i32) -> i32 { return (a & b) | (a ^ b) << 1 >> 1 ^ !a; }
+            fn g(a: i64) -> i64 { let m: i64 = !0; return a & m | 1 << 3 ^ (a >> 2); }
+            fn main() -> i32 {
+                let mut x = 0xF0;
+                x &= 0x3C; x |= 1; x ^= 2; x <<= 1; x >>= 1; x += 1; x -= 1; x *= 2; x /= 2; x %= 7;
+                let b = !true;
+                return f(x, 1) + g(1 as i64) as i32;
+            }
+        "#;
+        let (hir, msg) = sema(ok);
+        assert!(hir.is_some(), "{msg}");
+        for (src, code) in [
+            ("fn main() -> i32 { return 1 & true; }", "E0244"),
+            ("fn main() -> i32 { return 1.0 ^ 2.0; }", "E0244"),
+            ("fn main() -> i32 { let a: i64 = 1; return (a << 1) as i32; }", ""),
+            ("fn main() -> i32 { let a: i64 = 1; let b: i32 = 1; return (a << b) as i32; }", "E0244"),
+            ("fn main() -> i32 { return (!1.5) as i32; }", "E0245"),
+            ("fn main() -> i32 { let s = \"a\"; s += 1; return 0; }", "E0244"),
+        ] {
+            let (hir, msg) = sema(src);
+            if code.is_empty() {
+                assert!(hir.is_some(), "{src}: {msg}");
+            } else {
+                assert!(msg.contains(code), "{src}: {msg}");
+            }
+        }
     }
 }

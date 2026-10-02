@@ -125,6 +125,10 @@ pub enum Stmt {
     Continue {
         span: Span,
     },
+    /// Suspends a budgeted VM run (`Vm::run_budget`); a no-op otherwise.
+    Yield {
+        span: Span,
+    },
     Block {
         block: Block,
         span: Span,
@@ -143,6 +147,7 @@ impl Stmt {
             | Stmt::For { span, .. }
             | Stmt::Break { span }
             | Stmt::Continue { span }
+            | Stmt::Yield { span }
             | Stmt::Block { span, .. } => *span,
         }
     }
@@ -218,6 +223,14 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// Integer-only bitwise operators; `Shl`/`Shr` take a shift amount of
+    /// the left operand's type and mask it to the bit width (see
+    /// `docs/language.md`).
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl BinOp {
@@ -236,11 +249,23 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::And => "&&",
             BinOp::Or => "||",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
         }
     }
 
     pub fn is_logical(self) -> bool {
         matches!(self, BinOp::And | BinOp::Or)
+    }
+
+    pub fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+        )
     }
 
     pub fn is_cmp(self) -> bool {
@@ -463,6 +488,7 @@ fn dump_stmt(stmt: &Stmt, n: usize, out: &mut String) {
         }
         Stmt::Break { .. } => out.push_str(&format!("{}break;\n", indent(n))),
         Stmt::Continue { .. } => out.push_str(&format!("{}continue;\n", indent(n))),
+        Stmt::Yield { .. } => out.push_str(&format!("{}yield;\n", indent(n))),
         Stmt::Block { block, .. } => {
             out.push_str(&indent(n));
             dump_block(block, n, out);

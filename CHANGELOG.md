@@ -6,6 +6,109 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for the **source language and library API**. Bytecode and LLVM text are
 explicitly unstable.
 
+## [0.2.2] — 2026-10-02
+
+### Added
+- Compound assignment (`+= -= *= /= %= &= |= ^= <<= >>=`), bitwise `& | ^ << >>`
+  and integer `!`, literals `0x`/`0b`/`0o`/`1_000`, `\u{...}` escapes
+- Built-ins `print_char`, `to_string`, `i64_to_string`, `f64_to_string`,
+  `char_to_string`, `abs`, `min`, `max`, `clamp`, `sqrt`, `floor`, `ceil`,
+  `pow_i32`; `len` accepts arrays; a user `fn` shadows a built-in
+- `yield;` statement, `Vm::run_budget` / `Step` for per-frame execution
+  budgets, `Op::Yield`
+- Host-bindable `extern fn` (`host::Host::register`, `Vm::with_host_fn`)
+- CLI: `--include FILE` / `AETHER_INCLUDE` multi-file programs and
+  `stdlib/prelude.ae`, `--max-steps`, `--max-depth`, `run --backend llvm`,
+  `bench <file> [--n N]`, REPL that keeps definitions (`:items`, `:reset`)
+- Optimizer: fixpoint driver, `dead-fn` (unreachable functions removed),
+  `regalloc` register compaction (type-aware), bitwise identities
+- Golden tests for example IR/bytecode (`UPDATE_GOLDENS=1`), suites
+  `language_ops`, `cli_features`, `host_api`, `yield_stmt`
+- Fuzz kind `agg` (alias `aggregate`, part of `all`): well-typed programs with
+  structs, nested arrays, `i64`/`f64`/`char`/`string`, casts, `&&`/`||`
+  guards, nested assignment and tail-expression functions, checked by the
+  `-O0` / `-O2` differential oracle
+- `tests/regressions.rs`: one test per fixed bug, each program run at `-O0`
+  and `-O2` (both must agree and match the expected stdout/value);
+  rows R1–R22 and the `agg` fuzz row in `docs/test-matrix.md`
+- VM opcodes: generic `Cmp { op: Eq|Ne|Lt|Le|Gt|Ge }` for `i64`/`f64`/`bool`/
+  `char`/`string` comparisons not covered by the specialised ops, `RemI64`,
+  `NegI64`, `CastI64ToF64`, `CastF64ToI64`, `CastBoolToI64`, `CastCharToI32`,
+  `CastI32ToChar`
+- Diagnostics: E0221 (tail expression type differs from the return type),
+  E0238 (`for` bounds must be `i32`), E0263 (integer literal out of `i32`
+  range), E0264 (function name used as a value), E0300 (unsupported
+  operator/type combination in the assembler), E0101 for nesting deeper than
+  256 (expressions or blocks)
+- Constant folding of `i64` / `f64` / `char` / `string` / `bool` comparisons
+  and of `i64` `%`
+
+### Changed
+- The trailing expression (no `;`) of a function body is the return value and
+  must match the return type; a trailing expression in any nested block is
+  evaluated as a statement
+- Negative literals are single literals (`let y: i64 = -1;`, `-2147483648`
+  is a valid `i32`); the expected type propagates through unary minus,
+  parentheses and arithmetic/comparison operators, and a bare integer literal
+  adopts the type of the other operand (`1 + a` with `a: i64` is `i64`)
+- Struct literals may list fields in any order (evaluated in source order,
+  stored at the declared position)
+- Nested assignment (`a[i][j] = v`, `o.inner.x = v`) is supported
+- `&&` / `||` short-circuit: the right operand runs only when needed
+- Arrays and structs have value semantics: `let b = a;` copies (deep copy
+  in the VM)
+- Integer division wraps (`i32::MIN / -1 == i32::MIN`) in the VM and in the
+  optimizer
+- `len` counts Unicode scalar values (chars), consistent with indexing
+- Every comparison and cast that sema accepts now executes (`i64` all six
+  comparisons, `f64` all six, `bool` `==` `!=`, `char` all six, `string`
+  `==` `!=`; `i64` `%` and negation; all casts in `ty.rs::can_cast_to`)
+- VM registers are `u16` (up to 65535 per frame); the assembler reports a
+  compile error instead of truncating
+- `-O2` pass order: const-fold, algebraic, cf-simplify, inline, local-cse,
+  copy-prop, const-prop, cf-simplify, dce, const-fold, dce (cf-simplify now
+  runs before inline)
+- Inliner copies arguments into fresh registers and remaps every instruction
+  kind
+- Algebraic identities (`x-x`, `x*0`, `x==x`, `x+0`, `x*1`, `x/1`, `x*2`)
+  apply to `i32` and `i64` only
+- copy-prop no longer redirects the base of an element/field store and drops
+  aliases on both sides of a store
+- The CLI prints the stdout produced so far before `runtime error: ...`
+- LLVM emitter produces valid LLVM 18 IR (one `alloca` per IR register,
+  `load`/`store`, ready for `mem2reg`; accepted by `llvm-as` on every
+  example). Known differences from the VM: aggregates are stack-allocated and
+  copying an array/struct copies the pointer (aliasing), no bounds checks,
+  string concatenation is unsupported (aborts), `print_f64` uses `%g`
+- Fuzz: the junk, format and mutation properties also compile at `-O2`
+- Version 0.2.2 in `Cargo.toml`, `Cargo.lock`, README badge, `MANUAL.md`
+  (README said 0.2.0 and `MANUAL.md` said 0.2.0 while this file had 0.2.1)
+
+### Fixed
+Miscompilations:
+- Trailing expression of a function body was discarded
+- Struct literal with fields in non-declaration order stored them at the
+  wrong positions
+- Nested assignment (`a[i][j] = v`, `o.inner.x = v`) was lost
+- The `for` variable leaked out of the loop body scope
+- `&&` / `||` evaluated both operands
+- `-O2` copy-prop aliased array/struct copies (`let b = a;`)
+- `x-x`, `x*0`, `x==x` were folded for `f64`, wrong for NaN
+- More than 255 registers per function were silently truncated
+- Integer literals out of `i32` range silently wrapped
+- Missing opcodes (`i64` comparisons beyond `Eq`/`Lt`, `i64` `%`, several
+  casts) were emitted as `Nop`, so the result was `()`
+- `i64` negation was truncated to 32 bits
+- Calling an `extern fn` the VM does not implement behaved like `print`
+- The inliner never fired: lowering leaves a dead block after every `return`,
+  so no function looked like a single-block leaf
+
+Crashes and usability:
+- `i32::MIN / -1` panicked in the VM and in `-O2` constant folding
+- Deeply nested input overflowed the parser stack (now diagnosed, E0101)
+- Stdout produced before a runtime error was lost
+- `len` counted bytes instead of chars
+
 ## [0.2.1] — 2026-09-19
 
 ### Added

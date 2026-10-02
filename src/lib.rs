@@ -21,8 +21,11 @@ pub mod ty;
 pub mod vm;
 pub mod runtime;
 
-pub use driver::{compile_file, compile_source, CompileOptions, Compiled};
-pub use vm::{execute, Value, VmError};
+pub use driver::{
+    compile_file, compile_files, compile_source, compile_sources, run_compiled,
+    run_compiled_with, CompileOptions, Compiled, RunError,
+};
+pub use vm::{execute, Value, VmError, VmOptions};
 
 /// Compile and execute a source string on the Aether VM.
 pub fn run_source(name: &str, source: &str, opt_level: u8) -> Result<(Value, String, DiagnosticsView), String> {

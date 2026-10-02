@@ -141,6 +141,8 @@ pub enum Inst {
         dest: Reg,
         ty: Type,
     },
+    /// Suspends a budgeted VM run; never removed (it is an effect).
+    Yield,
     /// Marker used by DCE: instruction has no effect.
     Nop,
 }
@@ -158,13 +160,17 @@ impl Inst {
             | Inst::AllocArray { dest, .. }
             | Inst::AllocStruct { dest, .. } => Some(*dest),
             Inst::Call { dest, .. } => *dest,
-            Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Nop => None,
+            Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Yield | Inst::Nop => None,
         }
     }
 
     pub fn uses(&self) -> Vec<Reg> {
         match self {
-            Inst::LoadConst { .. } | Inst::AllocArray { .. } | Inst::AllocStruct { .. } | Inst::Nop => {
+            Inst::LoadConst { .. }
+            | Inst::AllocArray { .. }
+            | Inst::AllocStruct { .. }
+            | Inst::Yield
+            | Inst::Nop => {
                 Vec::new()
             }
             Inst::Move { src, .. } | Inst::Un { src, .. } | Inst::Cast { src, .. } => vec![*src],
@@ -183,7 +189,8 @@ impl Inst {
         match self {
             Inst::Call { .. }
             | Inst::IndexStore { .. }
-            | Inst::FieldStore { .. } => false,
+            | Inst::FieldStore { .. }
+            | Inst::Yield => false,
             Inst::Nop => true,
             _ => true,
         }
@@ -344,11 +351,13 @@ fn lower_fn(f: &HirFn) -> IrFunction {
         params.push((name.clone(), ty.clone(), r));
     }
     if let Some(body) = &f.body {
-        lower_block(&mut b, body, None, None);
-        // implicit return of unit / default
+        let tail = lower_block(&mut b, body, None, None);
+        // implicit return: the block's tail expression, unit, or a default
         match &b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term) {
             Some(Terminator::Unreachable) | Some(Terminator::Jump { .. }) | None => {
-                if f.return_ty == Type::Unit {
+                if let (Some(r), false) = (tail, f.return_ty == Type::Unit) {
+                    b.set_term(Terminator::Return { value: Some(r) });
+                } else if f.return_ty == Type::Unit {
                     b.set_term(Terminator::Return { value: None });
                 } else if f.return_ty == Type::I32 {
                     let r = b.alloc_reg();
@@ -377,20 +386,20 @@ fn lower_fn(f: &HirFn) -> IrFunction {
     }
 }
 
+/// Lowers a block and returns the register holding its tail expression, if any.
 fn lower_block(
     b: &mut Builder,
     block: &HirBlock,
     break_bb: Option<BlockId>,
     continue_bb: Option<BlockId>,
-) {
+) -> Option<Reg> {
     let mark = b.locals.len();
     for stmt in &block.stmts {
         lower_stmt(b, stmt, break_bb, continue_bb);
     }
-    if let Some(tail) = &block.tail {
-        let _ = lower_expr(b, tail);
-    }
+    let tail = block.tail.as_ref().map(|tail| lower_expr(b, tail));
     b.unbind_to(mark);
+    tail
 }
 
 fn lower_stmt(
@@ -495,6 +504,8 @@ fn lower_stmt(
             let s = lower_expr(b, start);
             b.emit(Inst::Move { dest: i, src: s });
             let limit = lower_expr(b, end);
+            // the loop variable is scoped to the loop
+            let mark = b.locals.len();
             b.bind(var.clone(), i, Type::I32);
             let header = b.new_block();
             let body_bb = b.new_block();
@@ -538,6 +549,7 @@ fn lower_stmt(
             });
             b.set_term(Terminator::Jump { target: header });
             b.switch(exit);
+            b.unbind_to(mark);
         }
         HirStmt::Break(_) => {
             if let Some(t) = break_bb {
@@ -546,6 +558,7 @@ fn lower_stmt(
                 b.switch(dead);
             }
         }
+        HirStmt::Yield(_) => b.emit(Inst::Yield),
         HirStmt::Continue(_) => {
             if let Some(t) = continue_bb {
                 b.set_term(Terminator::Jump { target: t });
@@ -553,10 +566,17 @@ fn lower_stmt(
                 b.switch(dead);
             }
         }
-        HirStmt::Block(block) => lower_block(b, block, break_bb, continue_bb),
+        HirStmt::Block(block) => {
+            lower_block(b, block, break_bb, continue_bb);
+        }
     }
 }
 
+/// Stores `src` into an lvalue.
+///
+/// Aggregates have value semantics: loading `a[i]` yields a copy, so a store
+/// into a nested place (`a[i][j] = v`, `o.p.x = v`) mutates that copy and then
+/// writes the copy back into its parent, recursively, until a local is reached.
 fn assign_to(b: &mut Builder, target: &HirExpr, src: Reg) {
     match &target.kind {
         HirExprKind::Local(name) => {
@@ -573,6 +593,7 @@ fn assign_to(b: &mut Builder, target: &HirExpr, src: Reg) {
                 value: src,
                 elem: target.ty.clone(),
             });
+            write_back(b, base, br);
         }
         HirExprKind::Field { base, index, .. } => {
             let br = lower_expr(b, base);
@@ -582,8 +603,17 @@ fn assign_to(b: &mut Builder, target: &HirExpr, src: Reg) {
                 value: src,
                 ty: target.ty.clone(),
             });
+            write_back(b, base, br);
         }
         _ => {}
+    }
+}
+
+/// After mutating the copy `reg` of a nested place, store it back into its parent.
+/// A local's register is mutated in place, so nothing is needed there.
+fn write_back(b: &mut Builder, base: &HirExpr, reg: Reg) {
+    if !matches!(base.kind, HirExprKind::Local(_)) {
+        assign_to(b, base, reg);
     }
 }
 
@@ -609,6 +639,30 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
                 });
                 dest
             }
+        }
+        HirExprKind::Binary { op, lhs, rhs } if op.is_logical() => {
+            // short-circuit: the right operand runs only when it decides the result
+            let dest = b.alloc_reg();
+            let l = lower_expr(b, lhs);
+            b.emit(Inst::Move { dest, src: l });
+            let rhs_bb = b.new_block();
+            let join = b.new_block();
+            let (then_bb, else_bb) = if *op == BinOp::And {
+                (rhs_bb, join)
+            } else {
+                (join, rhs_bb)
+            };
+            b.set_term(Terminator::Branch {
+                cond: l,
+                then_bb,
+                else_bb,
+            });
+            b.switch(rhs_bb);
+            let r = lower_expr(b, rhs);
+            b.emit(Inst::Move { dest, src: r });
+            b.set_term(Terminator::Jump { target: join });
+            b.switch(join);
+            dest
         }
         HirExprKind::Binary { op, lhs, rhs } => {
             let l = lower_expr(b, lhs);
@@ -711,11 +765,13 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
                 dest,
                 ty: expr.ty.clone(),
             });
-            for (i, (_, e)) in fields.iter().enumerate() {
+            // evaluate in source order, store at the declared field index
+            for (name, e) in fields {
                 let v = lower_expr(b, e);
+                let index = expr.ty.field(name).map(|(i, _)| i).unwrap_or(0);
                 b.emit(Inst::FieldStore {
                     base: dest,
-                    index: i,
+                    index,
                     value: v,
                     ty: e.ty.clone(),
                 });
@@ -802,6 +858,7 @@ impl fmt::Display for Inst {
                 write!(f, "  {dest} = alloc [{elem}; {len}]")
             }
             Inst::AllocStruct { dest, ty } => write!(f, "  {dest} = alloc {ty}"),
+            Inst::Yield => write!(f, "  yield"),
             Inst::Nop => write!(f, "  nop"),
         }
     }

@@ -43,6 +43,6 @@ fn ceil #19 arity=1 regs=1
 fn pow_i32 #20 arity=1 regs=1
 
 fn main #21 arity=0 regs=1
-  0000  jmp 1
-  0001  loadimm r0, I32(1)
+  0000  loadimm r0, I32(21)
+  0001  native #2 -> None [0]
   0002  ret r0

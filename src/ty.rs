@@ -181,9 +181,19 @@ pub fn binop_result(op: crate::ast::BinOp, lhs: &Type, rhs: &Type) -> Option<Typ
                 None
             }
         }
+        // Same-type integers only; the shift amount has the type of the
+        // shifted value and the result keeps that type.
+        BitAnd | BitOr | BitXor | Shl | Shr => {
+            if lhs == rhs && lhs.is_integer() {
+                Some(lhs.clone())
+            } else {
+                None
+            }
+        }
     }
 }
 
+/// `-` on numbers; `!` is logical not on `bool` and bitwise not on integers.
 pub fn unop_result(op: crate::ast::UnOp, inner: &Type) -> Option<Type> {
     use crate::ast::UnOp::*;
     if inner.is_error() {
@@ -192,6 +202,7 @@ pub fn unop_result(op: crate::ast::UnOp, inner: &Type) -> Option<Type> {
     match op {
         Neg if inner.is_numeric() => Some(inner.clone()),
         Not if *inner == Type::Bool => Some(Type::Bool),
+        Not if inner.is_integer() => Some(inner.clone()),
         _ => None,
     }
 }
@@ -208,6 +219,24 @@ mod tests {
             Some(Type::I32)
         );
         assert!(binop_result(BinOp::Add, &Type::I32, &Type::I64).is_none());
+    }
+
+    #[test]
+    fn bitwise_is_integer_only_and_same_typed() {
+        use crate::ast::UnOp;
+        for op in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Shl, BinOp::Shr] {
+            assert_eq!(binop_result(op, &Type::I32, &Type::I32), Some(Type::I32));
+            assert_eq!(binop_result(op, &Type::I64, &Type::I64), Some(Type::I64));
+            assert!(binop_result(op, &Type::I32, &Type::I64).is_none());
+            assert!(binop_result(op, &Type::I64, &Type::I32).is_none());
+            assert!(binop_result(op, &Type::Bool, &Type::Bool).is_none());
+            assert!(binop_result(op, &Type::F64, &Type::F64).is_none());
+        }
+        assert_eq!(unop_result(UnOp::Not, &Type::Bool), Some(Type::Bool));
+        assert_eq!(unop_result(UnOp::Not, &Type::I32), Some(Type::I32));
+        assert_eq!(unop_result(UnOp::Not, &Type::I64), Some(Type::I64));
+        assert!(unop_result(UnOp::Not, &Type::F64).is_none());
+        assert!(unop_result(UnOp::Not, &Type::String).is_none());
     }
 
     #[test]

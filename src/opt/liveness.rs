@@ -4,7 +4,7 @@
 //! might read the current definition. The analysis never claims a value
 //! is dead when a join could still see it.
 
-use crate::ir::{Inst, IrFunction, IrModule, Terminator};
+use crate::ir::{IrFunction, IrModule, Terminator};
 use std::collections::{HashMap, HashSet};
 
 pub type LiveSet = HashSet<u32>;
@@ -61,25 +61,15 @@ pub fn analyze_function(f: &IrFunction) -> Liveness {
                 _ => {}
             }
 
+            // live_before = (live_after − def) ∪ uses: kill the destination
+            // first so `r = call f(r)` keeps `r` live on entry.
             let mut live = out.clone();
             for inst in bb.insts.iter().rev() {
-                match inst {
-                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. } => {
-                        for u in inst.uses() {
-                            live.insert(u.0);
-                        }
-                        if let Some(d) = inst.dest_reg() {
-                            live.remove(&d.0);
-                        }
-                    }
-                    _ => {
-                        if let Some(d) = inst.dest_reg() {
-                            live.remove(&d.0);
-                        }
-                        for u in inst.uses() {
-                            live.insert(u.0);
-                        }
-                    }
+                if let Some(d) = inst.dest_reg() {
+                    live.remove(&d.0);
+                }
+                for u in inst.uses() {
+                    live.insert(u.0);
                 }
             }
 

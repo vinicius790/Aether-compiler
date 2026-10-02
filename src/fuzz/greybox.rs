@@ -131,7 +131,7 @@ fn pick(rng: &mut FuzzRng, corpus: &[Seed]) -> usize {
 }
 
 fn coverage_of(module: &IrModule) -> Result<HashSet<u64>, String> {
-    let bc = assemble(module);
+    let bc = assemble(module).map_err(|e| e.to_string())?;
     execute_with_coverage(&bc)
         .map(|(_, _, _, edges)| edges)
         .map_err(|e| e.to_string())

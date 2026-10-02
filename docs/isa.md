@@ -9,8 +9,8 @@ A ISA **não é estável** entre versões (ver CHANGELOG).
 - Um módulo tem um pool de funções, um pool de strings e um índice `entry`
   (`main`).
 - Cada função tem `arity`, `nregs` e um `Vec<Op>`.
-- Registradores são `u8` (no máximo 256 por frame). A IR de compilação
-  pode ter mais; o assembler falha se `reg_count > 255`.
+- Registradores são `u16` (até 65535 por frame). Se uma função precisar de
+  mais, o assembler devolve erro de compilação; nunca trunca.
 - Chamadas empilham um `Frame { func, pc, regs, ret_reg }`.
 - Não há heap partilhado entre frames para escalares. Arrays e structs
   vivem como `Value::Array` / `Value::Object` no registrador.
@@ -36,26 +36,26 @@ A ISA **não é estável** entre versões (ver CHANGELOG).
 `AddI32`, `SubI32`, `MulI32`, `DivI32`, `RemI32`, `NegI32`.
 
 Divisão e resto por zero são erro de runtime (`VmError::Runtime`).
-Overflow de i32 na VM usa wrapping nos folds do otimizador; a VM Rust
-usa operadores nativos (pode panic em debug em `i32` overflow — os
-testes evitam isso com valores pequenos). O fold do compilador usa
-`wrapping_*` de propósito.
+A aritmética inteira, incluindo a divisão, usa wrapping
+(`i32::MIN / -1 == i32::MIN`, sem pânico), na VM e no fold do compilador.
 
 ## Aritmética i64 e f64
 
-Conjunto paralelo. `NegF64` existe; não há `RemF64`.
+Conjunto paralelo, incluindo `RemI64` e `NegI64`. `NegF64` existe; não há
+`RemF64`.
 
 ## Comparações
 
-i32: `Eq Ne Lt Le Gt Ge`.  
-i64: `Eq Lt`.  
-f64: `Eq Lt`.  
-bool: `Eq`, mais `AndBool` `OrBool` `NotBool`.
+Opcodes especializados: i32 `Eq Ne Lt Le Gt Ge`; i64 `Eq Lt`; f64 `Eq Lt`;
+bool `Eq`, mais `AndBool` `OrBool` `NotBool`.
 
-O lowering da IR mapeia `BinOp` + `Type` para um destes opcodes.
-Comparações em falta para i64/f64 (Ge, etc.) devem ser expandidas no
-assembler como `Not` de `Lt` se algum dia forem emitidas — hoje o
-front-end só gera o que o assembler cobre para os exemplos oficiais.
+Todas as outras comparações que a sema aceita usam o opcode genérico
+`Cmp { op }`, com `op` em `Eq Ne Lt Le Gt Ge`, sobre i64, f64, bool, char e
+string (bool e string só `Eq`/`Ne`).
+
+O lowering da IR mapeia `BinOp` + `Type` para um destes opcodes. Uma
+combinação (operador, tipo) sem opcode é erro de compilação (E0300);
+nunca vira `Nop`.
 
 ## Controlo
 
@@ -75,7 +75,9 @@ Alvos de jump são índices no `Vec<Op>` da **mesma** função.
 ## Conversões
 
 `CastI32ToI64`, `CastI64ToI32` (trunca), `CastI32ToF64`, `CastF64ToI32`,
-`CastBoolToI32`.
+`CastBoolToI32`, `CastI64ToF64`, `CastF64ToI64`, `CastBoolToI64`,
+`CastCharToI32`, `CastI32ToChar`. Cobrem todos os pares de `can_cast_to`
+(`ty.rs`).
 
 ## Agregados
 
@@ -86,9 +88,22 @@ Alvos de jump são índices no `Vec<Op>` da **mesma** função.
 `LoadField` / `StoreField` — índice estático `u8`.  
 `Concat` — strings.
 
+Arrays e structs têm semântica de valor: copiá-los para outro registrador
+faz cópia profunda.
+
+## Bits, `yield`
+
+`BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`/`NotInt` operam em `i32` ou `i64`
+conforme o valor do registrador esquerdo; o deslocamento é mascarado
+(`& 31` / `& 63`) e `Shr` é aritmético. `Yield` suspende `Vm::run_budget`
+(devolve `Step::Yielded`) e é ignorado por `run()`. Natives 8..=20 estão
+listados em `src/runtime/mod.rs`; os índices de funções do utilizador no
+módulo começam depois da tabela de natives.
+
 ## Natives
 
-Ver `src/runtime/mod.rs`. Ids estáveis só dentro da mesma versão.
+Ver `src/runtime/mod.rs`. Ids estáveis só dentro da mesma versão. Chamar
+uma `extern fn` que a VM não implementa é erro de runtime.
 
 ## Perfil e digest
 

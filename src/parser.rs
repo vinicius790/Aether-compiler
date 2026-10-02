@@ -8,10 +8,18 @@ use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
 
+/// Maximum depth of syntactic nesting (parenthesised expressions, blocks,
+/// array types, `else if` chains) before the parser gives up on a subtree.
+/// The parser, sema and lowering all recurse once per level, so without a
+/// bound a few hundred thousand `(` would overflow the host stack.
+pub const MAX_NESTING: usize = 256;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diags: Diagnostics,
+    depth: usize,
+    depth_reported: bool,
 }
 
 impl Parser {
@@ -20,7 +28,36 @@ impl Parser {
             tokens,
             pos: 0,
             diags: Diagnostics::new(),
+            depth: 0,
+            depth_reported: false,
         }
+    }
+
+    /// Enter one level of nesting. Returns `None` (after reporting E0101
+    /// once) when `MAX_NESTING` would be exceeded, so callers can bail out
+    /// with `?` and let statement-level recovery skip the rest.
+    fn enter_nesting(&mut self) -> Option<()> {
+        if self.depth >= MAX_NESTING {
+            if !self.depth_reported {
+                self.depth_reported = true;
+                let span = self.peek_span();
+                self.diags.push(
+                    Diagnostic::error(
+                        format!("nesting too deep (limit {MAX_NESTING})"),
+                        span,
+                    )
+                    .with_code("E0101")
+                    .with_help("split the expression or block into smaller pieces"),
+                );
+            }
+            return None;
+        }
+        self.depth += 1;
+        Some(())
+    }
+
+    fn leave_nesting(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     pub fn parse_program(mut self) -> (Program, Diagnostics) {
@@ -172,50 +209,46 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Option<Block> {
+        self.enter_nesting()?;
+        let result = self.parse_block_inner();
+        self.leave_nesting();
+        result
+    }
+
+    // The recursive entry points (`parse_block_inner`, `parse_stmt`,
+    // `parse_prec_inner`, `parse_prefix`) are kept to small dispatchers that
+    // call out-of-line helpers. Debug builds reserve stack for every arm of
+    // a `match` up front, so one fat function per nesting level would eat a
+    // 2 MiB thread stack well before `MAX_NESTING`.
+
+    fn parse_block_inner(&mut self) -> Option<Block> {
         let start = self.expect(TokenKind::LBrace)?.span;
         let mut stmts = Vec::new();
         let mut tail = None;
         while !self.check(TokenKind::RBrace) && !self.is_eof() {
+            let before = self.pos;
             if self.is_stmt_start() {
                 if let Some(stmt) = self.parse_stmt() {
                     stmts.push(stmt);
                 } else {
                     self.synchronize_stmt();
                 }
-            } else {
-                // expression statement, assignment, or block tail
-                match self.parse_expr() {
-                    Some(expr) => {
-                        if self.eat(TokenKind::Eq) {
-                            let value = match self.parse_expr() {
-                                Some(v) => v,
-                                None => {
-                                    self.synchronize_stmt();
-                                    continue;
-                                }
-                            };
-                            self.expect(TokenKind::Semicolon);
-                            let span = expr.span.merge(self.prev_span());
-                            stmts.push(Stmt::Assign {
-                                target: expr,
-                                value,
-                                span,
-                            });
-                        } else if self.check(TokenKind::RBrace) {
-                            tail = Some(Box::new(expr));
-                            break;
-                        } else if self.eat(TokenKind::Semicolon) {
-                            let span = expr.span;
-                            stmts.push(Stmt::Expr { expr, span });
-                        } else {
-                            tail = Some(Box::new(expr));
-                            break;
-                        }
-                    }
-                    None => {
-                        self.synchronize_stmt();
-                    }
+            } else if self.parse_expr_stmt_or_tail(&mut stmts, &mut tail) {
+                break;
+            }
+            if self.pos == before {
+                // Recovery made no progress: `synchronize_stmt` stops in
+                // front of `fn` / `struct` without consuming them. An item
+                // keyword inside a block means the block is unterminated, so
+                // end it here and let the item parse at top level; anything
+                // else is skipped so the loop always advances.
+                if matches!(
+                    self.peek_kind(),
+                    TokenKind::Fn | TokenKind::Struct | TokenKind::Extern
+                ) {
+                    break;
                 }
+                self.bump();
             }
         }
         let end = match self.expect(TokenKind::RBrace) {
@@ -229,6 +262,55 @@ impl Parser {
         })
     }
 
+    /// Expression statement, assignment, or block tail. Returns `true` when
+    /// the block tail was consumed and the block body is complete.
+    fn parse_expr_stmt_or_tail(
+        &mut self,
+        stmts: &mut Vec<Stmt>,
+        tail: &mut Option<Box<Expr>>,
+    ) -> bool {
+        let expr = match self.parse_expr() {
+            Some(e) => e,
+            None => {
+                self.synchronize_stmt();
+                return false;
+            }
+        };
+        let compound = compound_assign_op(self.peek_kind());
+        if compound.is_some() || self.check(TokenKind::Eq) {
+            self.bump();
+            let value = match self.parse_expr() {
+                Some(v) => v,
+                None => {
+                    self.synchronize_stmt();
+                    return false;
+                }
+            };
+            self.expect(TokenKind::Semicolon);
+            let span = expr.span.merge(self.prev_span());
+            let value = match compound {
+                Some(op) => desugar_compound(&expr, op, value),
+                None => value,
+            };
+            stmts.push(Stmt::Assign {
+                target: expr,
+                value,
+                span,
+            });
+            false
+        } else if self.check(TokenKind::RBrace) {
+            *tail = Some(Box::new(expr));
+            true
+        } else if self.eat(TokenKind::Semicolon) {
+            let span = expr.span;
+            stmts.push(Stmt::Expr { expr, span });
+            false
+        } else {
+            *tail = Some(Box::new(expr));
+            true
+        }
+    }
+
     fn is_stmt_start(&self) -> bool {
         matches!(
             self.peek_kind(),
@@ -239,6 +321,7 @@ impl Parser {
                 | TokenKind::Return
                 | TokenKind::Break
                 | TokenKind::Continue
+                | TokenKind::Yield
                 | TokenKind::LBrace
         )
     }
@@ -249,55 +332,65 @@ impl Parser {
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
-            TokenKind::Return => {
-                let start = self.bump().span;
-                let value = if self.check(TokenKind::Semicolon) {
-                    None
-                } else {
-                    Some(self.parse_expr()?)
-                };
-                self.expect(TokenKind::Semicolon)?;
-                Some(Stmt::Return {
-                    value,
-                    span: start.merge(self.prev_span()),
-                })
-            }
-            TokenKind::Break => {
-                let start = self.bump().span;
-                self.expect(TokenKind::Semicolon)?;
-                Some(Stmt::Break {
-                    span: start.merge(self.prev_span()),
-                })
-            }
-            TokenKind::Continue => {
-                let start = self.bump().span;
-                self.expect(TokenKind::Semicolon)?;
-                Some(Stmt::Continue {
-                    span: start.merge(self.prev_span()),
-                })
-            }
-            TokenKind::LBrace => {
-                let block = self.parse_block()?;
-                let span = block.span;
-                Some(Stmt::Block { block, span })
-            }
-            _ => {
-                let expr = self.parse_expr()?;
-                if self.eat(TokenKind::Eq) {
-                    let value = self.parse_expr()?;
-                    self.expect(TokenKind::Semicolon)?;
-                    let span = expr.span.merge(self.prev_span());
-                    Some(Stmt::Assign {
-                        target: expr,
-                        value,
-                        span,
-                    })
-                } else {
-                    self.expect(TokenKind::Semicolon)?;
-                    let span = expr.span;
-                    Some(Stmt::Expr { expr, span })
-                }
-            }
+            TokenKind::Return => self.parse_return(),
+            TokenKind::Break | TokenKind::Continue | TokenKind::Yield => self.parse_jump(),
+            TokenKind::LBrace => self.parse_block_stmt(),
+            _ => self.parse_expr_stmt(),
+        }
+    }
+
+    fn parse_return(&mut self) -> Option<Stmt> {
+        let start = self.expect(TokenKind::Return)?.span;
+        let value = if self.check(TokenKind::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        self.expect(TokenKind::Semicolon)?;
+        Some(Stmt::Return {
+            value,
+            span: start.merge(self.prev_span()),
+        })
+    }
+
+    fn parse_jump(&mut self) -> Option<Stmt> {
+        let tok = self.bump();
+        self.expect(TokenKind::Semicolon)?;
+        let span = tok.span.merge(self.prev_span());
+        Some(match tok.kind {
+            TokenKind::Break => Stmt::Break { span },
+            TokenKind::Yield => Stmt::Yield { span },
+            _ => Stmt::Continue { span },
+        })
+    }
+
+    fn parse_block_stmt(&mut self) -> Option<Stmt> {
+        let block = self.parse_block()?;
+        let span = block.span;
+        Some(Stmt::Block { block, span })
+    }
+
+    fn parse_expr_stmt(&mut self) -> Option<Stmt> {
+        let expr = self.parse_expr()?;
+        let compound = compound_assign_op(self.peek_kind());
+        if compound.is_some() || self.check(TokenKind::Eq) {
+            self.bump();
+            let value = self.parse_expr()?;
+            self.expect(TokenKind::Semicolon)?;
+            let span = expr.span.merge(self.prev_span());
+            let value = match compound {
+                Some(op) => desugar_compound(&expr, op, value),
+                None => value,
+            };
+            Some(Stmt::Assign {
+                target: expr,
+                value,
+                span,
+            })
+        } else {
+            self.expect(TokenKind::Semicolon)?;
+            let span = expr.span;
+            Some(Stmt::Expr { expr, span })
         }
     }
 
@@ -326,6 +419,15 @@ impl Parser {
     }
 
     fn parse_if(&mut self) -> Option<Stmt> {
+        // `else if` chains recurse here without going through a block, so
+        // they count towards the nesting limit as well.
+        self.enter_nesting()?;
+        let result = self.parse_if_inner();
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_if_inner(&mut self) -> Option<Stmt> {
         let start = self.expect(TokenKind::If)?.span;
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
@@ -390,23 +492,25 @@ impl Parser {
     }
 
     fn parse_prec(&mut self, min_prec: u8) -> Option<Expr> {
-        let mut lhs = self.parse_prefix()?;
+        self.enter_nesting()?;
+        let result = self.parse_prec_inner(min_prec);
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_prec_inner(&mut self, min_prec: u8) -> Option<Expr> {
+        let lhs = self.parse_prefix()?;
+        self.parse_infix(lhs, min_prec)
+    }
+
+    fn parse_infix(&mut self, mut lhs: Expr, min_prec: u8) -> Option<Expr> {
         loop {
             let kind = self.peek_kind();
             if kind == TokenKind::As {
-                if min_prec > 9 {
+                if min_prec > PREC_CAST {
                     break;
                 }
-                self.bump();
-                let ty = self.parse_type()?;
-                let span = lhs.span.merge(ty.span);
-                lhs = Expr {
-                    kind: ExprKind::Cast {
-                        expr: Box::new(lhs),
-                        ty,
-                    },
-                    span,
-                };
+                lhs = self.parse_cast(lhs)?;
                 continue;
             }
             if let Some((prec, right_assoc, op)) = infix_info(kind) {
@@ -415,16 +519,7 @@ impl Parser {
                 }
                 self.bump();
                 let next_min = if right_assoc { prec } else { prec + 1 };
-                let rhs = self.parse_prec(next_min)?;
-                let span = lhs.span.merge(rhs.span);
-                lhs = Expr {
-                    kind: ExprKind::Binary {
-                        op,
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                    },
-                    span,
-                };
+                lhs = self.parse_binary_rhs(lhs, op, next_min)?;
                 continue;
             }
             break;
@@ -432,161 +527,184 @@ impl Parser {
         Some(lhs)
     }
 
+    fn parse_cast(&mut self, lhs: Expr) -> Option<Expr> {
+        self.expect(TokenKind::As)?;
+        let ty = self.parse_type()?;
+        let span = lhs.span.merge(ty.span);
+        Some(Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(lhs),
+                ty,
+            },
+            span,
+        })
+    }
+
+    fn parse_binary_rhs(&mut self, lhs: Expr, op: BinOp, next_min: u8) -> Option<Expr> {
+        let rhs = self.parse_prec(next_min)?;
+        let span = lhs.span.merge(rhs.span);
+        Some(Expr {
+            kind: ExprKind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            span,
+        })
+    }
+
     fn parse_prefix(&mut self) -> Option<Expr> {
         match self.peek_kind() {
+            TokenKind::Int
+            | TokenKind::Float
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::String
+            | TokenKind::Char => self.parse_literal(),
+            TokenKind::Ident => self.parse_ident_expr(),
+            TokenKind::LParen => self.parse_paren(),
+            TokenKind::LBracket => self.parse_array_lit(),
+            TokenKind::Minus => self.parse_unary(UnOp::Neg),
+            TokenKind::Bang => self.parse_unary(UnOp::Not),
+            _ => self.parse_prefix_error(),
+        }
+    }
+
+    fn parse_literal(&mut self) -> Option<Expr> {
+        let tok = self.bump();
+        let lit = match tok.kind {
             TokenKind::Int => {
-                let tok = self.bump();
                 let value = parse_int(&tok.lexeme);
                 if value.is_none() {
-                    self.error_at("invalid integer literal", tok.span, None);
+                    self.error_at(
+                        "invalid integer literal",
+                        tok.span,
+                        Some("integer literals must fit in 64 bits; forms: 255, 1_000, 0xFF, 0b1010, 0o17"),
+                    );
                 }
-                Some(Expr {
-                    kind: ExprKind::Literal(Literal::Int(value.unwrap_or(0))),
-                    span: tok.span,
-                })
+                Literal::Int(value.unwrap_or(0))
             }
-            TokenKind::Float => {
-                let tok = self.bump();
-                let value = tok.lexeme.parse::<f64>().unwrap_or(0.0);
-                Some(Expr {
-                    kind: ExprKind::Literal(Literal::Float(value)),
-                    span: tok.span,
-                })
-            }
-            TokenKind::True => {
-                let tok = self.bump();
-                Some(Expr {
-                    kind: ExprKind::Literal(Literal::Bool(true)),
-                    span: tok.span,
-                })
-            }
-            TokenKind::False => {
-                let tok = self.bump();
-                Some(Expr {
-                    kind: ExprKind::Literal(Literal::Bool(false)),
-                    span: tok.span,
-                })
-            }
+            TokenKind::Float => Literal::Float(parse_float(&tok.lexeme).unwrap_or(0.0)),
+            TokenKind::True => Literal::Bool(true),
+            TokenKind::False => Literal::Bool(false),
             TokenKind::String => {
-                let tok = self.bump();
-                let value = unescape_string(&tok.lexeme);
-                Some(Expr {
-                    kind: ExprKind::Literal(Literal::String(value)),
-                    span: tok.span,
-                })
-            }
-            TokenKind::Char => {
-                let tok = self.bump();
-                let value = unescape_char(&tok.lexeme);
-                Some(Expr {
-                    kind: ExprKind::Literal(Literal::Char(value)),
-                    span: tok.span,
-                })
-            }
-            TokenKind::Ident => {
-                let id = self.parse_ident()?;
-                // struct literal: Ident '{' field: expr, ... '}'
-                if self.check(TokenKind::LBrace) {
-                    // Ambiguous with block after `if cond`. We only parse a
-                    // struct literal when the next token after `{` looks like
-                    // `ident :`.
-                    if self.looks_like_struct_lit() {
-                        return self.finish_struct_lit(id);
-                    }
+                let (s, bad) = unescape_string(&tok.lexeme);
+                if bad {
+                    self.bad_unicode_escape(tok.span);
                 }
-                let expr = Expr {
-                    span: id.span,
-                    kind: ExprKind::Ident(id),
-                };
-                Some(self.parse_postfix(expr)?)
-            }
-            TokenKind::LParen => {
-                let start = self.bump().span;
-                if self.check(TokenKind::RParen) {
-                    let end = self.bump().span;
-                    return Some(Expr {
-                        kind: ExprKind::Literal(Literal::Unit),
-                        span: start.merge(end),
-                    });
-                }
-                let inner = self.parse_expr()?;
-                let end = self.expect(TokenKind::RParen)?.span;
-                let expr = Expr {
-                    kind: ExprKind::Group(Box::new(inner)),
-                    span: start.merge(end),
-                };
-                Some(self.parse_postfix(expr)?)
-            }
-            TokenKind::LBracket => {
-                let start = self.bump().span;
-                let mut elements = Vec::new();
-                if !self.check(TokenKind::RBracket) {
-                    loop {
-                        elements.push(self.parse_expr()?);
-                        if !self.eat(TokenKind::Comma) {
-                            break;
-                        }
-                        if self.check(TokenKind::RBracket) {
-                            break;
-                        }
-                    }
-                }
-                let end = self.expect(TokenKind::RBracket)?.span;
-                let expr = Expr {
-                    kind: ExprKind::Array { elements },
-                    span: start.merge(end),
-                };
-                Some(self.parse_postfix(expr)?)
-            }
-            TokenKind::Minus => {
-                let tok = self.bump();
-                let expr = self.parse_prec(12)?;
-                let span = tok.span.merge(expr.span);
-                Some(Expr {
-                    kind: ExprKind::Unary {
-                        op: UnOp::Neg,
-                        expr: Box::new(expr),
-                    },
-                    span,
-                })
-            }
-            TokenKind::Bang => {
-                let tok = self.bump();
-                let expr = self.parse_prec(12)?;
-                let span = tok.span.merge(expr.span);
-                Some(Expr {
-                    kind: ExprKind::Unary {
-                        op: UnOp::Not,
-                        expr: Box::new(expr),
-                    },
-                    span,
-                })
-            }
-            TokenKind::TyI32
-            | TokenKind::TyI64
-            | TokenKind::TyF64
-            | TokenKind::TyBool
-            | TokenKind::TyString
-            | TokenKind::TyUnit => {
-                // type names used as identifiers should not appear in expr
-                let tok = self.bump();
-                self.error_at(
-                    format!("type name `{}` is not a valid expression", tok.lexeme),
-                    tok.span,
-                    Some("use a variable or literal here"),
-                );
-                None
+                Literal::String(s)
             }
             _ => {
-                let tok = self.peek().clone();
-                self.error_at(
-                    format!("expected expression, found `{}`", tok.lexeme),
-                    tok.span,
-                    None,
-                );
-                None
+                let (c, bad) = unescape_char(&tok.lexeme);
+                if bad {
+                    self.bad_unicode_escape(tok.span);
+                }
+                Literal::Char(c)
+            }
+        };
+        Some(Expr {
+            kind: ExprKind::Literal(lit),
+            span: tok.span,
+        })
+    }
+
+    fn parse_ident_expr(&mut self) -> Option<Expr> {
+        let id = self.parse_ident()?;
+        // struct literal: Ident '{' field: expr, ... '}'
+        if self.check(TokenKind::LBrace) {
+            // Ambiguous with block after `if cond`. We only parse a
+            // struct literal when the next token after `{` looks like
+            // `ident :`.
+            if self.looks_like_struct_lit() {
+                return self.finish_struct_lit(id);
             }
         }
+        let expr = Expr {
+            span: id.span,
+            kind: ExprKind::Ident(id),
+        };
+        self.parse_postfix(expr)
+    }
+
+    fn parse_paren(&mut self) -> Option<Expr> {
+        let start = self.expect(TokenKind::LParen)?.span;
+        if self.check(TokenKind::RParen) {
+            let end = self.bump().span;
+            return Some(Expr {
+                kind: ExprKind::Literal(Literal::Unit),
+                span: start.merge(end),
+            });
+        }
+        let inner = self.parse_expr()?;
+        let end = self.expect(TokenKind::RParen)?.span;
+        let expr = Expr {
+            kind: ExprKind::Group(Box::new(inner)),
+            span: start.merge(end),
+        };
+        self.parse_postfix(expr)
+    }
+
+    fn parse_array_lit(&mut self) -> Option<Expr> {
+        let start = self.expect(TokenKind::LBracket)?.span;
+        let mut elements = Vec::new();
+        if !self.check(TokenKind::RBracket) {
+            loop {
+                elements.push(self.parse_expr()?);
+                if !self.eat(TokenKind::Comma) {
+                    break;
+                }
+                if self.check(TokenKind::RBracket) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(TokenKind::RBracket)?.span;
+        let expr = Expr {
+            kind: ExprKind::Array { elements },
+            span: start.merge(end),
+        };
+        self.parse_postfix(expr)
+    }
+
+    fn parse_unary(&mut self, op: UnOp) -> Option<Expr> {
+        let start = self.bump().span;
+        let expr = self.parse_prec(PREC_UNARY)?;
+        let span = start.merge(expr.span);
+        Some(Expr {
+            kind: ExprKind::Unary {
+                op,
+                expr: Box::new(expr),
+            },
+            span,
+        })
+    }
+
+    fn parse_prefix_error(&mut self) -> Option<Expr> {
+        let tok = self.peek().clone();
+        if matches!(
+            tok.kind,
+            TokenKind::TyI32
+                | TokenKind::TyI64
+                | TokenKind::TyF64
+                | TokenKind::TyBool
+                | TokenKind::TyString
+                | TokenKind::TyUnit
+        ) {
+            // type names used as identifiers should not appear in expr
+            self.bump();
+            self.error_at(
+                format!("type name `{}` is not a valid expression", tok.lexeme),
+                tok.span,
+                Some("use a variable or literal here"),
+            );
+        } else {
+            self.error_at(
+                format!("expected expression, found `{}`", tok.lexeme),
+                tok.span,
+                None,
+            );
+        }
+        None
     }
 
     fn parse_postfix(&mut self, mut expr: Expr) -> Option<Expr> {
@@ -677,6 +795,14 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Option<TypeExpr> {
+        // `[[[[...` array types recurse too.
+        self.enter_nesting()?;
+        let result = self.parse_type_inner();
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_type_inner(&mut self) -> Option<TypeExpr> {
         match self.peek_kind() {
             TokenKind::TyI32
             | TokenKind::TyI64
@@ -833,8 +959,25 @@ impl Parser {
         }
         self.diags.push(d);
     }
+
+    fn bad_unicode_escape(&mut self, span: Span) {
+        self.diags.push(
+            Diagnostic::error("invalid unicode escape", span)
+                .with_code("E0005")
+                .with_help("write `\\u{XXXX}` with 1 to 6 hex digits naming a Unicode scalar value"),
+        );
+    }
 }
 
+/// Binding power of `as`: above arithmetic, below prefix operators.
+const PREC_CAST: u8 = 11;
+/// Binding power of the prefix operators `-` and `!`.
+const PREC_UNARY: u8 = 12;
+
+/// Precedence table (`docs/language.md`), loosest first:
+/// `||` 1, `&&` 2, `== !=` 3, `< <= > >=` 4, `|` 5, `^` 6, `&` 7, `<< >>` 8,
+/// `+ -` 9, `* / %` 10, `as` 11, prefix 12. All infix operators are
+/// left-associative.
 fn infix_info(kind: TokenKind) -> Option<(u8, bool, BinOp)> {
     // precedence, right-associative, op
     match kind {
@@ -846,20 +989,74 @@ fn infix_info(kind: TokenKind) -> Option<(u8, bool, BinOp)> {
         TokenKind::LtEq => Some((4, false, BinOp::Le)),
         TokenKind::Gt => Some((4, false, BinOp::Gt)),
         TokenKind::GtEq => Some((4, false, BinOp::Ge)),
-        TokenKind::Plus => Some((5, false, BinOp::Add)),
-        TokenKind::Minus => Some((5, false, BinOp::Sub)),
-        TokenKind::Star => Some((6, false, BinOp::Mul)),
-        TokenKind::Slash => Some((6, false, BinOp::Div)),
-        TokenKind::Percent => Some((6, false, BinOp::Rem)),
+        TokenKind::Pipe => Some((5, false, BinOp::BitOr)),
+        TokenKind::Caret => Some((6, false, BinOp::BitXor)),
+        TokenKind::Amp => Some((7, false, BinOp::BitAnd)),
+        TokenKind::Shl => Some((8, false, BinOp::Shl)),
+        TokenKind::Shr => Some((8, false, BinOp::Shr)),
+        TokenKind::Plus => Some((9, false, BinOp::Add)),
+        TokenKind::Minus => Some((9, false, BinOp::Sub)),
+        TokenKind::Star => Some((10, false, BinOp::Mul)),
+        TokenKind::Slash => Some((10, false, BinOp::Div)),
+        TokenKind::Percent => Some((10, false, BinOp::Rem)),
         _ => None,
     }
 }
 
-fn parse_int(lexeme: &str) -> Option<i64> {
-    lexeme.parse::<i64>().ok()
+/// The binary operator behind a compound-assignment token (`+=` → `+`).
+fn compound_assign_op(kind: TokenKind) -> Option<BinOp> {
+    Some(match kind {
+        TokenKind::PlusEq => BinOp::Add,
+        TokenKind::MinusEq => BinOp::Sub,
+        TokenKind::StarEq => BinOp::Mul,
+        TokenKind::SlashEq => BinOp::Div,
+        TokenKind::PercentEq => BinOp::Rem,
+        TokenKind::AmpEq => BinOp::BitAnd,
+        TokenKind::PipeEq => BinOp::BitOr,
+        TokenKind::CaretEq => BinOp::BitXor,
+        TokenKind::ShlEq => BinOp::Shl,
+        TokenKind::ShrEq => BinOp::Shr,
+        _ => return None,
+    })
 }
 
-fn unescape_string(lexeme: &str) -> String {
+/// `target op= value` is sugar for `target = target op value`. The target
+/// is evaluated twice (once as a value, once as a place), so a call inside
+/// an index expression (`a[f()] += 1`) runs twice; documented in
+/// `docs/language.md`.
+fn desugar_compound(target: &Expr, op: BinOp, value: Expr) -> Expr {
+    let span = target.span.merge(value.span);
+    Expr {
+        kind: ExprKind::Binary {
+            op,
+            lhs: Box::new(target.clone()),
+            rhs: Box::new(value),
+        },
+        span,
+    }
+}
+
+/// Decimal, `0x`, `0b` or `0o` with optional `_` separators; the value must
+/// fit in `i64` (hex and friends denote values, not bit patterns, so
+/// `0xFFFF_FFFF_FFFF_FFFF` is rejected).
+fn parse_int(lexeme: &str) -> Option<i64> {
+    let digits: String = lexeme.chars().filter(|c| *c != '_').collect();
+    let (radix, body) = match digits.get(..2) {
+        Some("0x") => (16, &digits[2..]),
+        Some("0b") => (2, &digits[2..]),
+        Some("0o") => (8, &digits[2..]),
+        _ => (10, digits.as_str()),
+    };
+    i64::from_str_radix(body, radix).ok()
+}
+
+fn parse_float(lexeme: &str) -> Option<f64> {
+    let digits: String = lexeme.chars().filter(|c| *c != '_').collect();
+    digits.parse::<f64>().ok()
+}
+
+/// Returns the decoded string and whether an invalid `\u{...}` was seen.
+fn unescape_string(lexeme: &str) -> (String, bool) {
     let inner = if lexeme.len() >= 2 && lexeme.starts_with('"') && lexeme.ends_with('"') {
         &lexeme[1..lexeme.len() - 1]
     } else if lexeme.starts_with('"') {
@@ -870,18 +1067,24 @@ fn unescape_string(lexeme: &str) -> String {
     unescape(inner)
 }
 
-fn unescape_char(lexeme: &str) -> char {
+fn unescape_char(lexeme: &str) -> (char, bool) {
     let inner = if lexeme.len() >= 2 && lexeme.starts_with('\'') && lexeme.ends_with('\'') {
         &lexeme[1..lexeme.len() - 1]
     } else {
         lexeme
     };
-    unescape(inner).chars().next().unwrap_or('\0')
+    let (s, bad) = unescape(inner);
+    (s.chars().next().unwrap_or('\0'), bad)
 }
 
-fn unescape(s: &str) -> String {
+/// Escapes: `\n \t \r \0 \\ \" \'` and `\u{XXXX}` (1–6 hex digits naming a
+/// Unicode scalar value). A malformed `\u{...}` decodes to U+FFFD and sets
+/// the flag so the parser can report E0005 and carry on. Unknown escapes
+/// are kept verbatim.
+fn unescape(s: &str) -> (String, bool) {
     let mut out = String::new();
-    let mut chars = s.chars();
+    let mut bad = false;
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
@@ -892,6 +1095,31 @@ fn unescape(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
                 Some('\'') => out.push('\''),
+                Some('u') if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    let mut hex = String::new();
+                    let mut closed = false;
+                    while let Some(&h) = chars.peek() {
+                        chars.next();
+                        if h == '}' {
+                            closed = true;
+                            break;
+                        }
+                        hex.push(h);
+                    }
+                    let decoded = if closed && !hex.is_empty() && hex.len() <= 6 {
+                        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                    } else {
+                        None
+                    };
+                    match decoded {
+                        Some(ch) => out.push(ch),
+                        None => {
+                            bad = true;
+                            out.push('\u{FFFD}');
+                        }
+                    }
+                }
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
@@ -902,7 +1130,7 @@ fn unescape(s: &str) -> String {
             out.push(c);
         }
     }
-    out
+    (out, bad)
 }
 
 pub fn parse(tokens: Vec<Token>) -> (Program, Diagnostics) {
@@ -964,6 +1192,276 @@ mod tests {
         let src = "fn main( -> i32 { return 0; }";
         let (_, diags) = parse_src(src);
         assert!(diags.has_errors());
+    }
+
+    fn nested_parens(n: usize) -> String {
+        format!(
+            "fn main() -> i32 {{ let x = {}1{}; return x; }}",
+            "(".repeat(n),
+            ")".repeat(n)
+        )
+    }
+
+    fn render(diags: &Diagnostics) -> String {
+        diags.render(&crate::span::Session::new(), false)
+    }
+
+    #[test]
+    fn nesting_100_parens_is_fine() {
+        let (prog, diags) = parse_src(&nested_parens(100));
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn nesting_100k_parens_reports_e0101_once() {
+        let (_, diags) = parse_src(&nested_parens(100_000));
+        assert!(diags.has_errors());
+        let e0101 = diags.iter().filter(|d| d.code == Some("E0101")).count();
+        assert_eq!(e0101, 1, "{}", render(&diags));
+        let out = render(&diags);
+        assert!(out.contains("nesting too deep (limit 256)"), "{out}");
+    }
+
+    #[test]
+    fn nesting_100k_blocks_reports_e0101_once() {
+        let src = format!(
+            "fn main() -> i32 {{ {} return 0; {} }}",
+            "{".repeat(100_000),
+            "}".repeat(100_000)
+        );
+        let (_, diags) = parse_src(&src);
+        assert!(diags.has_errors());
+        let e0101 = diags.iter().filter(|d| d.code == Some("E0101")).count();
+        assert_eq!(e0101, 1, "{}", render(&diags));
+    }
+
+    #[test]
+    fn nesting_100k_else_if_and_array_types_do_not_crash() {
+        let mut src = String::from("fn main() -> i32 { ");
+        for _ in 0..100_000 {
+            src.push_str("if true { } else ");
+        }
+        src.push_str("{ } return 0; }");
+        let (_, diags) = parse_src(&src);
+        assert!(diags.iter().any(|d| d.code == Some("E0101")));
+
+        let src = format!(
+            "fn main() -> i32 {{ let a: {}i32{}; return 0; }}",
+            "[".repeat(100_000),
+            "; 1]".repeat(100_000)
+        );
+        let (_, diags) = parse_src(&src);
+        assert!(diags.iter().any(|d| d.code == Some("E0101")));
+    }
+
+    #[test]
+    fn nesting_near_limit_end_to_end() {
+        // The parser itself fits 256 levels in a 2 MiB test thread, but
+        // sema's `check_expr` frame is several KiB in debug builds and
+        // overflows 2 MiB somewhere between 128 and 256 `Group` levels, so
+        // the full pipeline runs on an explicit 32 MiB stack here (the CLI's
+        // main thread has 8 MiB and release frames are far smaller).
+        let handle = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let src = nested_parens(MAX_NESTING - 8);
+                let (v, _, _) = crate::run_source("deep.ae", &src, 0).expect("-O0");
+                assert_eq!(v, crate::vm::Value::I32(1));
+                let (v, _, _) = crate::run_source("deep.ae", &src, 2).expect("-O2");
+                assert_eq!(v, crate::vm::Value::I32(1));
+                let (prog, diags) = parse_src(&src);
+                assert!(!diags.has_errors());
+                let pretty = crate::pretty::pretty_program(&prog);
+                assert!(pretty.contains("fn main"));
+                let dumped = crate::ast::dump_program(&prog);
+                assert!(dumped.contains("main"));
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn unterminated_block_before_next_item_terminates() {
+        // `fn` inside a block used to make statement recovery spin forever
+        // (and allocate a diagnostic per spin). The block must end, the
+        // next item must still parse, and diagnostics must stay bounded.
+        let src = "fn h0(p0: i32) -> i32 {\n    return 8;\n\nfn main() -> i32 {\n    let mut acc = 0;\n    acc = h0(acc);\n   \u{fffd}return acc;\n}\n";
+        let (prog, diags) = parse_src(src);
+        assert!(diags.has_errors());
+        assert!(diags.error_count() < 16, "{}", render(&diags));
+        assert_eq!(prog.items.len(), 2, "{}", render(&diags));
+        for src in [
+            "fn main() -> i32 { struct S { x: i32 }",
+            "fn main() -> i32 { extern fn f();",
+            "fn main() -> i32 { let x = 1; } }",
+            "fn main() -> i32 { else else else }",
+        ] {
+            let (_, diags) = parse_src(src);
+            assert!(diags.error_count() < 16, "{src}: {}", render(&diags));
+        }
+    }
+
+    #[test]
+    fn nesting_limit_parses_on_default_test_stack() {
+        // Exactly at the limit the parser must neither crash nor report.
+        // The fn body block and the `let` initializer each take one level.
+        let (prog, diags) = parse_src(&nested_parens(MAX_NESTING - 2));
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        assert_eq!(prog.items.len(), 1);
+        let (_, diags) = parse_src(&nested_parens(MAX_NESTING - 1));
+        assert!(diags.iter().any(|d| d.code == Some("E0101")));
+    }
+
+    fn first_stmt(src: &str) -> Stmt {
+        let (prog, diags) = parse_src(src);
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        let Item::Fn(f) = &prog.items[0] else { panic!() };
+        f.body.as_ref().unwrap().stmts[0].clone()
+    }
+
+    fn return_expr(src: &str) -> Expr {
+        let Stmt::Return { value: Some(e), .. } = first_stmt(src) else { panic!() };
+        e
+    }
+
+    #[test]
+    fn compound_assignment_desugars_to_assign_with_binary() {
+        for (src, op) in [
+            ("fn main() -> i32 { x += 1; }", BinOp::Add),
+            ("fn main() -> i32 { x -= 1; }", BinOp::Sub),
+            ("fn main() -> i32 { x *= 1; }", BinOp::Mul),
+            ("fn main() -> i32 { x /= 1; }", BinOp::Div),
+            ("fn main() -> i32 { x %= 1; }", BinOp::Rem),
+            ("fn main() -> i32 { x &= 1; }", BinOp::BitAnd),
+            ("fn main() -> i32 { x |= 1; }", BinOp::BitOr),
+            ("fn main() -> i32 { x ^= 1; }", BinOp::BitXor),
+            ("fn main() -> i32 { x <<= 1; }", BinOp::Shl),
+            ("fn main() -> i32 { x >>= 1; }", BinOp::Shr),
+        ] {
+            let Stmt::Assign { target, value, .. } = first_stmt(src) else {
+                panic!("{src}")
+            };
+            assert!(matches!(target.kind, ExprKind::Ident(_)), "{src}");
+            let ExprKind::Binary { op: got, lhs, .. } = &value.kind else {
+                panic!("{src}")
+            };
+            assert_eq!(*got, op, "{src}");
+            assert_eq!(**lhs, target, "{src}");
+        }
+        // `a[i] += v` and `p.x -= v` keep the full place expression as lhs;
+        // the right operand binds the whole expression (`x += 1 + 2`).
+        let Stmt::Assign { target, value, .. } =
+            first_stmt("fn main() -> i32 { a[i] += 1 + 2; }")
+        else {
+            panic!()
+        };
+        assert!(matches!(target.kind, ExprKind::Index { .. }));
+        let ExprKind::Binary { op: BinOp::Add, lhs, rhs } = &value.kind else { panic!() };
+        assert_eq!(**lhs, target);
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+        let Stmt::Assign { target, .. } = first_stmt("fn main() -> i32 { p.x -= 2; }") else {
+            panic!()
+        };
+        assert!(matches!(target.kind, ExprKind::Field { .. }));
+        // also when the statement is the last thing in a block
+        let (prog, diags) = parse_src("fn main() -> i32 { let mut x = 1; x += 2; }");
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        let Item::Fn(f) = &prog.items[0] else { panic!() };
+        assert_eq!(f.body.as_ref().unwrap().stmts.len(), 2);
+    }
+
+    #[test]
+    fn bitwise_precedence_is_rust_like() {
+        // `|` 5 < `^` 6 < `&` 7 < `<< >>` 8 < `+ -` 9, all tighter than `==`.
+        let e = return_expr("fn main() -> i32 { return 1 | 2 & 3 == 3; }");
+        let ExprKind::Binary { op: BinOp::Eq, lhs, .. } = &e.kind else { panic!("{e:?}") };
+        let ExprKind::Binary { op: BinOp::BitOr, rhs, .. } = &lhs.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+
+        let e = return_expr("fn main() -> i32 { return a ^ b & c | d; }");
+        let ExprKind::Binary { op: BinOp::BitOr, lhs, .. } = &e.kind else { panic!("{e:?}") };
+        let ExprKind::Binary { op: BinOp::BitXor, rhs, .. } = &lhs.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+
+        // `1 << 2 + 3` is `1 << (2 + 3)`; `a & b << 1` is `a & (b << 1)`
+        let e = return_expr("fn main() -> i32 { return 1 << 2 + 3; }");
+        let ExprKind::Binary { op: BinOp::Shl, rhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+        let e = return_expr("fn main() -> i32 { return a & b << 1; }");
+        let ExprKind::Binary { op: BinOp::BitAnd, rhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::Shl, .. }));
+
+        // shifts are left-associative; `as` binds tighter than `<<`; `!` tighter than `as`
+        let e = return_expr("fn main() -> i32 { return a >> 1 >> 2; }");
+        let ExprKind::Binary { op: BinOp::Shr, lhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(lhs.kind, ExprKind::Binary { op: BinOp::Shr, .. }));
+        let e = return_expr("fn main() -> i32 { return a << b as i32; }");
+        let ExprKind::Binary { op: BinOp::Shl, rhs, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(rhs.kind, ExprKind::Cast { .. }));
+        let e = return_expr("fn main() -> i32 { return !a as i64; }");
+        let ExprKind::Cast { expr, .. } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(expr.kind, ExprKind::Unary { op: UnOp::Not, .. }));
+        // `&&`/`||` still loosest
+        let e = return_expr("fn main() -> i32 { return a & b && c | d; }");
+        let ExprKind::Binary { op: BinOp::And, lhs, rhs } = &e.kind else { panic!("{e:?}") };
+        assert!(matches!(lhs.kind, ExprKind::Binary { op: BinOp::BitAnd, .. }));
+        assert!(matches!(rhs.kind, ExprKind::Binary { op: BinOp::BitOr, .. }));
+    }
+
+    #[test]
+    fn integer_literal_forms_and_range() {
+        for (src, want) in [
+            ("0xFF", 255),
+            ("0xff", 255),
+            ("0b1010", 10),
+            ("0o17", 15),
+            ("1_000_000", 1_000_000),
+            ("0x7FFF_FFFF_FFFF_FFFF", i64::MAX),
+            ("0", 0),
+        ] {
+            let e = return_expr(&format!("fn main() -> i32 {{ return {src}; }}"));
+            assert_eq!(e.kind, ExprKind::Literal(Literal::Int(want)), "{src}");
+        }
+        let e = return_expr("fn main() -> f64 { return 1_000.000_5; }");
+        assert_eq!(e.kind, ExprKind::Literal(Literal::Float(1000.0005)));
+        for src in ["0x", "0b", "0o8", "0xFFFF_FFFF_FFFF_FFFF", "99999999999999999999"] {
+            let (_, diags) = parse_src(&format!("fn main() -> i32 {{ return {src}; }}"));
+            let out = render(&diags);
+            assert!(out.contains("invalid integer literal"), "{src}: {out}");
+        }
+    }
+
+    #[test]
+    fn unicode_escapes_in_char_and_string() {
+        let e = return_expr(r"fn main() -> i32 { return '\u{41}'; }");
+        assert_eq!(e.kind, ExprKind::Literal(Literal::Char('A')));
+        let e = return_expr(r#"fn main() -> i32 { return "a\u{1F600}b\u{0}"; }"#);
+        assert_eq!(
+            e.kind,
+            ExprKind::Literal(Literal::String("a\u{1F600}b\0".into()))
+        );
+        // invalid escapes: E0005, but the literal still parses (U+FFFD)
+        for src in [
+            r#"fn main() -> i32 { return "\u{}"; }"#,
+            r#"fn main() -> i32 { return "\u{110000}"; }"#,
+            r#"fn main() -> i32 { return "\u{D800}"; }"#,
+            r#"fn main() -> i32 { return "\u{1234567}"; }"#,
+            r#"fn main() -> i32 { return "\u{zz}"; }"#,
+            r#"fn main() -> i32 { return "\u{41"; }"#,
+        ] {
+            let (prog, diags) = parse_src(src);
+            assert_eq!(
+                diags.iter().filter(|d| d.code == Some("E0005")).count(),
+                1,
+                "{src}: {}",
+                render(&diags)
+            );
+            assert_eq!(prog.items.len(), 1, "{src}");
+        }
+        // `\u` without a brace is an unknown escape, kept verbatim as before
+        let e = return_expr(r#"fn main() -> i32 { return "\u41"; }"#);
+        assert_eq!(e.kind, ExprKind::Literal(Literal::String("\\u41".into())));
     }
 
     #[test]

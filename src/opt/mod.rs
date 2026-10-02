@@ -6,6 +6,7 @@
 
 pub mod inline;
 pub mod liveness;
+pub mod regalloc;
 
 use crate::ast::{BinOp, UnOp};
 use crate::ir::{ConstValue, Inst, IrFunction, IrModule, Reg, Terminator};
@@ -73,12 +74,15 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
         return (module, report);
     }
 
+    // cf-simplify runs before inline: lowering leaves a dead block after every
+    // `return`, and the inliner only accepts single-block leaves.
     let passes: Vec<(&str, fn(&mut IrModule))> = if level >= 2 {
         vec![
             ("const-fold", pass_const_fold),
             ("algebraic", pass_algebraic),
-            ("local-cse", pass_local_cse),
+            ("cf-simplify", pass_cf_simplify),
             ("inline", crate::opt::inline::pass_inline),
+            ("local-cse", pass_local_cse),
             ("copy-prop", pass_copy_prop),
             ("const-prop", pass_const_prop),
             ("cf-simplify", pass_cf_simplify),
@@ -94,65 +98,139 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
         ]
     };
 
-    for (name, pass) in passes {
+    // Run the sequence to a fixpoint: a later pass often exposes work for an
+    // earlier one (inlining feeds folding feeds DCE). Bounded so a pathological
+    // module cannot spin; in practice two or three rounds suffice.
+    const MAX_ROUNDS: usize = 4;
+    for round in 0..MAX_ROUNDS {
+        let round_before = count_insts(&module);
+        for (name, pass) in &passes {
+            let before = count_insts(&module);
+            pass(&mut module);
+            let after = count_insts(&module);
+            if round == 0 || before != after {
+                report.passes.push(PassStats {
+                    name: name.to_string(),
+                    insts_before: before,
+                    insts_after: after,
+                });
+            }
+        }
+        if level >= 2 {
+            let before = count_insts(&module);
+            pass_dead_functions(&mut module);
+            let after = count_insts(&module);
+            if round == 0 || before != after {
+                report.passes.push(PassStats {
+                    name: "dead-fn".to_string(),
+                    insts_before: before,
+                    insts_after: after,
+                });
+            }
+        }
+        if count_insts(&module) == round_before {
+            break;
+        }
+    }
+    if level >= 2 {
+        // Register compaction runs once, after the fixpoint: it only renumbers
+        // registers, so no earlier pass can benefit from it.
+        let regs_before = regalloc::reg_total(&module);
         let before = count_insts(&module);
-        pass(&mut module);
-        let after = count_insts(&module);
+        regalloc::pass_regalloc(&mut module);
         report.passes.push(PassStats {
-            name: name.to_string(),
+            name: format!("regalloc (regs {}→{})", regs_before, regalloc::reg_total(&module)),
             insts_before: before,
-            insts_after: after,
+            insts_after: count_insts(&module),
         });
     }
     report.insts_after = count_insts(&module);
     (module, report)
 }
 
-fn fold_bin(op: BinOp, ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option<ConstValue> {
+/// Removes functions that `main` can never reach (typically leaves that were
+/// inlined everywhere). Extern declarations are kept: they are bound by the host.
+pub fn pass_dead_functions(module: &mut IrModule) {
+    let mut live: HashSet<String> = HashSet::new();
+    let mut stack = vec!["main".to_string()];
+    while let Some(name) = stack.pop() {
+        if !live.insert(name.clone()) {
+            continue;
+        }
+        if let Some(f) = module.function(&name) {
+            for bb in &f.blocks {
+                for inst in &bb.insts {
+                    if let Inst::Call { func, .. } = inst {
+                        if !live.contains(func) {
+                            stack.push(func.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    module
+        .functions
+        .retain(|f| f.is_extern || live.contains(&f.name));
+}
+
+/// Compare two constants of the same type the way the VM would.
+fn fold_cmp<T: PartialOrd>(op: BinOp, a: T, b: T) -> Option<ConstValue> {
+    Some(ConstValue::Bool(match op {
+        BinOp::Eq => a == b,
+        BinOp::Ne => a != b,
+        BinOp::Lt => a < b,
+        BinOp::Le => a <= b,
+        BinOp::Gt => a > b,
+        BinOp::Ge => a >= b,
+        _ => return None,
+    }))
+}
+
+/// Integer arithmetic wraps, exactly like the VM (`i32::MIN / -1` included).
+/// Division by zero is left to the VM, which reports it at runtime.
+/// Shift amounts are masked to the bit width (`b & 31` for `i32`, `b & 63`
+/// for `i64`), so shifting by the width or by a negative amount never traps;
+/// `>>` is arithmetic (sign-filling). The VM must do the same.
+fn fold_bin(op: BinOp, _ty: &Type, lhs: &ConstValue, rhs: &ConstValue) -> Option<ConstValue> {
+    use ConstValue::*;
     match (op, lhs, rhs) {
-        (BinOp::Add, ConstValue::I32(a), ConstValue::I32(b)) => {
-            Some(ConstValue::I32(a.wrapping_add(*b)))
-        }
-        (BinOp::Sub, ConstValue::I32(a), ConstValue::I32(b)) => {
-            Some(ConstValue::I32(a.wrapping_sub(*b)))
-        }
-        (BinOp::Mul, ConstValue::I32(a), ConstValue::I32(b)) => {
-            Some(ConstValue::I32(a.wrapping_mul(*b)))
-        }
-        (BinOp::Div, ConstValue::I32(a), ConstValue::I32(b)) if *b != 0 => Some(ConstValue::I32(a / b)),
-        (BinOp::Rem, ConstValue::I32(a), ConstValue::I32(b)) if *b != 0 => Some(ConstValue::I32(a % b)),
-        (BinOp::Add, ConstValue::I64(a), ConstValue::I64(b)) => {
-            Some(ConstValue::I64(a.wrapping_add(*b)))
-        }
-        (BinOp::Sub, ConstValue::I64(a), ConstValue::I64(b)) => {
-            Some(ConstValue::I64(a.wrapping_sub(*b)))
-        }
-        (BinOp::Mul, ConstValue::I64(a), ConstValue::I64(b)) => {
-            Some(ConstValue::I64(a.wrapping_mul(*b)))
-        }
-        (BinOp::Div, ConstValue::I64(a), ConstValue::I64(b)) if *b != 0 => Some(ConstValue::I64(a / b)),
-        (BinOp::Add, ConstValue::F64(a), ConstValue::F64(b)) => Some(ConstValue::F64(a + b)),
-        (BinOp::Sub, ConstValue::F64(a), ConstValue::F64(b)) => Some(ConstValue::F64(a - b)),
-        (BinOp::Mul, ConstValue::F64(a), ConstValue::F64(b)) => Some(ConstValue::F64(a * b)),
-        (BinOp::Div, ConstValue::F64(a), ConstValue::F64(b)) if *b != 0.0 => {
-            Some(ConstValue::F64(a / b))
-        }
-        (BinOp::Eq, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a == b)),
-        (BinOp::Ne, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a != b)),
-        (BinOp::Lt, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a < b)),
-        (BinOp::Le, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a <= b)),
-        (BinOp::Gt, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a > b)),
-        (BinOp::Ge, ConstValue::I32(a), ConstValue::I32(b)) => Some(ConstValue::Bool(a >= b)),
-        (BinOp::Eq, ConstValue::Bool(a), ConstValue::Bool(b)) => Some(ConstValue::Bool(a == b)),
-        (BinOp::And, ConstValue::Bool(a), ConstValue::Bool(b)) => Some(ConstValue::Bool(*a && *b)),
-        (BinOp::Or, ConstValue::Bool(a), ConstValue::Bool(b)) => Some(ConstValue::Bool(*a || *b)),
-        (BinOp::Add, ConstValue::String(a), ConstValue::String(b)) => {
-            Some(ConstValue::String(format!("{a}{b}")))
-        }
-        _ => {
-            let _ = ty;
-            None
-        }
+        (BinOp::Add, I32(a), I32(b)) => Some(I32(a.wrapping_add(*b))),
+        (BinOp::Sub, I32(a), I32(b)) => Some(I32(a.wrapping_sub(*b))),
+        (BinOp::Mul, I32(a), I32(b)) => Some(I32(a.wrapping_mul(*b))),
+        (BinOp::Div, I32(a), I32(b)) if *b != 0 => Some(I32(a.wrapping_div(*b))),
+        (BinOp::Rem, I32(a), I32(b)) if *b != 0 => Some(I32(a.wrapping_rem(*b))),
+        (BinOp::BitAnd, I32(a), I32(b)) => Some(I32(a & b)),
+        (BinOp::BitOr, I32(a), I32(b)) => Some(I32(a | b)),
+        (BinOp::BitXor, I32(a), I32(b)) => Some(I32(a ^ b)),
+        (BinOp::Shl, I32(a), I32(b)) => Some(I32(a.wrapping_shl((*b & 31) as u32))),
+        (BinOp::Shr, I32(a), I32(b)) => Some(I32(a.wrapping_shr((*b & 31) as u32))),
+        (BinOp::Add, I64(a), I64(b)) => Some(I64(a.wrapping_add(*b))),
+        (BinOp::Sub, I64(a), I64(b)) => Some(I64(a.wrapping_sub(*b))),
+        (BinOp::Mul, I64(a), I64(b)) => Some(I64(a.wrapping_mul(*b))),
+        (BinOp::Div, I64(a), I64(b)) if *b != 0 => Some(I64(a.wrapping_div(*b))),
+        (BinOp::Rem, I64(a), I64(b)) if *b != 0 => Some(I64(a.wrapping_rem(*b))),
+        (BinOp::BitAnd, I64(a), I64(b)) => Some(I64(a & b)),
+        (BinOp::BitOr, I64(a), I64(b)) => Some(I64(a | b)),
+        (BinOp::BitXor, I64(a), I64(b)) => Some(I64(a ^ b)),
+        (BinOp::Shl, I64(a), I64(b)) => Some(I64(a.wrapping_shl((*b & 63) as u32))),
+        (BinOp::Shr, I64(a), I64(b)) => Some(I64(a.wrapping_shr((*b & 63) as u32))),
+        (BinOp::Add, F64(a), F64(b)) => Some(F64(a + b)),
+        (BinOp::Sub, F64(a), F64(b)) => Some(F64(a - b)),
+        (BinOp::Mul, F64(a), F64(b)) => Some(F64(a * b)),
+        (BinOp::Div, F64(a), F64(b)) => Some(F64(a / b)),
+        (BinOp::And, Bool(a), Bool(b)) => Some(Bool(*a && *b)),
+        (BinOp::Or, Bool(a), Bool(b)) => Some(Bool(*a || *b)),
+        (BinOp::Add, String(a), String(b)) => Some(String(format!("{a}{b}"))),
+        (_, I32(a), I32(b)) => fold_cmp(op, a, b),
+        (_, I64(a), I64(b)) => fold_cmp(op, a, b),
+        (_, F64(a), F64(b)) => fold_cmp(op, a, b),
+        (_, Char(a), Char(b)) => fold_cmp(op, a, b),
+        (BinOp::Eq, Bool(a), Bool(b)) => Some(Bool(a == b)),
+        (BinOp::Ne, Bool(a), Bool(b)) => Some(Bool(a != b)),
+        (BinOp::Eq, String(a), String(b)) => Some(Bool(a == b)),
+        (BinOp::Ne, String(a), String(b)) => Some(Bool(a != b)),
+        _ => None,
     }
 }
 
@@ -162,6 +240,9 @@ fn fold_un(op: UnOp, src: &ConstValue) -> Option<ConstValue> {
         (UnOp::Neg, ConstValue::I64(v)) => Some(ConstValue::I64(v.wrapping_neg())),
         (UnOp::Neg, ConstValue::F64(v)) => Some(ConstValue::F64(-v)),
         (UnOp::Not, ConstValue::Bool(v)) => Some(ConstValue::Bool(!v)),
+        // `!` on integers is bitwise not
+        (UnOp::Not, ConstValue::I32(v)) => Some(ConstValue::I32(!v)),
+        (UnOp::Not, ConstValue::I64(v)) => Some(ConstValue::I64(!v)),
         _ => None,
     }
 }
@@ -268,48 +349,83 @@ pub fn pass_algebraic(module: &mut IrModule) {
                 {
                     let lconst = consts.get(&lhs.0);
                     let rconst = consts.get(&rhs.0);
-                    // x + 0 / x * 1 / x * 0 / x - 0
+                    // Integer identities only: for f64 `x - x`, `x * 0` and
+                    // `x == x` are not constants when `x` is NaN or infinite.
+                    let is_int = ty.is_integer();
+                    let same = lhs.0 == rhs.0;
+                    let zero = int_const(&ty, 0);
                     let rewritten = match (op, lconst, rconst) {
                         // Opaque identities: same register, no const required.
-                        (BinOp::Sub, _, _) if lhs.0 == rhs.0 => Some(Inst::LoadConst {
-                            dest,
-                            value: ConstValue::I32(0),
-                        }),
-                        (BinOp::Eq, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
+                        (BinOp::Sub, _, _) if same && is_int => {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::Eq, _, _) | (BinOp::Le, _, _) | (BinOp::Ge, _, _)
+                            if same && is_int =>
+                        {
                             Some(Inst::LoadConst {
                                 dest,
                                 value: ConstValue::Bool(true),
                             })
                         }
-                        (BinOp::Ne, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
+                        (BinOp::Ne, _, _) | (BinOp::Lt, _, _) | (BinOp::Gt, _, _)
+                            if same && is_int =>
+                        {
                             Some(Inst::LoadConst {
                                 dest,
                                 value: ConstValue::Bool(false),
                             })
                         }
-                        (BinOp::Lt, _, _) | (BinOp::Gt, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
-                            Some(Inst::LoadConst {
-                                dest,
-                                value: ConstValue::Bool(false),
-                            })
+                        // x ^ x → 0; x & x → x; x | x → x
+                        (BinOp::BitXor, _, _) if same && is_int => {
+                            Some(Inst::LoadConst { dest, value: zero })
                         }
-                        (BinOp::Le, _, _) | (BinOp::Ge, _, _) if lhs.0 == rhs.0 && ty == Type::I32 => {
-                            Some(Inst::LoadConst {
-                                dest,
-                                value: ConstValue::Bool(true),
-                            })
+                        (BinOp::BitAnd, _, _) | (BinOp::BitOr, _, _) if same && is_int => {
+                            Some(Inst::Move { dest, src: lhs })
                         }
-                        (BinOp::Add, _, Some(ConstValue::I32(0))) => Some(Inst::Move { dest, src: lhs }),
-                        (BinOp::Add, Some(ConstValue::I32(0)), _) => Some(Inst::Move { dest, src: rhs }),
-                        (BinOp::Sub, _, Some(ConstValue::I32(0))) => Some(Inst::Move { dest, src: lhs }),
-                        (BinOp::Mul, _, Some(ConstValue::I32(1))) => Some(Inst::Move { dest, src: lhs }),
-                        (BinOp::Mul, Some(ConstValue::I32(1)), _) => Some(Inst::Move { dest, src: rhs }),
-                        (BinOp::Mul, _, Some(ConstValue::I32(0)))
-                        | (BinOp::Mul, Some(ConstValue::I32(0)), _) => Some(Inst::LoadConst {
-                            dest,
-                            value: ConstValue::I32(0),
-                        }),
-                        (BinOp::Div, _, Some(ConstValue::I32(1))) => Some(Inst::Move { dest, src: lhs }),
+                        // x & 0 → 0; x | 0 → x; x ^ 0 → x; x << 0 → x; x >> 0 → x
+                        (BinOp::BitAnd, _, Some(c)) | (BinOp::BitAnd, Some(c), _)
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::BitOr, _, Some(c)) | (BinOp::BitXor, _, Some(c))
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::BitOr, Some(c), _) | (BinOp::BitXor, Some(c), _)
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::Move { dest, src: rhs })
+                        }
+                        (BinOp::Shl, _, Some(c)) | (BinOp::Shr, _, Some(c))
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::Add, _, Some(c)) if is_int && is_int_const(c, 0) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::Add, Some(c), _) if is_int && is_int_const(c, 0) => {
+                            Some(Inst::Move { dest, src: rhs })
+                        }
+                        (BinOp::Sub, _, Some(c)) if is_int && is_int_const(c, 0) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::Mul, _, Some(c)) if is_int && is_int_const(c, 1) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
+                        (BinOp::Mul, Some(c), _) if is_int && is_int_const(c, 1) => {
+                            Some(Inst::Move { dest, src: rhs })
+                        }
+                        (BinOp::Mul, _, Some(c)) | (BinOp::Mul, Some(c), _)
+                            if is_int && is_int_const(c, 0) =>
+                        {
+                            Some(Inst::LoadConst { dest, value: zero })
+                        }
+                        (BinOp::Div, _, Some(c)) if is_int && is_int_const(c, 1) => {
+                            Some(Inst::Move { dest, src: lhs })
+                        }
                         (BinOp::And, _, Some(ConstValue::Bool(true))) => Some(Inst::Move { dest, src: lhs }),
                         (BinOp::And, Some(ConstValue::Bool(true)), _) => Some(Inst::Move { dest, src: rhs }),
                         (BinOp::And, _, Some(ConstValue::Bool(false)))
@@ -324,7 +440,7 @@ pub fn pass_algebraic(module: &mut IrModule) {
                             dest,
                             value: ConstValue::Bool(true),
                         }),
-                        (BinOp::Mul, _, Some(ConstValue::I32(2))) if ty == Type::I32 => {
+                        (BinOp::Mul, _, Some(c)) if is_int && is_int_const(c, 2) => {
                             Some(Inst::Bin {
                                 dest,
                                 op: BinOp::Add,
@@ -348,6 +464,22 @@ pub fn pass_algebraic(module: &mut IrModule) {
                 }
             }
         }
+    }
+}
+
+fn int_const(ty: &Type, v: i64) -> ConstValue {
+    if *ty == Type::I64 {
+        ConstValue::I64(v)
+    } else {
+        ConstValue::I32(v as i32)
+    }
+}
+
+fn is_int_const(c: &ConstValue, v: i64) -> bool {
+    match c {
+        ConstValue::I32(x) => i64::from(*x) == v,
+        ConstValue::I64(x) => *x == v,
+        _ => false,
     }
 }
 
@@ -387,13 +519,23 @@ pub fn pass_local_cse(module: &mut IrModule) {
     }
 }
 
+/// Replaces uses of a `Move` destination by its source within a block.
+///
+/// Aggregates have value semantics (`Move` copies the array/struct), so a
+/// store through a register must neither be redirected to the register it
+/// was copied from, nor leave aliases alive on either side of the copy.
 pub fn pass_copy_prop(module: &mut IrModule) {
     for f in &mut module.functions {
         for bb in &mut f.blocks {
-        let mut alias: HashMap<u32, u32> = HashMap::new();
+            let mut alias: HashMap<u32, u32> = HashMap::new();
             for inst in &mut bb.insts {
                 // resolve uses
                 rewrite_uses(inst, &alias);
+                if let Inst::IndexStore { base, .. } | Inst::FieldStore { base, .. } = inst {
+                    let b = base.0;
+                    alias.retain(|k, v| *k != b && *v != b);
+                    continue;
+                }
                 if let Inst::Move { dest, src } = inst {
                     if dest.0 != src.0 {
                         alias.retain(|_, v| *v != dest.0);
@@ -447,18 +589,13 @@ fn rewrite_uses(inst: &mut Inst, alias: &HashMap<u32, u32>) {
             map(base);
             map(index);
         }
-        Inst::IndexStore {
-            base, index, value, ..
-        } => {
-            map(base);
+        // the base of a store is mutated in place: never redirect it
+        Inst::IndexStore { index, value, .. } => {
             map(index);
             map(value);
         }
         Inst::FieldLoad { base, .. } => map(base),
-        Inst::FieldStore { base, value, .. } => {
-            map(base);
-            map(value);
-        }
+        Inst::FieldStore { value, .. } => map(value),
         _ => {}
     }
 }
@@ -544,7 +681,7 @@ pub fn pass_dce(module: &mut IrModule) {
                 let inst = &bb.insts[i];
                 let effect = matches!(
                     inst,
-                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. }
+                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Yield
                 );
                 let dest_live = inst
                     .dest_reg()
@@ -591,7 +728,7 @@ mod tests {
     fn folds_and_false() {
         let ir = compile_ir("fn main() -> i32 { if false && true { return 1; } return 0; }");
         let (opt, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(0));
     }
@@ -603,6 +740,75 @@ mod tests {
         let text = dump_ir(&opt);
         assert!(text.contains("const 3_i32"), "{text}\n{}", report.summary());
         assert!(!text.contains("add.i32"), "{text}");
+    }
+
+    #[test]
+    fn folds_bitwise_and_shift_constants() {
+        for (expr, want) in [
+            ("0xFF & 0b1010", "10_i32"),
+            ("0xF0 | 0x0F", "255_i32"),
+            ("0xFF ^ 0x0F", "240_i32"),
+            ("1 << 4", "16_i32"),
+            ("-16 >> 2", "-4_i32"),
+            ("!0", "-1_i32"),
+            ("1 << 32", "1_i32"),  // amount masked to 5 bits
+            ("1 << -1", "-2147483648_i32"),  // -1 & 31 == 31
+            ("1 << 31", "-2147483648_i32"),
+            ("(0 - 1) >> 31", "-1_i32"),
+        ] {
+            let ir = compile_ir(&format!("fn main() -> i32 {{ return {expr}; }}"));
+            let (opt, _) = optimize(ir, 2);
+            let text = dump_ir(&opt);
+            assert!(text.contains(&format!("const {want}")), "{expr}:\n{text}");
+        }
+        for (expr, want) in [
+            ("1 << 40", "1099511627776_i64"),
+            ("1 << 64", "1_i64"),
+            ("!0", "-1_i64"),
+            ("0x7FFF_FFFF_FFFF_FFFF & 0xFF", "255_i64"),
+        ] {
+            let ir = compile_ir(&format!(
+                "fn main() -> i32 {{ let x: i64 = {expr}; print_i64(x); return 0; }}"
+            ));
+            let (opt, _) = optimize(ir, 2);
+            let text = dump_ir(&opt);
+            assert!(text.contains(&format!("const {want}")), "{expr}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn algebraic_bitwise_identities() {
+        // `x` comes from an extern call, so it is neither constant nor
+        // inlinable: the Bin must disappear through the identity alone.
+        for (body, op_text) in [
+            ("x & 0", "&.i32"),
+            ("0 & x", "&.i32"),
+            ("x | 0", "|.i32"),
+            ("0 | x", "|.i32"),
+            ("x ^ 0", "^.i32"),
+            ("x ^ x", "^.i32"),
+            ("x & x", "&.i32"),
+            ("x | x", "|.i32"),
+            ("x << 0", "<<.i32"),
+            ("x >> 0", ">>.i32"),
+        ] {
+            let ir = compile_ir(&format!(
+                "extern fn opaque() -> i32;\nfn main() -> i32 {{ let x = opaque(); return {body}; }}"
+            ));
+            let (opt, _) = optimize(ir, 2);
+            let text = dump_ir(&opt);
+            assert!(!text.contains(op_text), "{body}:\n{text}");
+        }
+        // not an identity: `x & 1`, `x ^ 1`, `x << 1` stay
+        let ir = compile_ir(
+            "extern fn opaque() -> i32;\nfn main() -> i32 { let x = opaque(); return (x & 1) + (x ^ 1) + (x << 1); }",
+        );
+        let (opt, _) = optimize(ir, 2);
+        let text = dump_ir(&opt);
+        assert!(
+            text.contains("&.i32") && text.contains("^.i32") && text.contains("<<.i32"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -626,7 +832,7 @@ mod tests {
         "#;
         let ir = compile_ir(src);
         let (opt, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(8));
     }
@@ -647,7 +853,7 @@ mod tests {
             !text.contains("br %"),
             "opaque (x-x)==0 should become a jump\n{text}"
         );
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(1));
     }
@@ -663,9 +869,41 @@ mod tests {
         "#;
         let ir = compile_ir(src);
         let (opt, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opt);
+        let bc = crate::backend::assemble(&opt).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(2));
+    }
+
+    #[test]
+    fn inlined_leaf_is_removed_and_fixpoint_folds_through() {
+        let src = r#"
+            fn add1(x: i32) -> i32 { return x + 1; }
+            fn twice(x: i32) -> i32 { return add1(add1(x)); }
+            fn main() -> i32 { return twice(40); }
+        "#;
+        let ir = compile_ir(src);
+        let (opt, report) = optimize(ir, 2);
+        let text = dump_ir(&opt);
+        assert!(!text.contains("fn add1"), "add1 should be dead after inlining\n{text}");
+        assert!(!text.contains("fn twice"), "twice should be dead after inlining\n{text}");
+        assert!(
+            text.contains("const 42_i32"),
+            "nested inlining should fold to 42\n{text}\n{}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn keeps_functions_main_reaches() {
+        let src = r#"
+            fn loud(n: i32) -> i32 { print_i32(n); return n; }
+            fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+            fn main() -> i32 { return loud(fib(5)); }
+        "#;
+        let ir = compile_ir(src);
+        let (opt, _) = optimize(ir, 2);
+        assert!(opt.function("fib").is_some());
+        assert!(opt.function("loud").is_some() || dump_ir(&opt).contains("print_i32"));
     }
 
     #[test]
@@ -682,7 +920,7 @@ mod tests {
         "#;
         let ir = compile_ir(src);
         let (opted, _) = optimize(ir, 2);
-        let bc = crate::backend::assemble(&opted);
+        let bc = crate::backend::assemble(&opted).expect("assemble");
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(-16));
     }

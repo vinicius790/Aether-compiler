@@ -68,14 +68,30 @@ impl<'src> Lexer<'src> {
             ',' => self.single(TokenKind::Comma, start, line, column),
             ';' => self.single(TokenKind::Semicolon, start, line, column),
             ':' => self.single(TokenKind::Colon, start, line, column),
-            '+' => self.single(TokenKind::Plus, start, line, column),
-            '*' => self.single(TokenKind::Star, start, line, column),
-            '%' => self.single(TokenKind::Percent, start, line, column),
+            '+' => {
+                self.bump();
+                self.op_or_assign(TokenKind::Plus, TokenKind::PlusEq, start, line, column)
+            }
+            '*' => {
+                self.bump();
+                self.op_or_assign(TokenKind::Star, TokenKind::StarEq, start, line, column)
+            }
+            '%' => {
+                self.bump();
+                self.op_or_assign(TokenKind::Percent, TokenKind::PercentEq, start, line, column)
+            }
+            '^' => {
+                self.bump();
+                self.op_or_assign(TokenKind::Caret, TokenKind::CaretEq, start, line, column)
+            }
             '-' => {
                 self.bump();
                 if self.peek_char() == '>' {
                     self.bump();
                     self.make(TokenKind::Arrow, start, line, column)
+                } else if self.peek_char() == '=' {
+                    self.bump();
+                    self.make(TokenKind::MinusEq, start, line, column)
                 } else {
                     self.make(TokenKind::Minus, start, line, column)
                 }
@@ -100,7 +116,10 @@ impl<'src> Lexer<'src> {
             }
             '<' => {
                 self.bump();
-                if self.peek_char() == '=' {
+                if self.peek_char() == '<' {
+                    self.bump();
+                    self.op_or_assign(TokenKind::Shl, TokenKind::ShlEq, start, line, column)
+                } else if self.peek_char() == '=' {
                     self.bump();
                     self.make(TokenKind::LtEq, start, line, column)
                 } else {
@@ -108,8 +127,12 @@ impl<'src> Lexer<'src> {
                 }
             }
             '>' => {
+                // `->` is handled under `-`, so a leading `>` is never an arrow.
                 self.bump();
-                if self.peek_char() == '=' {
+                if self.peek_char() == '>' {
+                    self.bump();
+                    self.op_or_assign(TokenKind::Shr, TokenKind::ShrEq, start, line, column)
+                } else if self.peek_char() == '=' {
                     self.bump();
                     self.make(TokenKind::GtEq, start, line, column)
                 } else {
@@ -121,6 +144,9 @@ impl<'src> Lexer<'src> {
                 if self.peek_char() == '&' {
                     self.bump();
                     self.make(TokenKind::AmpAmp, start, line, column)
+                } else if self.peek_char() == '=' {
+                    self.bump();
+                    self.make(TokenKind::AmpEq, start, line, column)
                 } else {
                     self.make(TokenKind::Amp, start, line, column)
                 }
@@ -130,6 +156,9 @@ impl<'src> Lexer<'src> {
                 if self.peek_char() == '|' {
                     self.bump();
                     self.make(TokenKind::PipePipe, start, line, column)
+                } else if self.peek_char() == '=' {
+                    self.bump();
+                    self.make(TokenKind::PipeEq, start, line, column)
                 } else {
                     self.make(TokenKind::Pipe, start, line, column)
                 }
@@ -145,7 +174,8 @@ impl<'src> Lexer<'src> {
             }
             '/' => {
                 // trivia already consumed comments; a remaining slash is division
-                self.single(TokenKind::Slash, start, line, column)
+                self.bump();
+                self.op_or_assign(TokenKind::Slash, TokenKind::SlashEq, start, line, column)
             }
             _ => {
                 let bad = ch;
@@ -170,15 +200,35 @@ impl<'src> Lexer<'src> {
         self.make(kind, start, line, column)
     }
 
+    /// Decimal `1_000`, hex `0xFF`, binary `0b1010`, octal `0o17`; `_` is a
+    /// digit separator everywhere, including the mantissa of a float. The
+    /// prefixed forms are always integers (no hex floats). Value range is
+    /// checked by the parser (`parse_int`).
     fn number(&mut self, start: usize, line: u32, column: u32) -> Token {
-        while self.peek_char().is_ascii_digit() {
+        if self.peek_char() == '0' {
+            let radix = match self.peek_char_at(1) {
+                'x' => 16,
+                'o' => 8,
+                'b' => 2,
+                _ => 0,
+            };
+            if radix != 0 {
+                self.bump();
+                self.bump();
+                while self.peek_char().is_digit(radix) || self.peek_char() == '_' {
+                    self.bump();
+                }
+                return self.make(TokenKind::Int, start, line, column);
+            }
+        }
+        while self.peek_char().is_ascii_digit() || self.peek_char() == '_' {
             self.bump();
         }
         let mut is_float = false;
         if self.peek_char() == '.' && self.peek_char_at(1).is_ascii_digit() {
             is_float = true;
             self.bump();
-            while self.peek_char().is_ascii_digit() {
+            while self.peek_char().is_ascii_digit() || self.peek_char() == '_' {
                 self.bump();
             }
         }
@@ -241,8 +291,19 @@ impl<'src> Lexer<'src> {
         self.bump();
         if self.peek_char() == '\\' {
             self.bump();
+            let esc = self.peek_char();
             if !self.is_eof() {
                 self.bump();
+            }
+            // `'\u{1F600}'`: swallow the braces so the closing quote is found;
+            // the parser validates the digits.
+            if esc == 'u' && self.peek_char() == '{' {
+                while !self.is_eof() && !matches!(self.peek_char(), '}' | '\'' | '\n') {
+                    self.bump();
+                }
+                if self.peek_char() == '}' {
+                    self.bump();
+                }
             }
         } else if !self.is_eof() && self.peek_char() != '\'' {
             self.bump();
@@ -263,6 +324,24 @@ impl<'src> Lexer<'src> {
     fn single(&mut self, kind: TokenKind, start: usize, line: u32, column: u32) -> Token {
         self.bump();
         self.make(kind, start, line, column)
+    }
+
+    /// After the operator itself was consumed: `op`, or its compound
+    /// assignment form `op=` when `=` follows.
+    fn op_or_assign(
+        &mut self,
+        op: TokenKind,
+        assign: TokenKind,
+        start: usize,
+        line: u32,
+        column: u32,
+    ) -> Token {
+        if self.peek_char() == '=' {
+            self.bump();
+            self.make(assign, start, line, column)
+        } else {
+            self.make(op, start, line, column)
+        }
     }
 
     fn skip_trivia(&mut self) {
@@ -397,15 +476,85 @@ mod tests {
     #[test]
     fn lexes_operators_and_comments() {
         let src = "a += 1; // ignore\n/* block */ 1.5 != 2 && true";
-        // `+=` is `+` then `=`
         let k = kinds(src);
-        assert!(k.contains(&TokenKind::Plus));
-        assert!(k.contains(&TokenKind::Eq));
+        assert!(k.contains(&TokenKind::PlusEq));
+        assert!(!k.contains(&TokenKind::Plus));
+        assert!(!k.contains(&TokenKind::Eq));
         assert!(k.contains(&TokenKind::Float));
         assert!(k.contains(&TokenKind::BangEq));
         assert!(k.contains(&TokenKind::AmpAmp));
         assert!(k.contains(&TokenKind::True));
         assert!(!k.contains(&TokenKind::Invalid));
+    }
+
+    #[test]
+    fn lexes_bitwise_shift_and_compound_assignment() {
+        use TokenKind::*;
+        let k = kinds("a & b | c ^ d << 2 >> 1 && e || f -> x >= y <= z");
+        assert_eq!(
+            k,
+            vec![
+                Ident, Amp, Ident, Pipe, Ident, Caret, Ident, Shl, Int, Shr, Int, AmpAmp, Ident,
+                PipePipe, Ident, Arrow, Ident, GtEq, Ident, LtEq, Ident, Eof
+            ]
+        );
+        let k = kinds("+= -= *= /= %= &= |= ^= <<= >>= = == -> ..");
+        assert_eq!(
+            k,
+            vec![
+                PlusEq, MinusEq, StarEq, SlashEq, PercentEq, AmpEq, PipeEq, CaretEq, ShlEq,
+                ShrEq, Eq, EqEq, Arrow, DotDot, Eof
+            ]
+        );
+        // `a>>=b` and `a>=b` stay distinct; `x<-1` is `x < -1`
+        assert_eq!(kinds("a>>=b"), vec![Ident, ShrEq, Ident, Eof]);
+        assert_eq!(kinds("a>=b"), vec![Ident, GtEq, Ident, Eof]);
+        assert_eq!(kinds("x<-1"), vec![Ident, Lt, Minus, Int, Eof]);
+    }
+
+    #[test]
+    fn lexes_integer_literal_forms() {
+        let (toks, diags) = tokenize(
+            FileId(0),
+            "0xFF 0b1010 0o17 1_000_000 1_000.5 0 0.5e3 1..10 0x_ff",
+        );
+        assert!(!diags.has_errors());
+        let lexemes: Vec<(TokenKind, &str)> = toks
+            .iter()
+            .map(|t| (t.kind, t.lexeme.as_str()))
+            .collect();
+        assert_eq!(
+            lexemes,
+            vec![
+                (TokenKind::Int, "0xFF"),
+                (TokenKind::Int, "0b1010"),
+                (TokenKind::Int, "0o17"),
+                (TokenKind::Int, "1_000_000"),
+                (TokenKind::Float, "1_000.5"),
+                (TokenKind::Int, "0"),
+                (TokenKind::Float, "0.5e3"),
+                (TokenKind::Int, "1"),
+                (TokenKind::DotDot, ".."),
+                (TokenKind::Int, "10"),
+                (TokenKind::Int, "0x_ff"),
+                (TokenKind::Eof, ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_unicode_escape_in_char_literal() {
+        let (toks, diags) = tokenize(FileId(0), r"'\u{41}' '\u{1F600}' '\n' 'x'");
+        assert!(!diags.has_errors());
+        let chars: Vec<&str> = toks
+            .iter()
+            .filter(|t| t.kind == TokenKind::Char)
+            .map(|t| t.lexeme.as_str())
+            .collect();
+        assert_eq!(chars, vec![r"'\u{41}'", r"'\u{1F600}'", r"'\n'", "'x'"]);
+        // an unterminated escape still reports E0003 without hanging
+        let (_, diags) = tokenize(FileId(0), r"'\u{41");
+        assert!(diags.has_errors());
     }
 
     #[test]

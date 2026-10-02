@@ -7,7 +7,7 @@ body:
     id: version
     attributes:
       label: Aether version
-      placeholder: "0.2.0"
+      placeholder: "0.2.2"
     validations:
       required: true
   - type: textarea

@@ -39,12 +39,15 @@
 - [x] Registradores `u16`, opcodes `Cmp` / `RemI64` / `NegI64` / conversões em falta; combinação sem opcode = erro E0300
 - [x] Semântica de valor para arrays/structs, divisão com wrapping, curto-circuito `&&` / `||`, `len` em caracteres
 - [x] Fuzzer tipado de agregados (`--kind agg`) e `tests/regressions.rs` (R1–R22)
+- [x] Módulos de ficheiro: `use "path";` (0.3.0; resolução transitiva no driver, deduplicação, caminhos relativos ao ficheiro; `stdlib/vec2.ae`, `stdlib/rng.ae`, `tests/modules.rs`)
 
 ## Limitações conhecidas
 
 - Inferência de tipos apenas em `let` a partir do inicializador (não Hindley–Milner).
 - Funções de primeira classe / closures: não implementadas.
-- Módulos / `import`: não implementados; um arquivo = um programa.
+- Módulos: `use "path";` junta ficheiros num espaço de nomes plano; `pub` é
+  aceite mas a visibilidade não é verificada (pendente); não há `mod` nem
+  nomes qualificados.
 - Strings são imutáveis e concatenáveis; não há fatiamento.
 - Arrays têm tamanho fixo conhecido em tempo de compilação.
 - A IR não é SSA. O emissor LLVM aloca um `alloca` por registrador da IR
@@ -81,5 +84,7 @@ natives do host (`Host::register`), `--include`/prelúdio, `bench`, REPL com
 estado, compactação de registradores, otimizador em ponto fixo com remoção
 de funções mortas.
 
-1. Módulos simples (`mod` / `use`).
+Feito em 0.3.0: módulos de ficheiro (`use "path";`).
+
+1. Visibilidade (`pub` verificado) e nomes qualificados nos módulos.
 2. Relatórios de cobertura LLVM / `cargo-fuzz` sobre a IR (o greybox da VM já existe).

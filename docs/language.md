@@ -26,8 +26,45 @@ arrays. Avaliação eager. Funções não são valores.
 
 ## Unidades de compilação
 
-Um arquivo `.ae` contém zero ou mais itens (`fn`, `struct`, `extern fn`).
-O ponto de entrada é `fn main() -> i32` ou `fn main() -> unit`.
+Um arquivo `.ae` contém zero ou mais itens (`fn`, `struct`, `extern fn`,
+`use`). O ponto de entrada é `fn main() -> i32` ou `fn main() -> unit`. Um
+programa pode estender-se por vários ficheiros através de `use` (ver
+[Módulos](#módulos)).
+
+## Módulos
+
+```
+use "relative/path.ae";
+```
+
+`use` é um item de topo que importa **todos** os itens de outro ficheiro
+para o programa. Semântica (0.3):
+
+- **Caminhos relativos ao ficheiro que importa**, não ao diretório
+  corrente: `examples/modules.ae` escreve `use "../stdlib/vec2.ae";`. A
+  extensão `.ae` pode ser omitida (é acrescentada). Para fontes em memória
+  (REPL, `compile_source`) a base é o diretório corrente.
+- **Espaço de nomes plano.** Não há prefixos nem `mod`: `vec2_add` chama-se
+  `vec2_add` em todo o lado, e dois ficheiros que definam o mesmo nome dão o
+  erro habitual `duplicate function` / `duplicate struct`. As importações
+  são transitivas: o que `b.ae` importa também fica visível em quem importa
+  `b.ae`.
+- **Cada ficheiro entra uma vez** (deduplicação pelo caminho canónico):
+  importar o mesmo ficheiro duas vezes, por caminhos diferentes, ou em
+  ciclo (`a` → `b` → `a`) é inofensivo. `--include` / `AETHER_INCLUDE` são
+  `use`s implícitos do ficheiro principal e seguem a mesma regra.
+- **Sem visibilidade.** `pub` é aceite antes de `fn`, `struct` e `extern fn`
+  e registado na AST (`is_pub`), mas **não é verificado**: tudo o que um
+  ficheiro define é visível em quem o importa. `pub use` não existe.
+- Um ficheiro só com `use` e definições (sem `main`) é uma biblioteca; o
+  `main` tem de existir exatamente uma vez no programa inteiro.
+- Importação que não se consegue ler é o erro `E0280 unresolved import`,
+  apontando para o `use` (`cannot read X (imported from FILE:LINE)`); o
+  limite de 8 MiB por ficheiro aplica-se a cada ficheiro importado.
+
+`use` é resolvido pelo *driver* antes da análise semântica; a AST do
+programa final contém os itens de todos os ficheiros, com os diagnósticos a
+apontar para o ficheiro certo.
 
 ## Tipos
 

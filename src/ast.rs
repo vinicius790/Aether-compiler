@@ -14,6 +14,16 @@ pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
     Extern(ExternDecl),
+    /// `use "path";` — a file import, resolved by the driver before sema.
+    Use(UseDecl),
+}
+
+/// `use "relative/path.ae";` (`.ae` may be omitted). `path` is the literal
+/// as written; the driver resolves it relative to the importing file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseDecl {
+    pub path: String,
+    pub span: Span,
 }
 
 impl Item {
@@ -22,6 +32,7 @@ impl Item {
             Item::Fn(f) => f.span,
             Item::Struct(s) => s.span,
             Item::Extern(e) => e.span,
+            Item::Use(u) => u.span,
         }
     }
 
@@ -30,12 +41,15 @@ impl Item {
             Item::Fn(f) => &f.name.name,
             Item::Struct(s) => &s.name.name,
             Item::Extern(e) => &e.name.name,
+            Item::Use(u) => &u.path,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
+    /// `pub` was written. Recorded only; visibility is not enforced in 0.3.
+    pub is_pub: bool,
     pub name: Ident,
     pub params: Vec<Param>,
     pub return_ty: TypeExpr,
@@ -45,6 +59,7 @@ pub struct FnDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternDecl {
+    pub is_pub: bool,
     pub name: Ident,
     pub params: Vec<Param>,
     pub return_ty: TypeExpr,
@@ -60,6 +75,7 @@ pub struct Param {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
+    pub is_pub: bool,
     pub name: Ident,
     pub fields: Vec<FieldDecl>,
     pub span: Span,
@@ -397,6 +413,9 @@ fn dump_item(item: &Item, n: usize, out: &mut String) {
                 e.name.name,
                 type_str(&e.return_ty)
             ));
+        }
+        Item::Use(u) => {
+            out.push_str(&format!("{}use {:?};\n", indent(n), u.path));
         }
     }
 }

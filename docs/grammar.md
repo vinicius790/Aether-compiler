@@ -5,11 +5,12 @@ Notação: EBNF. Tokens em maiúsculas ou entre aspas. `Ident` não é palavra-c
 ```
 Program     ::= Item*
 
-Item        ::= FnItem | StructItem | ExternItem
+Item        ::= "pub"? (FnItem | StructItem | ExternItem) | UseItem
 
 FnItem      ::= "fn" Ident "(" ParamList? ")" ("->" Type)? Block
 ExternItem  ::= "extern" "fn" Ident "(" ParamList? ")" ("->" Type)? ";"
 StructItem  ::= "struct" Ident "{" FieldList? "}"
+UseItem     ::= "use" StringLit ";"
 
 ParamList   ::= Param ("," Param)* ","?
 Param       ::= Ident ":" Type
@@ -72,6 +73,11 @@ FieldInit   ::= Ident ":" Expr
 ```
 
 Comentários: `//` até o fim da linha; `/* ... */` não aninhados.
+
+`pub` é aceite e registado na AST mas não tem efeito em 0.3 (visibilidade
+não verificada). `UseItem` importa os itens de outro ficheiro; o caminho é
+relativo ao ficheiro corrente e `.ae` é opcional (ver language.md,
+“Módulos”).
 
 Precedência (do mais frouxo ao mais apertado): `||` 1, `&&` 2, `== !=` 3,
 `< <= > >=` 4, `|` 5, `^` 6, `&` 7, `<< >>` 8, `+ -` 9, `* / %` 10, `as` 11,

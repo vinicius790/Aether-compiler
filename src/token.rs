@@ -31,6 +31,7 @@ pub enum TokenKind {
     As,
     Extern,
     Pub,
+    Use,
 
     // types (reserved)
     TyI32,
@@ -114,6 +115,7 @@ impl TokenKind {
             "as" => TokenKind::As,
             "extern" => TokenKind::Extern,
             "pub" => TokenKind::Pub,
+            "use" => TokenKind::Use,
             "i32" => TokenKind::TyI32,
             "i64" => TokenKind::TyI64,
             "f64" => TokenKind::TyF64,
@@ -161,6 +163,7 @@ impl TokenKind {
             TokenKind::As => "as",
             TokenKind::Extern => "extern",
             TokenKind::Pub => "pub",
+            TokenKind::Use => "use",
             TokenKind::TyI32 => "i32",
             TokenKind::TyI64 => "i64",
             TokenKind::TyF64 => "f64",

@@ -75,7 +75,12 @@ impl Parser {
                     while !self.is_eof()
                         && !matches!(
                             self.peek_kind(),
-                            TokenKind::Fn | TokenKind::Struct | TokenKind::Extern | TokenKind::Eof
+                            TokenKind::Fn
+                                | TokenKind::Struct
+                                | TokenKind::Extern
+                                | TokenKind::Use
+                                | TokenKind::Pub
+                                | TokenKind::Eof
                         )
                     {
                         self.bump();
@@ -94,21 +99,48 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Option<Item> {
+        // `pub` is accepted and recorded; visibility is not enforced in 0.3.
+        let is_pub = self.eat(TokenKind::Pub);
         match self.peek_kind() {
-            TokenKind::Fn => self.parse_fn().map(Item::Fn),
-            TokenKind::Struct => self.parse_struct().map(Item::Struct),
-            TokenKind::Extern => self.parse_extern().map(Item::Extern),
-            TokenKind::Eof => None,
+            TokenKind::Fn => self.parse_fn().map(|mut f| {
+                f.is_pub = is_pub;
+                Item::Fn(f)
+            }),
+            TokenKind::Struct => self.parse_struct().map(|mut s| {
+                s.is_pub = is_pub;
+                Item::Struct(s)
+            }),
+            TokenKind::Extern => self.parse_extern().map(|mut e| {
+                e.is_pub = is_pub;
+                Item::Extern(e)
+            }),
+            TokenKind::Use if !is_pub => self.parse_use().map(Item::Use),
+            TokenKind::Eof if !is_pub => None,
             _ => {
                 let tok = self.peek().clone();
                 self.error_at(
                     format!("expected item, found `{}`", tok.lexeme),
                     tok.span,
-                    Some("items start with `fn`, `struct` or `extern`"),
+                    Some("items start with `fn`, `struct`, `extern` or `use`; `pub` may precede the first three"),
                 );
                 None
             }
         }
+    }
+
+    /// `use "relative/path.ae";` — resolved by the driver, not here.
+    fn parse_use(&mut self) -> Option<UseDecl> {
+        let start = self.expect(TokenKind::Use)?.span;
+        let tok = self.expect(TokenKind::String)?;
+        let (path, bad) = unescape_string(&tok.lexeme);
+        if bad {
+            self.bad_unicode_escape(tok.span);
+        }
+        let end = self.expect(TokenKind::Semicolon)?.span;
+        Some(UseDecl {
+            path,
+            span: start.merge(end),
+        })
     }
 
     fn parse_fn(&mut self) -> Option<FnDecl> {
@@ -130,6 +162,7 @@ impl Parser {
         };
         let end = body.as_ref().map(|b| b.span).unwrap_or(self.prev_span());
         Some(FnDecl {
+            is_pub: false,
             name,
             params,
             return_ty,
@@ -152,6 +185,7 @@ impl Parser {
         };
         self.expect(TokenKind::Semicolon)?;
         Some(ExternDecl {
+            is_pub: false,
             name,
             params,
             return_ty,
@@ -202,6 +236,7 @@ impl Parser {
         }
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(StructDecl {
+            is_pub: false,
             name,
             fields,
             span: start.merge(end),

@@ -1,6 +1,6 @@
 //! Compiler driver: source → tokens → AST → HIR → IR → opt → backend.
 
-use crate::ast::{dump_program, Program};
+use crate::ast::{dump_program, Item, Program};
 use crate::backend::{assemble, emit_llvm_ir, BytecodeModule};
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::ir::{dump_ir, emit_ir, IrModule};
@@ -11,8 +11,10 @@ use crate::sema::{analyze, HirProgram};
 use crate::span::{FileId, Session, Span};
 use crate::token::{Token, TokenKind};
 use crate::vm::{Value, Vm, VmError, VmOptions};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -108,43 +110,111 @@ pub fn compile_source(name: &str, source: &str, opts: &CompileOptions) -> Compil
 }
 
 /// Compile several in-memory files as one program. The first entry is the
-/// main file; every file gets its own [`FileId`] in the session and is lexed
-/// separately so diagnostics point at the right file, then the token streams
-/// are concatenated (dropping every `Eof` but the last) and parsed once.
+/// main file; every file gets its own [`FileId`] in the session and is
+/// lexed and parsed separately so diagnostics point at the right file, then
+/// the items of all files are merged into one flat [`Program`]. `use`
+/// imports are resolved transitively before semantic analysis: relative to
+/// the file's directory when `name` is the path of an existing file, else
+/// (a bare label such as `<repl>`) relative to the current directory.
 /// Duplicate item names across files surface through the usual sema errors.
 pub fn compile_sources(files: Vec<(String, String)>, opts: &CompileOptions) -> Compiled {
-    let mut files = files;
-    if files.is_empty() {
-        files.push(("<empty>".to_string(), String::new()));
+    let units = files
+        .into_iter()
+        .map(|(name, source)| {
+            let path = Path::new(&name);
+            let dir = if path.is_file() {
+                path.parent().map(Path::to_path_buf)
+            } else {
+                None
+            };
+            Unit { name, source, dir }
+        })
+        .collect();
+    compile_units(units, HashSet::new(), opts)
+}
+
+/// One source file waiting to be compiled: display name, text and the
+/// directory relative `use` paths resolve against (`None` = cwd).
+struct Unit {
+    name: String,
+    source: String,
+    dir: Option<PathBuf>,
+}
+
+/// Lex and parse every unit, pulling in the files their `use` items name
+/// (depth-first, each file once), then run the rest of the pipeline on
+/// the merged item list.
+fn compile_units(units: Vec<Unit>, mut seen: HashSet<PathBuf>, opts: &CompileOptions) -> Compiled {
+    let mut queue: VecDeque<Unit> = units.into();
+    if queue.is_empty() {
+        queue.push_back(Unit {
+            name: "<empty>".to_string(),
+            source: String::new(),
+            dir: None,
+        });
     }
     let mut session = Session::new();
     let mut timings = StageTimings::default();
     let mut diags = Diagnostics::new();
     let mut tokens: Vec<Token> = Vec::new();
+    let mut last_eof: Option<Token> = None;
     let mut file = FileId::DUMMY;
+    let mut program = Program {
+        items: Vec::new(),
+        span: Span::DUMMY,
+    };
 
-    let t0 = Instant::now();
-    let last = files.len() - 1;
-    for (i, (name, source)) in files.into_iter().enumerate() {
-        let id = session.add_file(name, source);
-        if i == 0 {
+    while let Some(unit) = queue.pop_front() {
+        let id = session.add_file(unit.name.clone(), unit.source);
+        if file == FileId::DUMMY {
             file = id;
         }
         let src = &session.file(id).expect("file just added").source;
-        let (mut toks, lex_diags) = tokenize(id, src);
-        if i != last {
-            toks.retain(|t| t.kind != TokenKind::Eof);
-        }
-        tokens.extend(toks);
+        let t0 = Instant::now();
+        let (toks, lex_diags) = tokenize(id, src);
+        timings.lex_us += t0.elapsed().as_micros();
         diags.extend(lex_diags);
+
+        let t1 = Instant::now();
+        let (parsed, parse_diags) = parse(toks.clone());
+        timings.parse_us += t1.elapsed().as_micros();
+        diags.extend(parse_diags);
+
+        // concatenated token stream for `dump-tokens`: one Eof, last
+        last_eof = toks.last().filter(|t| t.kind == TokenKind::Eof).cloned();
+        tokens.extend(toks.into_iter().filter(|t| t.kind != TokenKind::Eof));
+
+        let mut imported = Vec::new();
+        for item in &parsed.items {
+            if let Item::Use(u) = item {
+                match load_import(unit.dir.as_deref(), &u.path, &mut seen) {
+                    Ok(Some(dep)) => imported.push(dep),
+                    Ok(None) => {} // already part of the program
+                    Err(msg) => diags.push(
+                        Diagnostic::error(
+                            format!(
+                                "unresolved import: {msg} (imported from {}:{})",
+                                unit.name, u.span.line
+                            ),
+                            u.span,
+                        )
+                        .with_code("E0280")
+                        .with_help("paths are relative to the importing file; `.ae` is optional"),
+                    ),
+                }
+            }
+        }
+        // depth-first: the imports of this file come before the rest of the queue
+        for dep in imported.into_iter().rev() {
+            queue.push_front(dep);
+        }
+
+        if program.span.is_dummy() {
+            program.span = parsed.span;
+        }
+        program.items.extend(parsed.items);
     }
-    timings.lex_us = t0.elapsed().as_micros();
-
-    let t1 = Instant::now();
-    let (program, parse_diags) = parse(tokens.clone());
-    timings.parse_us = t1.elapsed().as_micros();
-
-    diags.extend(parse_diags);
+    tokens.extend(last_eof);
 
     if diags.has_errors() {
         return Compiled {
@@ -221,6 +291,62 @@ pub fn compile_sources(files: Vec<(String, String)>, opts: &CompileOptions) -> C
     }
 }
 
+/// Where `use "path"` written in a file inside `from_dir` (`None` = the
+/// current directory) points: `.ae` is appended when missing and `.`/`..`
+/// components are folded lexically, so `examples/../stdlib/vec2` becomes
+/// `stdlib/vec2.ae`.
+pub fn resolve_import_path(from_dir: Option<&Path>, path: &str) -> PathBuf {
+    let mut rel = path.to_string();
+    if !rel.ends_with(".ae") {
+        rel.push_str(".ae");
+    }
+    let joined = match from_dir {
+        Some(d) if !d.as_os_str().is_empty() => d.join(&rel),
+        _ => PathBuf::from(&rel),
+    };
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        use std::path::Component::*;
+        match comp {
+            CurDir => {}
+            ParentDir => {
+                if matches!(out.components().next_back(), Some(Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+/// Load the file a `use` names, unless its canonical path is already in
+/// `seen` (then `Ok(None)`: a file imported twice or cyclically is compiled
+/// once). Errors are plain messages; the caller attaches the span.
+fn load_import(
+    from_dir: Option<&Path>,
+    path: &str,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<Option<Unit>, String> {
+    let full = resolve_import_path(from_dir, path);
+    let name = full.display().to_string();
+    let canonical = std::fs::canonicalize(&full).map_err(|e| format!("cannot read {name}: {e}"))?;
+    if !seen.insert(canonical) {
+        return Ok(None);
+    }
+    let source = read_source(&name)?;
+    Ok(Some(Unit {
+        dir: full.parent().map(Path::to_path_buf),
+        name,
+        source,
+    }))
+}
+
 /// Assembler errors name the offending function in backticks
 /// ("function `f` needs ..."); point the diagnostic at its definition
 /// when that function exists, else at nothing.
@@ -234,25 +360,38 @@ fn assemble_error_span(ir: &IrModule, msg: &str) -> Span {
         .unwrap_or(Span::DUMMY)
 }
 
-/// Compile one file from disk (no includes).
+/// Compile one file from disk, following its `use` imports.
 pub fn compile_file(path: &str, opts: &CompileOptions) -> Result<Compiled, String> {
     compile_files(path, &[], opts)
 }
 
 /// Compile `main` together with `includes` (all paths on disk) as one
 /// program. Files are read in order; a missing or oversized file is an
-/// error before anything is compiled.
+/// error before anything is compiled. Includes behave like implicit `use`s
+/// of the main file: a file named twice (or also imported) is compiled
+/// once. `use` imports are resolved relative to the importing file; a
+/// missing import is diagnostic E0280 in the result, not an `Err`.
 pub fn compile_files(
     main: &str,
     includes: &[String],
     opts: &CompileOptions,
 ) -> Result<Compiled, String> {
-    let mut files = Vec::with_capacity(includes.len() + 1);
-    files.push((main.to_string(), read_source(main)?));
-    for inc in includes {
-        files.push((inc.clone(), read_source(inc)?));
+    let mut seen = HashSet::new();
+    let mut units = Vec::with_capacity(includes.len() + 1);
+    for path in std::iter::once(main).chain(includes.iter().map(String::as_str)) {
+        let source = read_source(path)?;
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            if !seen.insert(canonical) {
+                continue;
+            }
+        }
+        units.push(Unit {
+            name: path.to_string(),
+            source,
+            dir: Path::new(path).parent().map(Path::to_path_buf),
+        });
     }
-    Ok(compile_sources(files, opts))
+    Ok(compile_units(units, seen, opts))
 }
 
 fn read_source(path: &str) -> Result<String, String> {
@@ -513,5 +652,138 @@ mod tests {
         let d = Diagnostic::error(msg, span).with_code("E0300");
         assert_eq!(d.code, Some("E0300"));
         assert_eq!(assemble_error_span(&ir, "unknown function `ghost`"), Span::DUMMY);
+    }
+
+    /// Fresh scratch directory under the system temp dir (std only).
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aether-driver-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &Path, name: &str, src: &str) -> String {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, src).unwrap();
+        p.display().to_string()
+    }
+
+    #[test]
+    fn use_imports_items_from_another_file() {
+        let dir = scratch("use");
+        write(&dir, "lib.ae", "fn twice(x: i32) -> i32 { return x * 2; }");
+        let main = write(
+            &dir,
+            "main.ae",
+            "use \"lib\";\nfn main() -> i32 { print_i32(twice(21)); return 0; }",
+        );
+        let mut c = compile_file(&main, &CompileOptions::default()).unwrap();
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        assert_eq!(c.session.files().len(), 2);
+        assert!(c.session.file_name(FileId(1)).ends_with("lib.ae"));
+        let (_, out, _) = run_compiled(&mut c).unwrap();
+        assert_eq!(out, "42\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn use_dedupes_and_tolerates_cycles() {
+        let dir = scratch("cycle");
+        write(&dir, "a.ae", "use \"b.ae\";\nuse \"c.ae\";\nfn a() -> i32 { return 1; }");
+        write(&dir, "b.ae", "use \"c.ae\";\nuse \"a.ae\";\nfn b() -> i32 { return 2; }");
+        write(&dir, "c.ae", "use \"./a.ae\";\nfn c() -> i32 { return 3; }");
+        let main = write(
+            &dir,
+            "main.ae",
+            "use \"a\";\nuse \"a.ae\";\nfn main() -> i32 { print_i32(a() + b() + c()); return 0; }",
+        );
+        let mut c = compile_file(&main, &CompileOptions::default()).unwrap();
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        // main, a, b, c: each exactly once despite the cycle and the repeats
+        assert_eq!(c.session.files().len(), 4);
+        let (_, out, _) = run_compiled(&mut c).unwrap();
+        assert_eq!(out, "6\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_and_use_of_the_same_file_compile_it_once() {
+        let dir = scratch("inc");
+        let lib = write(&dir, "lib.ae", "fn one() -> i32 { return 1; }");
+        let main = write(&dir, "main.ae", "use \"lib.ae\";\nfn main() -> i32 { return one(); }");
+        let c = compile_files(&main, &[lib.clone(), lib], &CompileOptions::default()).unwrap();
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        assert_eq!(c.session.files().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_import_is_e0280_at_the_use_span() {
+        let dir = scratch("missing");
+        let main = write(
+            &dir,
+            "main.ae",
+            "fn main() -> i32 { return 0; }\nuse \"nowhere/none\";\n",
+        );
+        let c = compile_file(&main, &CompileOptions::default()).unwrap();
+        assert!(!c.ok());
+        let d = c.diags.iter().find(|d| d.code == Some("E0280")).expect("E0280");
+        assert!(d.message.starts_with("unresolved import: cannot read "), "{}", d.message);
+        assert!(d.message.contains("nowhere/none.ae"), "{}", d.message);
+        assert!(d.message.contains("main.ae:2)"), "{}", d.message);
+        assert_eq!(d.span.file, c.file);
+        assert_eq!(d.span.line, 2);
+        assert_eq!(d.span.column, 1);
+        assert_eq!(d.span.len(), "use \"nowhere/none\";".len() as u32);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn imports_resolve_relative_to_the_importing_file() {
+        let dir = scratch("nested");
+        write(&dir, "lib/util.ae", "use \"../lib/deep/inner.ae\";\nfn util() -> i32 { return inner() + 1; }");
+        write(&dir, "lib/deep/inner.ae", "fn inner() -> i32 { return 41; }");
+        let main = write(
+            &dir,
+            "app/main.ae",
+            "use \"../lib/util\";\nfn main() -> i32 { print_i32(util()); return 0; }",
+        );
+        let mut c = compile_file(&main, &CompileOptions::default()).unwrap();
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        // names are folded lexically: no `app/../lib` in the session
+        assert!(c.session.files().iter().all(|f| !f.name.contains("/../")));
+        let (_, out, _) = run_compiled(&mut c).unwrap();
+        assert_eq!(out, "42\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_source_resolves_imports_against_cwd() {
+        // the repo root is cargo's cwd for unit tests
+        let src = "use \"stdlib/prelude\";\nfn main() -> i32 { print_i32(gcd(12, 18)); return 0; }";
+        let mut c = compile_source("mem.ae", src, &CompileOptions::default());
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        assert_eq!(c.session.file_name(FileId(1)), "stdlib/prelude.ae");
+        let (_, out, _) = run_compiled(&mut c).unwrap();
+        assert_eq!(out, "6\n");
+    }
+
+    #[test]
+    fn resolve_import_path_folds_components_and_adds_extension() {
+        let p = |d: Option<&str>, s: &str| resolve_import_path(d.map(Path::new), s).display().to_string();
+        assert_eq!(p(Some("examples"), "../stdlib/vec2.ae"), "stdlib/vec2.ae");
+        assert_eq!(p(Some("examples"), "vec2"), "examples/vec2.ae");
+        assert_eq!(p(Some(""), "./x"), "x.ae");
+        assert_eq!(p(None, "a/./b/../c"), "a/c.ae");
+        assert_eq!(p(Some("a"), "../../up"), "../up.ae");
     }
 }

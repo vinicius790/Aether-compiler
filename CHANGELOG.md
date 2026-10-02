@@ -6,6 +6,19 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for the **source language and library API**. Bytecode and LLVM text are
 explicitly unstable.
 
+## [0.3.0] — 2026-10-02
+
+### Added
+- File modules: `use "relative/path.ae";` imports every item of another
+  file (path relative to the importing file, `.ae` optional, transitive,
+  each file included once, cycles allowed); `--include` / `AETHER_INCLUDE`
+  are implicit `use`s. Missing import: `E0280 unresolved import`. `pub` is
+  accepted before `fn` / `struct` / `extern fn` and recorded (`is_pub`), not
+  enforced
+- stdlib: `stdlib/vec2.ae` (`Vec2`, `vec2_*`) and `stdlib/rng.ae`
+  (`rng_next`, `rng_range`, xorshift32) as importable files;
+  `examples/modules.ae`; `tests/modules.rs`
+
 ## [0.2.2] — 2026-10-02
 
 ### Added

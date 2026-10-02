@@ -28,7 +28,12 @@ fn pretty_item(item: &Item) -> String {
                 .as_ref()
                 .map(|b| pretty_block(b, 0))
                 .unwrap_or_else(|| ";".into());
-            format!("fn {}({}) -> {ret} {body}", f.name.name, params.join(", "))
+            format!(
+                "{}fn {}({}) -> {ret} {body}",
+                vis(f.is_pub),
+                f.name.name,
+                params.join(", ")
+            )
         }
         Item::Struct(st) => {
             let fields: Vec<String> = st
@@ -36,7 +41,12 @@ fn pretty_item(item: &Item) -> String {
                 .iter()
                 .map(|f| format!("    {}: {},", f.name.name, type_str(&f.ty)))
                 .collect();
-            format!("struct {} {{\n{}\n}}", st.name.name, fields.join("\n"))
+            format!(
+                "{}struct {} {{\n{}\n}}",
+                vis(st.is_pub),
+                st.name.name,
+                fields.join("\n")
+            )
         }
         Item::Extern(e) => {
             let params: Vec<String> = e
@@ -45,12 +55,23 @@ fn pretty_item(item: &Item) -> String {
                 .map(|p| format!("{}: {}", p.name.name, type_str(&p.ty)))
                 .collect();
             format!(
-                "extern fn {}({}) -> {};",
+                "{}extern fn {}({}) -> {};",
+                vis(e.is_pub),
                 e.name.name,
                 params.join(", "),
                 type_str(&e.return_ty)
             )
         }
+        Item::Use(u) => format!("use {:?};", u.path),
+    }
+}
+
+/// `pub ` when the item was declared public (recorded, not enforced).
+fn vis(is_pub: bool) -> &'static str {
+    if is_pub {
+        "pub "
+    } else {
+        ""
     }
 }
 

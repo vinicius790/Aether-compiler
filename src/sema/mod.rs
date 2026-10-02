@@ -165,6 +165,7 @@ impl<'a> Analyzer<'a> {
                 }
                 Item::Extern(e) => {
                     let dummy = FnDecl {
+                        is_pub: e.is_pub,
                         name: e.name.clone(),
                         params: e.params.clone(),
                         return_ty: e.return_ty.clone(),
@@ -175,7 +176,8 @@ impl<'a> Analyzer<'a> {
                         functions.push(hf);
                     }
                 }
-                Item::Struct(_) => {}
+                // imports are resolved by the driver before sema
+                Item::Struct(_) | Item::Use(_) => {}
             }
         }
         self.check_entry_point(&functions);
@@ -235,7 +237,7 @@ impl<'a> Analyzer<'a> {
                 Item::Extern(e) => {
                     self.register_fn(&e.name, &e.params, &e.return_ty, e.span, true)
                 }
-                Item::Struct(_) => {}
+                Item::Struct(_) | Item::Use(_) => {}
             }
         }
 

@@ -198,6 +198,7 @@ impl Printer<'_> {
                 self.expr_regions(index, r);
             }
             ExprKind::Field { base, .. } => self.expr_regions(base, r),
+            ExprKind::ArrayRepeat { value, .. } => self.expr_regions(value, r),
             ExprKind::Array { elements } | ExprKind::Tuple { elements } => {
                 elements.iter().for_each(|a| self.expr_regions(a, r))
             }
@@ -317,7 +318,7 @@ impl Printer<'_> {
                 s
             }
             Item::Enum(en) => {
-                let mut s = format!("enum {} {{", en.name.name);
+                let mut s = format!("{}enum {} {{", vis(en.is_pub), en.name.name);
                 let b = self.lbrace_after(en.name.span.end.0);
                 self.open(&mut s, b);
                 s.push('\n');
@@ -540,6 +541,7 @@ impl Printer<'_> {
                 let a: Vec<String> = elements.iter().map(|x| self.expr(x, indent)).collect();
                 format!("[{}]", a.join(", "))
             }
+            ExprKind::ArrayRepeat { value, count } => format!("[{}; {count}]", self.expr(value, indent)),
             ExprKind::StructLit { name, fields } => {
                 let fs: Vec<String> = fields
                     .iter()

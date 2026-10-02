@@ -79,7 +79,8 @@ Unary       ::= ("-"|"!") Unary | Postfix
 Postfix     ::= Primary (Call | Index | Field)*
 Call        ::= "(" ArgList? ")"
 Index       ::= "[" Expr "]"
-Field       ::= "." (Ident | IntLit)
+Field       ::= "." (Ident | TupleIndex)
+TupleIndex  ::= "0" | NonZeroDigit Digit*
 ArgList     ::= Expr ("," Expr)* ","?
 
 Primary     ::= Ident StructLit?
@@ -89,6 +90,7 @@ Primary     ::= Ident StructLit?
               | "(" Expr? ")"
               | TupleExpr
               | "[" ArgList? "]"
+              | "[" Expr ";" IntLit "]"
               | MatchExpr
 
 TupleExpr   ::= "(" Expr ("," Expr)+ ","? ")"
@@ -99,12 +101,16 @@ FieldInit   ::= Ident ":" Expr
 
 Comentários: `//` até o fim da linha; `/* ... */` não aninhados.
 
-`pub` é aceite e registado na AST mas não tem efeito em 0.3 (visibilidade
-não verificada). `UseItem` importa os itens de outro ficheiro; o caminho é
+`pub` torna o item visível a outros ficheiros (sem `pub` o item é privado
+ao seu ficheiro; ver language.md, “Módulos”). `UseItem` importa os itens de outro ficheiro; o caminho é
 relativo ao ficheiro corrente e `.ae` é opcional (ver language.md,
 “Módulos”).
 `t.0.1` lê-se como `(t.0).1`: o léxico produz o float `0.1`, que o parser
-divide em dois índices. Nos padrões, `_` é o identificador `_`; os
+divide em dois índices; cada índice é um decimal canónico (`t.01` e
+`t.0.01` são "invalid tuple index"). `[]` só é válido onde o contexto espera
+um array (tipo `[T; 0]`); `[e; N]` repete `e` (avaliado uma vez) `N` vezes,
+com `N` um `IntLit`. Um `-` imediatamente antes do `IntLit`
+`9223372036854775808` forma o literal `i64::MIN` (também em padrões). Nos padrões, `_` é o identificador `_`; os
 sub-padrões de uma variante e os elementos de uma tupla são padrões
 quaisquer (aninhados). `&"}"` quer dizer "seguido de `}`": um braço de
 expressão sem vírgula só é aceite como último. Os padrões de `let` são só
@@ -133,6 +139,8 @@ CharLit     ::= "'" (Escape | any char except "'" and "\") "'"
 ```
 
 O léxico aceita `_` em qualquer posição após o primeiro dígito (também
-`0x_ff`); o valor tem de caber em `i64`. Os tokens `&&`, `||`, `->`, `>=`,
+`0x_ff`); o valor tem de caber em `i64` ("integer literal out of range for
+i64"), salvo a magnitude de `i64::MIN` precedida de `-`. Um erro de sintaxe
+no fim do ficheiro diz `found end of file`. Os tokens `&&`, `||`, `->`, `>=`,
 `<=`, `>>=` e `<<=` são sempre preferidos ao prefixo mais curto (maximal
 munch); não há genéricos, pelo que `>>` nunca fecha dois `>`.

@@ -239,7 +239,8 @@ fn compile_units(
                     Item::Fn(f) => f.is_pub = true,
                     Item::Struct(s) => s.is_pub = true,
                     Item::Extern(e) => e.is_pub = true,
-                    Item::Enum(_) | Item::Use(_) => {}
+                    Item::Enum(e) => e.is_pub = true,
+                    Item::Use(_) => {}
                 }
             }
         }
@@ -737,7 +738,8 @@ mod tests {
     fn compile_sources_reports_duplicates_across_files() {
         let files = vec![
             ("a.ae".to_string(), "fn f() -> i32 { return 1; }\nfn main() -> i32 { return f(); }".to_string()),
-            ("b.ae".to_string(), "fn f() -> i32 { return 2; }".to_string()),
+            // a `pub` item clashes with any other item of its name
+            ("b.ae".to_string(), "pub fn f() -> i32 { return 2; }".to_string()),
         ];
         let c = compile_sources(files, &CompileOptions::default());
         let text = c.diags.render(&c.session, false);

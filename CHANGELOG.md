@@ -9,6 +9,12 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- Uninitialised arrays/structs/tuples zero-filled (`let e: E;` is E0232); `[expr; N]`; `[]`/`[T; 0]`; `i64::MIN` literal;
+  `t.01` rejected; EOF diagnostics; `pub enum` follows E0281; private items are file-scoped
+- Uninitialised arrays/structs/tuples are zero-filled recursively (`let e: E;` is E0232); array repeat `[expr; N]`;
+  `[]` / `[T; 0]` wherever the context gives the type; `i64::MIN` literal; `t.01` rejected; EOF diagnostics say
+  "found end of file"; `pub enum` follows E0281; private items are file-scoped (same-named private items in
+  different files no longer clash)
 - `aether fmt` preserves comments (leading, trailing, inside blocks, end of file; never dropped or duplicated)
 - VM/assembler/optimizer audit: DCE keeps trapping ops (div/rem by non-constant, index loads), liveness
   to a true fixpoint, CSE soundness and O(n) data structures, 256+ field structs (u16 field index),

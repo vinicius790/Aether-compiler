@@ -3,7 +3,7 @@
 use crate::ast::*;
 use crate::diagnostic::{Diagnostic, Diagnostics};
 use crate::span::Span;
-use crate::ty::{binop_result, parse_named_type, unop_result, Type};
+use crate::ty::{binop_result, parse_named_type, source_name, unop_result, Type};
 
 mod exhaust;
 mod scope;
@@ -157,6 +157,11 @@ pub enum HirExprKind {
     Array {
         elements: Vec<HirExpr>,
     },
+    /// `[value; count]`: `value` is evaluated once (also when `count` is 0).
+    ArrayRepeat {
+        value: Box<HirExpr>,
+        count: i64,
+    },
     StructLit {
         name: String,
         fields: Vec<(String, HirExpr)>,
@@ -222,10 +227,26 @@ impl<'a> Analyzer<'a> {
         self
     }
 
-    fn check_vis(&mut self, kind: VisKind, name: &str, at: Span) {
-        if let Some(d) = self.vis.check(kind, name, at) {
-            self.diags.push(d);
+    /// Resolves the source name `name` used at `at` to an item's internal
+    /// name (file-private names, see `visibility.rs`), reporting E0281 when
+    /// only another file's private item has that name. `None`: no such item.
+    fn resolve_item(&mut self, kind: VisKind, name: &str, at: Span) -> Option<String> {
+        let (internal, visible) = self.vis.resolve(kind, name, at)?;
+        if !visible {
+            if kind == VisKind::Fn && self.is_builtin(name) {
+                return None; // the built-in is what this file sees
+            }
+            if let Some(d) = self.vis.private_error(kind, name, &internal, at) {
+                self.diags.push(d);
+            }
         }
+        Some(internal)
+    }
+
+    /// The struct or enum named `name` at `at`.
+    fn resolve_type_name(&mut self, name: &str, at: Span) -> Option<Type> {
+        let internal = self.resolve_item(VisKind::Type, name, at)?;
+        self.resolve_aggregate(&internal)
     }
 
     pub fn analyze(mut self) -> (Option<HirProgram>, Diagnostics) {
@@ -234,10 +255,11 @@ impl<'a> Analyzer<'a> {
             return (None, self.diags);
         }
         let mut functions = Vec::new();
-        for item in &self.program.items {
+        for (idx, item) in self.program.items.iter().enumerate() {
+            let internal = self.vis.item(idx).0.unwrap_or_default().to_string();
             match item {
                 Item::Fn(f) => {
-                    if let Some(hf) = self.check_fn(f, false) {
+                    if let Some(hf) = self.check_fn(f, false, internal) {
                         functions.push(hf);
                     }
                 }
@@ -250,7 +272,7 @@ impl<'a> Analyzer<'a> {
                         body: None,
                         span: e.span,
                     };
-                    if let Some(hf) = self.check_fn(&dummy, true) {
+                    if let Some(hf) = self.check_fn(&dummy, true, internal) {
                         functions.push(hf);
                     }
                 }
@@ -276,30 +298,40 @@ impl<'a> Analyzer<'a> {
         // structs and enums first so function signatures can refer to them;
         // they are resolved on demand so fields may name types declared later
         let program = self.program;
-        let mut seen: Vec<&str> = Vec::new();
-        for item in &program.items {
+        let mut seen: Vec<String> = Vec::new();
+        for (idx, item) in program.items.iter().enumerate() {
             let (name, kind) = match item {
                 Item::Struct(s) => (&s.name, "struct"),
                 Item::Enum(e) => (&e.name, "enum"),
                 _ => continue,
             };
-            if seen.contains(&name.name.as_str()) {
-                self.err(format!("duplicate {kind} `{}`", name.name), name.span, "E0201");
-            } else {
-                seen.push(name.name.as_str());
+            match self.vis.item(idx) {
+                (_, true) => {
+                    self.err(format!("duplicate {kind} `{}`", name.name), name.span, "E0201")
+                }
+                (Some(internal), false) => seen.push(internal.to_string()),
+                (None, false) => {}
             }
         }
         for name in seen {
-            self.resolve_aggregate(name);
+            self.resolve_aggregate(&name);
         }
 
-        for item in &program.items {
-            match item {
-                Item::Fn(f) => self.register_fn(&f.name, &f.params, &f.return_ty, f.span, false),
-                Item::Extern(e) => {
-                    self.register_fn(&e.name, &e.params, &e.return_ty, e.span, true)
+        for (idx, item) in program.items.iter().enumerate() {
+            let (name, params, ret, span, is_extern) = match item {
+                Item::Fn(f) => (&f.name, &f.params, &f.return_ty, f.span, false),
+                Item::Extern(e) => (&e.name, &e.params, &e.return_ty, e.span, true),
+                Item::Struct(_) | Item::Use(_) | Item::Enum(_) => continue,
+            };
+            match self.vis.item(idx) {
+                (_, true) => {
+                    self.err(format!("duplicate function `{}`", name.name), name.span, "E0203")
                 }
-                Item::Struct(_) | Item::Use(_) | Item::Enum(_) => {}
+                (Some(internal), false) => {
+                    let internal = internal.to_string();
+                    self.register_fn(internal, params, ret, span, is_extern)
+                }
+                (None, false) => {}
             }
         }
 
@@ -377,9 +409,9 @@ impl<'a> Analyzer<'a> {
         self.register_builtin("pow_i32", fn_ty(vec![I32, I32], I32));
     }
 
-    /// Resolves the struct or enum `name` (first declaration wins), caching
-    /// it in `self.structs`. Returns `None` for an unknown name or a type
-    /// that contains itself.
+    /// Resolves the struct or enum with internal name `name`, caching it in
+    /// `self.structs`. Returns `None` for an unknown name or a type that
+    /// contains itself.
     fn resolve_aggregate(&mut self, name: &str) -> Option<Type> {
         if let Some(s) = self.structs.iter().find(|s| s.name == name) {
             return Some(s.ty.clone());
@@ -388,9 +420,7 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         let program = self.program;
-        let item = program.items.iter().find(|it| {
-            matches!(it, Item::Struct(_) | Item::Enum(_)) && it.name() == name
-        })?;
+        let item = &program.items[self.vis.item_of(VisKind::Type, name)?];
         self.resolving.push(name.to_string());
         let ty = match item {
             Item::Struct(s) => {
@@ -408,7 +438,7 @@ impl<'a> Analyzer<'a> {
                     fields.push((f.name.name.clone(), ty));
                 }
                 Type::Struct {
-                    name: s.name.name.clone(),
+                    name: name.to_string(),
                     fields,
                 }
             }
@@ -434,7 +464,7 @@ impl<'a> Analyzer<'a> {
                     );
                 }
                 Type::Enum {
-                    name: e.name.name.clone(),
+                    name: name.to_string(),
                     variants,
                 }
             }
@@ -467,22 +497,20 @@ impl<'a> Analyzer<'a> {
             .any(|(n, _, span, is_extern)| n == name && *is_extern && *span == Span::DUMMY)
     }
 
+    /// Registers a user function under its internal name (duplicates were
+    /// reported by the caller).
     fn register_fn(
         &mut self,
-        name: &Ident,
+        name: String,
         params: &[Param],
         return_ty: &TypeExpr,
         span: Span,
         is_extern: bool,
     ) {
-        if self.functions.iter().any(|(n, _, _, _)| n == &name.name) {
-            self.err(format!("duplicate function `{}`", name.name), name.span, "E0203");
-            return;
-        }
         let param_tys: Vec<Type> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
         let ret = self.resolve_type(return_ty);
         self.functions.push((
-            name.name.clone(),
+            name,
             Type::Fn {
                 params: param_tys,
                 ret: Box::new(ret),
@@ -512,7 +540,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn check_fn(&mut self, f: &FnDecl, is_extern: bool) -> Option<HirFn> {
+    fn check_fn(&mut self, f: &FnDecl, is_extern: bool, internal: String) -> Option<HirFn> {
         let params: Vec<(String, Type)> = f
             .params
             .iter()
@@ -560,7 +588,7 @@ impl<'a> Analyzer<'a> {
             None
         };
         Some(HirFn {
-            name: f.name.name.clone(),
+            name: internal,
             params,
             return_ty,
             body,
@@ -1019,7 +1047,7 @@ impl<'a> Analyzer<'a> {
                 variant,
                 fields,
             } => {
-                let ety = match self.resolve_aggregate(&enum_name.name) {
+                let ety = match self.resolve_type_name(&enum_name.name, enum_name.span) {
                     Some(t @ Type::Enum { .. }) => t,
                     _ => {
                         self.err(
@@ -1133,6 +1161,25 @@ impl<'a> Analyzer<'a> {
                         Type::Error
                     }
                 };
+                if init.is_none() {
+                    // no initializer: zero-filled, which an enum cannot be
+                    let t = &final_ty;
+                    if let Some(e) = t.enum_without_default() {
+                        let msg = if t == e {
+                            format!("enum variable `{}` needs an initializer", name.name)
+                        } else {
+                            format!(
+                                "variable `{}` needs an initializer: its type `{t}` contains the enum `{e}`",
+                                name.name
+                            )
+                        };
+                        self.diags.push(
+                            Diagnostic::error(msg, name.span)
+                                .with_code("E0232")
+                                .with_help("enums have no default value; write `let x: E = E::Variant;`"),
+                        );
+                    }
+                }
                 if self.scopes.define(
                     name.name.clone(),
                     Symbol {
@@ -1423,6 +1470,9 @@ impl<'a> Analyzer<'a> {
             ExprKind::Index { base, index } => self.check_index(base, index, expr.span),
             ExprKind::Field { base, field } => self.check_field(base, field, expr.span),
             ExprKind::Array { elements } => self.check_array(elements, expected, expr.span),
+            ExprKind::ArrayRepeat { value, count } => {
+                self.check_array_repeat(value, *count, expected, expr.span)
+            }
             ExprKind::StructLit { name, fields } => self.check_struct_lit(name, fields, expr.span),
             ExprKind::Tuple { elements } => self.check_tuple(elements, expected, expr.span),
             ExprKind::EnumLit {
@@ -1458,7 +1508,7 @@ impl<'a> Analyzer<'a> {
         let ty = if let Some(sym) = self.scopes.lookup(&id.name) {
             sym.ty.clone()
         } else {
-            if self.functions.iter().any(|(n, _, _, _)| n == &id.name) {
+            if self.functions.iter().any(|(n, _, _, _)| source_name(n) == id.name) {
                 self.err(
                     format!("function `{}` cannot be used as a value", id.name),
                     id.span,
@@ -1528,6 +1578,14 @@ impl<'a> Analyzer<'a> {
         // a negation of an `i32` value and wraps like `-a`, it is not a literal.
         if op == UnOp::Neg {
             if let ExprKind::Literal(Literal::Int(v)) = &inner.kind {
+                if *v == i64::MIN {
+                    // `--9223372036854775808`: the negated literal is 2^63
+                    self.err(
+                        "integer literal `9223372036854775808` is out of range for `i64`",
+                        span,
+                        "E0263",
+                    );
+                }
                 return self.int_literal(v.wrapping_neg(), expected, span);
             }
         }
@@ -1632,7 +1690,16 @@ impl<'a> Analyzer<'a> {
             checked.push(c);
         }
         if elements.is_empty() {
-            self.err("cannot infer type of empty array", span, "E0250");
+            // `[]` takes its element type from the context (`[T; 0]`)
+            match expected {
+                Some(Type::Array { elem, .. }) => elem_ty = (**elem).clone(),
+                Some(Type::Error) => {}
+                _ => self.diags.push(
+                    Diagnostic::error("cannot infer type of empty array", span)
+                        .with_code("E0250")
+                        .with_help("give it a type: `let a: [i32; 0] = [];`"),
+                ),
+            }
         }
         HirExpr {
             ty: Type::Array {
@@ -1644,9 +1711,31 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// `[value; count]`: `[T; count]` where `value: T`.
+    fn check_array_repeat(&mut self, value: &Expr, count: i64, expected: Option<&Type>, span: Span) -> HirExpr {
+        let hint = match expected {
+            Some(Type::Array { elem, .. }) => Some((**elem).clone()),
+            _ => None,
+        };
+        let v = self.check_expr(value, hint.as_ref());
+        if count > i64::from(i32::MAX) {
+            self.err("array length does not fit in `i32`", span, "E0262");
+        }
+        HirExpr {
+            ty: Type::Array {
+                elem: Box::new(v.ty.clone()),
+                len: count,
+            },
+            kind: HirExprKind::ArrayRepeat {
+                value: Box::new(v),
+                count,
+            },
+            span,
+        }
+    }
+
     fn check_struct_lit(&mut self, name: &Ident, fields: &[(Ident, Expr)], span: Span) -> HirExpr {
-        self.check_vis(VisKind::Struct, &name.name, name.span);
-        let (sname, decl_fields) = match self.lookup_struct(&name.name) {
+        let (sname, decl_fields) = match self.resolve_type_name(&name.name, name.span) {
             Some(Type::Struct { name, fields }) => (name, fields),
             _ => {
                 self.err(
@@ -1683,7 +1772,7 @@ impl<'a> Analyzer<'a> {
                 }
                 None => {
                     self.err(
-                        format!("struct `{sname}` has no field `{}`", fname.name),
+                        format!("struct `{}` has no field `{}`", source_name(&sname), fname.name),
                         fname.span,
                         "E0252",
                     );
@@ -1693,7 +1782,7 @@ impl<'a> Analyzer<'a> {
         for (n, _) in &decl_fields {
             if !out_fields.iter().any(|(fnm, _)| fnm == n) {
                 self.err(
-                    format!("missing field `{n}` in `{sname}` literal"),
+                    format!("missing field `{n}` in `{}` literal", source_name(&sname)),
                     span,
                     "E0253",
                 );
@@ -1737,7 +1826,7 @@ impl<'a> Analyzer<'a> {
             ty: Type::Error,
             span,
         };
-        let ety = match self.resolve_aggregate(&enum_name.name) {
+        let ety = match self.resolve_type_name(&enum_name.name, enum_name.span) {
             Some(t @ Type::Enum { .. }) => t,
             _ => {
                 self.err(
@@ -1838,14 +1927,16 @@ impl<'a> Analyzer<'a> {
                 };
             }
         };
-        if name == "len" && self.is_builtin("len") {
+        let internal = self
+            .resolve_item(VisKind::Fn, &name, callee.span)
+            .unwrap_or_else(|| name.clone());
+        if internal == "len" && self.is_builtin("len") {
             return self.check_len_call(args, span);
         }
-        self.check_vis(VisKind::Fn, &name, callee.span);
         let fty = self
             .functions
             .iter()
-            .find(|(n, _, _, _)| n == &name)
+            .find(|(n, _, _, _)| n == &internal)
             .map(|(_, t, _, _)| t.clone());
         match fty {
             Some(Type::Fn { params, ret }) => {
@@ -1882,7 +1973,7 @@ impl<'a> Analyzer<'a> {
                 HirExpr {
                     ty: *ret,
                     kind: HirExprKind::Call {
-                        name,
+                        name: internal,
                         args: checked,
                     },
                     span,
@@ -1916,12 +2007,12 @@ impl<'a> Analyzer<'a> {
     fn resolve_type(&mut self, te: &TypeExpr) -> Type {
         match &te.kind {
             TypeExprKind::Named(n) => {
+                let internal = self.vis.resolve(VisKind::Type, n, te.span).map(|(i, _)| i);
                 if let Some(t) = parse_named_type(n) {
                     t
-                } else if let Some(t) = self.resolve_aggregate(n) {
-                    self.check_vis(VisKind::Struct, n, te.span);
+                } else if let Some(t) = self.resolve_type_name(n, te.span) {
                     t
-                } else if self.resolving.iter().any(|r| r == n) {
+                } else if internal.map_or(false, |i| self.resolving.contains(&i)) {
                     self.err(
                         format!("recursive type `{n}` has infinite size"),
                         te.span,
@@ -1939,6 +2030,8 @@ impl<'a> Analyzer<'a> {
             TypeExprKind::Array { elem, len } => {
                 if *len < 0 {
                     self.err("array length must be non-negative", te.span, "E0262");
+                } else if *len > i64::from(i32::MAX) {
+                    self.err("array length does not fit in `i32`", te.span, "E0262");
                 }
                 Type::Array {
                     elem: Box::new(self.resolve_type(elem)),
@@ -1947,13 +2040,6 @@ impl<'a> Analyzer<'a> {
             }
             TypeExprKind::Unit => Type::Unit,
         }
-    }
-
-    fn lookup_struct(&self, name: &str) -> Option<Type> {
-        self.structs
-            .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.ty.clone())
     }
 
     fn err(&mut self, message: impl Into<String>, span: Span, code: &'static str) {

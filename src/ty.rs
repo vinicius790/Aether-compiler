@@ -63,6 +63,20 @@ impl Type {
         }
     }
 
+    /// The enum inside this type that keeps it from having a default value
+    /// (`let x: T;` zero-fills every other type), if any. An array of
+    /// length 0 needs no element.
+    pub fn enum_without_default(&self) -> Option<&Type> {
+        match self {
+            Type::Enum { .. } => Some(self),
+            Type::Array { len: 0, .. } => None,
+            Type::Array { elem, .. } => elem.enum_without_default(),
+            Type::Struct { fields, .. } => fields.iter().find_map(|(_, t)| t.enum_without_default()),
+            Type::Tuple(elems) => elems.iter().find_map(Type::enum_without_default),
+            _ => None,
+        }
+    }
+
     pub fn field(&self, name: &str) -> Option<(usize, &Type)> {
         match self {
             Type::Struct { fields, .. } => fields
@@ -75,6 +89,9 @@ impl Type {
                     return None;
                 }
                 let i: usize = name.parse().ok()?;
+                if i.to_string() != name {
+                    return None; // `01` is not a tuple index
+                }
                 elems.get(i).map(|t| (i, t))
             }
             _ => None,
@@ -215,7 +232,7 @@ impl fmt::Display for Type {
             Type::String => write!(f, "string"),
             Type::Char => write!(f, "char"),
             Type::Array { elem, len } => write!(f, "[{elem}; {len}]"),
-            Type::Struct { name, .. } | Type::Enum { name, .. } => write!(f, "{name}"),
+            Type::Struct { name, .. } | Type::Enum { name, .. } => write!(f, "{}", source_name(name)),
             Type::Tuple(elems) => {
                 let p: Vec<_> = elems.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", p.join(", "))
@@ -226,6 +243,17 @@ impl fmt::Display for Type {
             }
             Type::Error => write!(f, "{{error}}"),
         }
+    }
+}
+
+/// The name an item was declared with. Private items of files other than
+/// the main one get a unique internal name `name$file` (see
+/// `docs/language.md`, file-private names); messages and dumps print the
+/// part before the `$`.
+pub fn source_name(name: &str) -> &str {
+    match name.find('$') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
     }
 }
 

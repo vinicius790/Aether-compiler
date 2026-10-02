@@ -44,16 +44,27 @@ para o programa. Semântica (0.3):
   corrente: `examples/modules.ae` escreve `use "../stdlib/vec2.ae";`. A
   extensão `.ae` pode ser omitida (é acrescentada). Para fontes em memória
   (REPL, `compile_source`) a base é o diretório corrente.
-- **Espaço de nomes plano.** Não há prefixos nem `mod`: `vec2_add` chama-se
-  `vec2_add` em todo o lado, e dois ficheiros que definam o mesmo nome dão o
-  erro habitual `duplicate function` / `duplicate struct`. As importações
-  são transitivas: o que `b.ae` importa também fica visível em quem importa
-  `b.ae`.
+- **Sem prefixos.** Não há `mod`: `vec2_add` chama-se `vec2_add` em todo o
+  lado. Um item `pub` colide com qualquer outro item do mesmo nome (o erro
+  habitual `duplicate function` / `duplicate struct`), tal como dois itens
+  do mesmo ficheiro. As importações são transitivas: o que `b.ae` importa
+  também fica visível em quem importa `b.ae`.
+- **Nomes privados por ficheiro.** Um item sem `pub` pertence ao ficheiro
+  que o define: um `fn helper` privado em `a.ae` e outro em `b.ae` compilam
+  ambos e cada ficheiro chama o seu (o mesmo para `struct` e `enum`). Um nome usado no ficheiro F resolve para o item de F com
+  esse nome, se existir, senão para o item `pub` com esse nome, senão para o
+  built-in. Internamente os itens privados dos ficheiros que não são o
+  principal chamam-se `nome$N` (N = número do ficheiro); `main`, os itens
+  `pub` e os do ficheiro principal mantêm o nome. Diagnósticos, `dump-ir` e
+  os tipos mostram sempre o nome do fonte. `main` e `extern fn` (cujo nome é
+  o símbolo do anfitrião) nunca mudam de nome: dois `main`, ou duas
+  declarações do mesmo `extern fn`, colidem sempre (um `extern fn` privado
+  continua invisível aos outros ficheiros, E0281).
 - **Cada ficheiro entra uma vez** (deduplicação pelo caminho canónico):
   importar o mesmo ficheiro duas vezes, por caminhos diferentes, ou em
   ciclo (`a` → `b` → `a`) é inofensivo. `--include` / `AETHER_INCLUDE` são
   `use`s implícitos do ficheiro principal e seguem a mesma regra.
-- **Visibilidade (`pub`).** Um item definido num ficheiro diferente do que o usa (via `use` ou `--include`) só é acessível se for `pub` (`pub fn`, `pub struct`, `pub extern fn`); senão é o erro `E0281` "`NOME` is private to `FICHEIRO`", com `help: mark it `pub` in FICHEIRO`. Os itens do mesmo ficheiro são sempre acessíveis; os itens do ficheiro principal só são acessíveis a ele próprio. `pub struct` expõe o tipo; os campos são sempre públicos. Os `enum` não têm visibilidade (`pub enum` é aceite e ignorado). O espaço de nomes continua plano e as importações transitivas; dois itens privados com o mesmo nome em ficheiros diferentes continuam a dar `duplicate function`. `pub use` não existe.
+- **Visibilidade (`pub`).** Um item definido num ficheiro diferente do que o usa (via `use` ou `--include`) só é acessível se for `pub` (`pub fn`, `pub struct`, `pub enum`, `pub extern fn`); nomear um item privado de outro ficheiro (sem haver um item visível com esse nome) é o erro `E0281` "`NOME` is private to `FICHEIRO`", com `help: mark it `pub` in FICHEIRO`. Os itens do mesmo ficheiro são sempre acessíveis; os itens do ficheiro principal só são acessíveis a ele próprio. `pub struct` expõe o tipo; os campos são sempre públicos. `pub enum` expõe o tipo e todas as variantes (`E::A` em expressões e padrões); um `enum` sem `pub` é privado ao seu ficheiro como um `struct`. Um valor de tipo privado pode circular (ser devolvido, guardado, lido campo a campo) sem que o outro ficheiro nomeie o tipo. `pub use` não existe.
 - Um ficheiro só com `use` e definições (sem `main`) é uma biblioteca; o
   `main` tem de existir exatamente uma vez no programa inteiro.
 - Importação que não se consegue ler é o erro `E0280 unresolved import`,
@@ -102,7 +113,10 @@ do outro operando (`1 + a` com `a: i64` é `i64`).
 Um literal negativo é um único literal: `let y: i64 = -1;` é válido e
 `-2147483648` é um `i32` válido. Um literal inteiro cujo tipo resulte `i32`
 e que não caiba em 32 bits é erro (E0263); em contexto `i64` o literal pode
-usar os 64 bits.
+usar os 64 bits, incluindo `-9223372036854775808` (`i64::MIN`, só em
+contexto `i64`; em contexto `i32` é E0263). Só um `-` escrito directamente
+antes do literal forma o literal negativo: `--9223372036854775808` nega
+`i64::MIN` como literal e é E0263, `-(-5)` é uma negação em runtime.
 
 ### Formas de literal inteiro
 
@@ -111,8 +125,10 @@ separar dígitos em qualquer forma (`1_000_000`, `0xFFFF_FFFF`) e também na
 mantissa de um `f64` (`1_000.5`). Os prefixos são minúsculos e denotam
 *valores*, não padrões de bits: `0xFFFF_FFFF` é 4294967295 e só cabe em
 `i64`; para a máscara `i32` de 32 uns escreva `-1` ou `!0`. O valor tem de
-caber em `i64` ("invalid integer literal" caso contrário), pelo que o
-mínimo de `i64` não tem literal: escreva `-9223372036854775807 - 1`. Um
+caber em `i64`: `9223372036854775808` sem `-` é "integer literal out of
+range for i64" e uma forma mal escrita (`0x`, `0o8`) "invalid integer
+literal"; a única excepção é a magnitude de `i64::MIN` imediatamente a
+seguir a `-` (ver acima). Um
 `f64` escreve-se `1.5`, `1_000.5`, `2e10` ou `1.5e-3` (o expoente dispensa a
 parte fraccionária; sem expoente o `.` e um dígito depois dele são
 obrigatórios, de modo que `1.` e `.5` não são literais).
@@ -195,6 +211,15 @@ pelo parser (E0101).
 let [mut] nome [: tipo] [= expr];
 ```
 
+Sem inicializador, a variável começa com o valor por omissão do seu tipo
+(o tipo é então obrigatório, E0231): `0` / `0` (`i64`) / `0.0` / `false` /
+`""` / `'\0'` / `()`, e para agregados o mesmo recursivamente — `let a:
+[i32; 3];` é `[0, 0, 0]` (`len(a) == 3`, `a[1] = 5` funciona), `let s: S;`
+tem todos os campos a zero, `let t: (i32, f64);` é `(0, 0.0)`. Um `enum` não
+tem valor por omissão: `let e: E;` é o erro E0232 "enum variable needs an
+initializer", e também qualquer tipo que contenha um enum (um campo, um
+elemento de tupla, ou um array de comprimento > 0 de enums).
+
 Reatribuição só é permitida em bindings `mut` e em elementos de array /
 campos de struct / campos de tupla obtidos por indexação, também aninhados
 (`a[i][j] = v`, `o.inner.x = v`, `t.0 = v`). Esta segunda forma **não exige**
@@ -254,7 +279,20 @@ a[i]
 ```
 
 Índice fora do intervalo é erro de runtime. `len(a)` devolve o número de
-elementos (`N`) como `i32`.
+elementos (`N`) como `i32`. `N` é um literal inteiro ≥ 0 (no máximo
+`2147483647`, E0262; a VM limita ainda os arrays a 2^28 elementos).
+
+**Repetição** `[expr; N]` (N literal inteiro ≥ 0): um array `[T; N]` com `N`
+cópias de `expr`, que é avaliada **uma vez** (também quando `N` é 0, pelos
+seus efeitos). As cópias são independentes (semântica de valor): `let mut
+m = [[0; 3]; 2]; m[0][1] = 5;` não altera `m[1]`. `[0; 100000]` compila
+num ciclo, não em 100000 escritas.
+
+**Arrays vazios.** `[T; 0]` é um tipo válido em qualquer posição (variável,
+parâmetro, campo, elemento). `[]` é válido quando o contexto espera um
+array (`let z: [i32; 0] = [];`, como argumento ou campo de tipo `[T; 0]`);
+sem contexto é E0250 "cannot infer type of empty array". `len(z) == 0` e
+qualquer índice é erro de runtime.
 
 ## Tuplas
 
@@ -267,7 +305,8 @@ let (a, b) = t;
 
 Tipo `(T1, T2, ...)` e expressão `(e1, e2, ...)` com **dois ou mais**
 elementos (`()` continua a ser `unit`, `(e)` é só `e`). Acesso posicional
-`t.0`, `t.1`, ... (`t.0.1` acede ao elemento 1 do elemento 0). A
+`t.0`, `t.1`, ... (`t.0.1` acede ao elemento 1 do elemento 0); o índice é
+um decimal canónico, sem zeros à esquerda (`t.01` é "invalid tuple index"). A
 desestruturação `let [mut] (a, b, ...) = expr;` exige tantos nomes quantos
 elementos (E0269); `_` descarta um elemento. A desestruturação pode ser
 aninhada: `let (a, (b, c)) = t;` (só nomes, `_` e tuplas; qualquer outro

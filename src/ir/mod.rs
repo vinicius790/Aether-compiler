@@ -423,10 +423,9 @@ fn lower_stmt(
                 let src = lower_expr(b, init);
                 b.emit(Inst::Move { dest, src });
             } else {
-                b.emit(Inst::LoadConst {
-                    dest,
-                    value: default_const(ty),
-                });
+                // `let x: T;` — zero-filled, aggregates included
+                let src = lower_default(b, ty);
+                b.emit(Inst::Move { dest, src });
             }
             b.bind(name.clone(), dest, ty.clone());
         }
@@ -1086,6 +1085,7 @@ fn contains_match(e: &HirExpr) -> bool {
         HirExprKind::Array { elements } | HirExprKind::Tuple { elements } => {
             elements.iter().any(contains_match)
         }
+        HirExprKind::ArrayRepeat { value, .. } => contains_match(value),
         HirExprKind::StructLit { fields, .. } => fields.iter().any(|(_, e)| contains_match(e)),
         HirExprKind::EnumLit { args, .. } => args.iter().any(contains_match),
     }
@@ -1253,6 +1253,14 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
             }
             dest
         }
+        HirExprKind::ArrayRepeat { value, count } => {
+            let v = lower_expr(b, value);
+            let elem_ty = match &expr.ty {
+                Type::Array { elem, .. } => *elem.clone(),
+                _ => Type::I32,
+            };
+            fill_array(b, &elem_ty, *count, v)
+        }
         HirExprKind::StructLit { fields, .. } => {
             let dest = b.alloc_reg();
             b.emit(Inst::AllocStruct {
@@ -1349,6 +1357,135 @@ fn lit_to_const(lit: &Literal, ty: &Type) -> ConstValue {
     }
 }
 
+/// Arrays up to this length are filled with straight-line stores; longer
+/// ones with a loop, so `[x; 100000]` stays small.
+const FILL_UNROLL: i64 = 8;
+
+/// A new `[elem; len]` with every element set to `v` (stored `len` times;
+/// aggregates have value semantics, so the copies are independent).
+fn fill_array(b: &mut Builder, elem: &Type, len: i64, v: Reg) -> Reg {
+    let dest = b.alloc_reg();
+    b.emit(Inst::AllocArray {
+        dest,
+        elem: elem.clone(),
+        len,
+    });
+    if len <= FILL_UNROLL {
+        for i in 0..len.max(0) {
+            let idx = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest: idx,
+                value: ConstValue::I32(i as i32),
+            });
+            b.emit(Inst::IndexStore {
+                base: dest,
+                index: idx,
+                value: v,
+                elem: elem.clone(),
+            });
+        }
+        return dest;
+    }
+    // i = 0; while i < len { dest[i] = v; i += 1; }
+    let i = b.alloc_reg();
+    b.emit(Inst::LoadConst {
+        dest: i,
+        value: ConstValue::I32(0),
+    });
+    let limit = b.alloc_reg();
+    b.emit(Inst::LoadConst {
+        dest: limit,
+        value: ConstValue::I32(i32::try_from(len).unwrap_or(i32::MAX)),
+    });
+    let header = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.set_term(Terminator::Jump { target: header });
+    b.switch(header);
+    let cmp = b.alloc_reg();
+    b.emit(Inst::Bin {
+        dest: cmp,
+        op: BinOp::Lt,
+        ty: Type::I32,
+        lhs: i,
+        rhs: limit,
+    });
+    b.set_term(Terminator::Branch {
+        cond: cmp,
+        then_bb: body,
+        else_bb: exit,
+    });
+    b.switch(body);
+    b.emit(Inst::IndexStore {
+        base: dest,
+        index: i,
+        value: v,
+        elem: elem.clone(),
+    });
+    let one = b.alloc_reg();
+    b.emit(Inst::LoadConst {
+        dest: one,
+        value: ConstValue::I32(1),
+    });
+    b.emit(Inst::Bin {
+        dest: i,
+        op: BinOp::Add,
+        ty: Type::I32,
+        lhs: i,
+        rhs: one,
+    });
+    b.set_term(Terminator::Jump { target: header });
+    b.switch(exit);
+    dest
+}
+
+/// The value of `let x: T;`: zero / `0.0` / `false` / `""` / `'\0'` for
+/// scalars, and aggregates (arrays, structs, tuples) of those, built
+/// recursively. Enums have no default (sema rejects them, E0232).
+fn lower_default(b: &mut Builder, ty: &Type) -> Reg {
+    match ty {
+        Type::Array { elem, len } => {
+            let v = if *len > 0 {
+                lower_default(b, elem)
+            } else {
+                // never stored; any register will do
+                let r = b.alloc_reg();
+                b.emit(Inst::LoadConst {
+                    dest: r,
+                    value: ConstValue::Unit,
+                });
+                r
+            };
+            fill_array(b, elem, *len, v)
+        }
+        Type::Struct { .. } | Type::Tuple(_) => {
+            let dest = b.alloc_reg();
+            b.emit(Inst::AllocStruct {
+                dest,
+                ty: ty.clone(),
+            });
+            for (index, fty) in ty.layout_fields().unwrap_or_default().iter().enumerate() {
+                let v = lower_default(b, fty);
+                b.emit(Inst::FieldStore {
+                    base: dest,
+                    index,
+                    value: v,
+                    ty: fty.clone(),
+                });
+            }
+            dest
+        }
+        _ => {
+            let dest = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest,
+                value: default_const(ty),
+            });
+            dest
+        }
+    }
+}
+
 fn default_const(ty: &Type) -> ConstValue {
     match ty {
         Type::I32 => ConstValue::I32(0),
@@ -1376,6 +1513,8 @@ impl fmt::Display for Inst {
             Inst::Un { dest, op, ty, src } => write!(f, "  {dest} = {}.{ty} {src}", op.as_str()),
             Inst::Call { dest, func, args } => {
                 let a: Vec<_> = args.iter().map(|r| r.to_string()).collect();
+                // file-private functions print their source name
+                let func = crate::ty::source_name(func);
                 match dest {
                     Some(d) => write!(f, "  {d} = call {func}({})", a.join(", ")),
                     None => write!(f, "  call {func}({})", a.join(", ")),
@@ -1432,7 +1571,7 @@ impl fmt::Display for IrFunction {
         writeln!(
             f,
             "fn {}({}) -> {} {{",
-            self.name,
+            crate::ty::source_name(&self.name),
             params.join(", "),
             self.return_ty
         )?;

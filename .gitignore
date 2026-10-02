@@ -16,3 +16,5 @@
 *.pdb
 .env
 .aether-cache/
+# harness worktrees / local agent state
+.claude/

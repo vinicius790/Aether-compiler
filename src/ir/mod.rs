@@ -4,7 +4,7 @@
 //! stable virtual registers so lowering to the register VM is a 1:1 map.
 //! The optimizer rewrites this IR in place.
 
-use crate::sema::{HirBlock, HirExpr, HirExprKind, HirFn, HirProgram, HirStmt};
+use crate::sema::{HirArm, HirBlock, HirExpr, HirExprKind, HirFn, HirPattern, HirProgram, HirStmt};
 use crate::span::Span;
 use crate::ty::Type;
 use crate::ast::{BinOp, Literal, UnOp};
@@ -569,7 +569,287 @@ fn lower_stmt(
         HirStmt::Block(block) => {
             lower_block(b, block, break_bb, continue_bb);
         }
+        HirStmt::Match {
+            scrutinee, arms, ..
+        } => lower_match(b, scrutinee, arms, break_bb, continue_bb),
     }
+}
+
+/// True when the current block has no terminator yet (fell through).
+fn current_is_open(b: &Builder) -> bool {
+    matches!(
+        b.blocks.iter().find(|bb| bb.id == b.current).map(|bb| &bb.term),
+        Some(Terminator::Unreachable)
+    )
+}
+
+/// `match`: the enum tag (field 0) or the scalar itself is compared against
+/// each arm in order, as a chain of `Branch`es; payload bindings are
+/// `FieldLoad`s of slots `1..` into fresh registers scoped to the arm. All
+/// arms jump to a common join block.
+fn lower_match(
+    b: &mut Builder,
+    scrutinee: &HirExpr,
+    arms: &[HirArm],
+    break_bb: Option<BlockId>,
+    continue_bb: Option<BlockId>,
+) {
+    let s = lower_expr(b, scrutinee);
+    // A copy keeps the arms independent of later writes to the scrutinee's
+    // register when it is a plain local.
+    let value = b.alloc_reg();
+    b.emit(Inst::Move { dest: value, src: s });
+    let is_enum = matches!(scrutinee.ty, Type::Enum { .. });
+    let tag = if is_enum {
+        let t = b.alloc_reg();
+        b.emit(Inst::FieldLoad {
+            dest: t,
+            base: value,
+            index: 0,
+            ty: Type::I32,
+        });
+        Some(t)
+    } else {
+        None
+    };
+    let join = b.new_block();
+    for arm in arms {
+        let mark = b.locals.len();
+        let next = match &arm.pattern {
+            HirPattern::Wildcard => None,
+            HirPattern::Binding { name, ty } => {
+                let r = b.alloc_reg();
+                b.emit(Inst::Move { dest: r, src: value });
+                b.bind(name.clone(), r, ty.clone());
+                None
+            }
+            HirPattern::Literal { lit, ty } => {
+                let c = b.alloc_reg();
+                b.emit(Inst::LoadConst {
+                    dest: c,
+                    value: lit_to_const(lit, ty),
+                });
+                let cond = b.alloc_reg();
+                b.emit(Inst::Bin {
+                    dest: cond,
+                    op: BinOp::Eq,
+                    ty: ty.clone(),
+                    lhs: value,
+                    rhs: c,
+                });
+                let arm_bb = b.new_block();
+                let next = b.new_block();
+                b.set_term(Terminator::Branch {
+                    cond,
+                    then_bb: arm_bb,
+                    else_bb: next,
+                });
+                b.switch(arm_bb);
+                Some(next)
+            }
+            HirPattern::Variant { tag: want, fields } => {
+                let next = match tag {
+                    Some(tag) => {
+                        let c = b.alloc_reg();
+                        b.emit(Inst::LoadConst {
+                            dest: c,
+                            value: ConstValue::I32(*want as i32),
+                        });
+                        let cond = b.alloc_reg();
+                        b.emit(Inst::Bin {
+                            dest: cond,
+                            op: BinOp::Eq,
+                            ty: Type::I32,
+                            lhs: tag,
+                            rhs: c,
+                        });
+                        let arm_bb = b.new_block();
+                        let next = b.new_block();
+                        b.set_term(Terminator::Branch {
+                            cond,
+                            then_bb: arm_bb,
+                            else_bb: next,
+                        });
+                        b.switch(arm_bb);
+                        Some(next)
+                    }
+                    None => None,
+                };
+                for (i, field) in fields.iter().enumerate() {
+                    if let Some((name, ty)) = field {
+                        let r = b.alloc_reg();
+                        b.emit(Inst::FieldLoad {
+                            dest: r,
+                            base: value,
+                            index: i + 1,
+                            ty: ty.clone(),
+                        });
+                        b.bind(name.clone(), r, ty.clone());
+                    }
+                }
+                next
+            }
+        };
+        lower_block(b, &arm.body, break_bb, continue_bb);
+        b.unbind_to(mark);
+        if current_is_open(b) {
+            b.set_term(Terminator::Jump { target: join });
+        }
+        match next {
+            Some(next) => b.switch(next),
+            None => {
+                // catch-all arm: the remaining arms are unreachable
+                let dead = b.new_block();
+                b.switch(dead);
+                break;
+            }
+        }
+    }
+    // no arm matched (impossible for an exhaustive match): fall through
+    if current_is_open(b) {
+        b.set_term(Terminator::Jump { target: join });
+    }
+    b.switch(join);
+}
+
+/// `==` on tuples, enums and structs is elementwise: a short-circuit chain
+/// that compares the tag (enums) and each payload slot / element / field
+/// with the comparison of its own type, recursively. (The VM has no
+/// object comparison opcode; arrays keep the backend's own `==`.)
+fn lower_agg_eq(b: &mut Builder, lhs: Reg, rhs: Reg, ty: &Type) -> Reg {
+    let dest = b.alloc_reg();
+    match ty {
+        Type::Tuple(_) | Type::Struct { .. } => {
+            b.emit(Inst::LoadConst {
+                dest,
+                value: ConstValue::Bool(true),
+            });
+            let join = b.new_block();
+            let slots: Vec<(usize, Type)> = ty
+                .layout_fields()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .collect();
+            lower_slots_eq(b, dest, lhs, rhs, &slots, join);
+            b.switch(join);
+        }
+        Type::Enum { variants, .. } => {
+            let (lt, rt) = (b.alloc_reg(), b.alloc_reg());
+            b.emit(Inst::FieldLoad {
+                dest: lt,
+                base: lhs,
+                index: 0,
+                ty: Type::I32,
+            });
+            b.emit(Inst::FieldLoad {
+                dest: rt,
+                base: rhs,
+                index: 0,
+                ty: Type::I32,
+            });
+            b.emit(Inst::Bin {
+                dest,
+                op: BinOp::Eq,
+                ty: Type::I32,
+                lhs: lt,
+                rhs: rt,
+            });
+            let join = b.new_block();
+            let payload_bb = b.new_block();
+            b.set_term(Terminator::Branch {
+                cond: dest,
+                then_bb: payload_bb,
+                else_bb: join,
+            });
+            b.switch(payload_bb);
+            for (tag, (_, payload)) in variants.iter().enumerate() {
+                if payload.is_empty() {
+                    continue;
+                }
+                let c = b.alloc_reg();
+                b.emit(Inst::LoadConst {
+                    dest: c,
+                    value: ConstValue::I32(tag as i32),
+                });
+                let cond = b.alloc_reg();
+                b.emit(Inst::Bin {
+                    dest: cond,
+                    op: BinOp::Eq,
+                    ty: Type::I32,
+                    lhs: lt,
+                    rhs: c,
+                });
+                let this_bb = b.new_block();
+                let next_bb = b.new_block();
+                b.set_term(Terminator::Branch {
+                    cond,
+                    then_bb: this_bb,
+                    else_bb: next_bb,
+                });
+                b.switch(this_bb);
+                let slots: Vec<(usize, Type)> = payload
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(i, t)| (i + 1, t))
+                    .collect();
+                lower_slots_eq(b, dest, lhs, rhs, &slots, join);
+                b.switch(next_bb);
+            }
+            // payload-less variant: tags were equal, so the values are equal
+            b.set_term(Terminator::Jump { target: join });
+            b.switch(join);
+        }
+        other => {
+            b.emit(Inst::Bin {
+                dest,
+                op: BinOp::Eq,
+                ty: other.clone(),
+                lhs,
+                rhs,
+            });
+        }
+    }
+    dest
+}
+
+/// Compares the given `(field index, type)` slots of two aggregates in
+/// order, writing each partial result to `dest` and jumping to `join` as
+/// soon as one differs. Ends in `join`.
+fn lower_slots_eq(
+    b: &mut Builder,
+    dest: Reg,
+    lhs: Reg,
+    rhs: Reg,
+    slots: &[(usize, Type)],
+    join: BlockId,
+) {
+    for (index, ty) in slots {
+        let (l, r) = (b.alloc_reg(), b.alloc_reg());
+        b.emit(Inst::FieldLoad {
+            dest: l,
+            base: lhs,
+            index: *index,
+            ty: ty.clone(),
+        });
+        b.emit(Inst::FieldLoad {
+            dest: r,
+            base: rhs,
+            index: *index,
+            ty: ty.clone(),
+        });
+        let eq = lower_agg_eq(b, l, r, ty);
+        b.emit(Inst::Move { dest, src: eq });
+        let cont = b.new_block();
+        b.set_term(Terminator::Branch {
+            cond: eq,
+            then_bb: cont,
+            else_bb: join,
+        });
+        b.switch(cont);
+    }
+    b.set_term(Terminator::Jump { target: join });
 }
 
 /// Stores `src` into an lvalue.
@@ -663,6 +943,26 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
             b.set_term(Terminator::Jump { target: join });
             b.switch(join);
             dest
+        }
+        HirExprKind::Binary { op, lhs, rhs }
+            if matches!(op, BinOp::Eq | BinOp::Ne)
+                && matches!(lhs.ty, Type::Tuple(_) | Type::Enum { .. } | Type::Struct { .. }) =>
+        {
+            let l = lower_expr(b, lhs);
+            let r = lower_expr(b, rhs);
+            let eq = lower_agg_eq(b, l, r, &lhs.ty);
+            if *op == BinOp::Eq {
+                eq
+            } else {
+                let dest = b.alloc_reg();
+                b.emit(Inst::Un {
+                    dest,
+                    op: UnOp::Not,
+                    ty: Type::Bool,
+                    src: eq,
+                });
+                dest
+            }
         }
         HirExprKind::Binary { op, lhs, rhs } => {
             let l = lower_expr(b, lhs);
@@ -772,6 +1072,51 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> Reg {
                 b.emit(Inst::FieldStore {
                     base: dest,
                     index,
+                    value: v,
+                    ty: e.ty.clone(),
+                });
+            }
+            dest
+        }
+        HirExprKind::Tuple { elements } => {
+            let dest = b.alloc_reg();
+            b.emit(Inst::AllocStruct {
+                dest,
+                ty: expr.ty.clone(),
+            });
+            for (index, e) in elements.iter().enumerate() {
+                let v = lower_expr(b, e);
+                b.emit(Inst::FieldStore {
+                    base: dest,
+                    index,
+                    value: v,
+                    ty: e.ty.clone(),
+                });
+            }
+            dest
+        }
+        HirExprKind::EnumLit { tag, args } => {
+            let dest = b.alloc_reg();
+            b.emit(Inst::AllocStruct {
+                dest,
+                ty: expr.ty.clone(),
+            });
+            let t = b.alloc_reg();
+            b.emit(Inst::LoadConst {
+                dest: t,
+                value: ConstValue::I32(*tag as i32),
+            });
+            b.emit(Inst::FieldStore {
+                base: dest,
+                index: 0,
+                value: t,
+                ty: Type::I32,
+            });
+            for (i, e) in args.iter().enumerate() {
+                let v = lower_expr(b, e);
+                b.emit(Inst::FieldStore {
+                    base: dest,
+                    index: i + 1,
                     value: v,
                     ty: e.ty.clone(),
                 });
@@ -929,6 +1274,57 @@ mod tests {
     use crate::parser::parse;
     use crate::sema::analyze;
     use crate::span::FileId;
+
+    #[test]
+    fn match_lowers_to_tag_load_and_branch_chain() {
+        let src = "
+            enum E { A(i32), B }
+            fn main() -> i32 {
+                let e = E::A(4);
+                match e {
+                    E::A(x) => { return x; }
+                    E::B => { return 0; }
+                }
+            }";
+        let (toks, _) = crate::lexer::tokenize(crate::span::FileId(0), src);
+        let (prog, _) = crate::parser::parse(toks);
+        let (hir, diags) = crate::sema::analyze(&prog);
+        assert!(!diags.has_errors(), "{:?}", diags);
+        let ir = emit_ir(&hir.unwrap());
+        let main = ir.function("main").unwrap();
+        let insts: Vec<&Inst> = main.blocks.iter().flat_map(|bb| bb.insts.iter()).collect();
+        // enum literal: alloc + tag store at field 0 + payload at field 1
+        assert!(insts.iter().any(|i| matches!(i, Inst::AllocStruct { ty: Type::Enum { .. }, .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::FieldStore { index: 0, .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::FieldStore { index: 1, .. })));
+        // match: tag load, i32 compare, payload binding load
+        assert!(insts.iter().any(|i| matches!(i, Inst::FieldLoad { index: 0, ty: Type::I32, .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::Bin { op: BinOp::Eq, ty: Type::I32, .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::FieldLoad { index: 1, ty: Type::I32, .. })));
+        let branches = main
+            .blocks
+            .iter()
+            .filter(|bb| matches!(bb.term, Terminator::Branch { .. }))
+            .count();
+        assert!(branches >= 2, "{}", dump_ir(&ir));
+        assert!(crate::ir::verify::verify_module(&ir).is_ok(), "{}", dump_ir(&ir));
+    }
+
+    #[test]
+    fn tuple_equality_lowers_elementwise() {
+        let src = "fn main() -> i32 { let a = (1, 2.5); let b = (1, 2.5); if a == b { return 1; } return 0; }";
+        let (toks, _) = crate::lexer::tokenize(crate::span::FileId(0), src);
+        let (prog, _) = crate::parser::parse(toks);
+        let (hir, diags) = crate::sema::analyze(&prog);
+        assert!(!diags.has_errors(), "{:?}", diags);
+        let ir = emit_ir(&hir.unwrap());
+        let main = ir.function("main").unwrap();
+        let insts: Vec<&Inst> = main.blocks.iter().flat_map(|bb| bb.insts.iter()).collect();
+        // no `==` at the tuple type: one i32 compare and one f64 compare instead
+        assert!(!insts.iter().any(|i| matches!(i, Inst::Bin { ty: Type::Tuple(_), .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::Bin { op: BinOp::Eq, ty: Type::I32, .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::Bin { op: BinOp::Eq, ty: Type::F64, .. })));
+    }
 
     #[test]
     fn lowers_add() {

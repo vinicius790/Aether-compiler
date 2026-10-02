@@ -1,0 +1,209 @@
+fn main() -> i32 {
+bb0:
+  %1 = const 3_f64
+  %2 = const 4_f64
+  %3 = call vec2_new(%1, %2)
+  %0 = mov %3
+  %5 = const 1_f64
+  %6 = const 2_f64
+  %7 = call vec2_new(%5, %6)
+  %4 = mov %7
+  %8 = call vec2_length(%0)
+  call print_f64(%8)
+  %9 = const ()
+  %10 = call vec2_dot(%0, %4)
+  call print_f64(%10)
+  %11 = const ()
+  %13 = call vec2_add(%0, %4)
+  %14 = call vec2_sub(%13, %4)
+  %15 = const 2_f64
+  %16 = call vec2_scale(%14, %15)
+  %12 = mov %16
+  %17 = field %12.0
+  call print_f64(%17)
+  %18 = const ()
+  %19 = field %12.1
+  call print_f64(%19)
+  %20 = const ()
+  %22 = const 12345_i32
+  %21 = mov %22
+  %24 = const 0_i32
+  %23 = mov %24
+  %26 = const 0_i32
+  %25 = mov %26
+  jmp bb1
+bb1:
+  %27 = const 5_i32
+  %28 = <.i32 %23, %27
+  br %28, bb2, bb3
+bb2:
+  %29 = call rng_next(%21)
+  %21 = mov %29
+  %31 = const 1_i32
+  %32 = const 7_i32
+  %33 = call rng_range(%21, %31, %32)
+  %30 = mov %33
+  %35 = const 1_i32
+  %36 = >=.i32 %30, %35
+  %34 = mov %36
+  br %36, bb4, bb5
+bb3:
+  call print_i32(%21)
+  %43 = const ()
+  call print_i32(%25)
+  %44 = const ()
+  %45 = const 0_i32
+  ret %45
+bb4:
+  %37 = const 6_i32
+  %38 = <=.i32 %30, %37
+  %34 = mov %38
+  jmp bb5
+bb5:
+  call assert(%34)
+  %39 = const ()
+  %40 = +.i32 %25, %30
+  %25 = mov %40
+  %41 = const 1_i32
+  %42 = +.i32 %23, %41
+  %23 = mov %42
+  jmp bb1
+bb6:
+  %46 = const 0_i32
+  ret %46
+}
+
+fn vec2_new(%0: f64 /* x */, %1: f64 /* y */) -> Vec2 {
+bb0:
+  %2 = alloc Vec2
+  store %2.0 = %0
+  store %2.1 = %1
+  ret %2
+bb1:
+  ret
+}
+
+fn vec2_add(%0: Vec2 /* a */, %1: Vec2 /* b */) -> Vec2 {
+bb0:
+  %2 = alloc Vec2
+  %3 = field %0.0
+  %4 = field %1.0
+  %5 = +.f64 %3, %4
+  store %2.0 = %5
+  %6 = field %0.1
+  %7 = field %1.1
+  %8 = +.f64 %6, %7
+  store %2.1 = %8
+  ret %2
+bb1:
+  ret
+}
+
+fn vec2_sub(%0: Vec2 /* a */, %1: Vec2 /* b */) -> Vec2 {
+bb0:
+  %2 = alloc Vec2
+  %3 = field %0.0
+  %4 = field %1.0
+  %5 = -.f64 %3, %4
+  store %2.0 = %5
+  %6 = field %0.1
+  %7 = field %1.1
+  %8 = -.f64 %6, %7
+  store %2.1 = %8
+  ret %2
+bb1:
+  ret
+}
+
+fn vec2_scale(%0: Vec2 /* v */, %1: f64 /* k */) -> Vec2 {
+bb0:
+  %2 = alloc Vec2
+  %3 = field %0.0
+  %4 = *.f64 %3, %1
+  store %2.0 = %4
+  %5 = field %0.1
+  %6 = *.f64 %5, %1
+  store %2.1 = %6
+  ret %2
+bb1:
+  ret
+}
+
+fn vec2_dot(%0: Vec2 /* a */, %1: Vec2 /* b */) -> f64 {
+bb0:
+  %2 = field %0.0
+  %3 = field %1.0
+  %4 = *.f64 %2, %3
+  %5 = field %0.1
+  %6 = field %1.1
+  %7 = *.f64 %5, %6
+  %8 = +.f64 %4, %7
+  ret %8
+bb1:
+  ret
+}
+
+fn vec2_length(%0: Vec2 /* v */) -> f64 {
+bb0:
+  %1 = call vec2_dot(%0, %0)
+  %2 = call sqrt(%1)
+  ret %2
+bb1:
+  ret
+}
+
+fn rng_next(%0: i32 /* state */) -> i32 {
+bb0:
+  %1 = mov %0
+  %2 = const 0_i32
+  %3 = ==.i32 %1, %2
+  br %3, bb1, bb2
+bb1:
+  %4 = const 1_i32
+  %1 = mov %4
+  jmp bb3
+bb2:
+  jmp bb3
+bb3:
+  %5 = const 13_i32
+  %6 = <<.i32 %1, %5
+  %7 = ^.i32 %1, %6
+  %1 = mov %7
+  %8 = const 17_i32
+  %9 = >>.i32 %1, %8
+  %10 = const 32767_i32
+  %11 = &.i32 %9, %10
+  %12 = ^.i32 %1, %11
+  %1 = mov %12
+  %13 = const 5_i32
+  %14 = <<.i32 %1, %13
+  %15 = ^.i32 %1, %14
+  %1 = mov %15
+  ret %1
+bb4:
+  %16 = const 0_i32
+  ret %16
+}
+
+fn rng_range(%0: i32 /* state */, %1: i32 /* lo */, %2: i32 /* hi */) -> i32 {
+bb0:
+  %3 = <=.i32 %2, %1
+  br %3, bb1, bb2
+bb1:
+  ret %1
+bb2:
+  jmp bb3
+bb3:
+  %4 = const 2147483647_i32
+  %5 = &.i32 %0, %4
+  %6 = -.i32 %2, %1
+  %7 = %.i32 %5, %6
+  %8 = +.i32 %1, %7
+  ret %8
+bb4:
+  jmp bb3
+bb5:
+  %9 = const 0_i32
+  ret %9
+}
+

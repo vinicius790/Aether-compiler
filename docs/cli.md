@@ -51,13 +51,18 @@ Num erro de runtime a CLI imprime o stdout produzido até ali antes de
 `runtime error: ...`. Exceder `--max-steps` ou `--max-depth` é um erro de
 runtime (`exit 2`) e o stdout parcial é preservado.
 
-## Vários ficheiros: `--include`
+## Vários ficheiros: `use` e `--include`
 
-A linguagem não tem `mod`/`use`. Em vez disso o *driver* aceita vários
-ficheiros: cada um recebe o seu `FileId` na sessão e é lexado em separado
-(os diagnósticos apontam para o ficheiro certo), os tokens são concatenados
-e o resultado é analisado como um único programa. Nomes repetidos entre
-ficheiros dão o erro habitual `duplicate function`.
+Um ficheiro importa outro com `use "relative/path.ae";` (caminho relativo ao
+ficheiro que importa; ver [`language.md`](language.md), “Módulos”). O
+*driver* também aceita vários ficheiros na linha de comando: cada um recebe
+o seu `FileId` na sessão e é lexado e analisado em separado (os diagnósticos
+apontam para o ficheiro certo), as importações são seguidas
+transitivamente, cada ficheiro entra uma vez (caminho canónico) e os itens
+de todos são juntos num único programa. `--include` / `AETHER_INCLUDE` são
+`use`s implícitos do ficheiro principal. Nomes repetidos entre ficheiros
+dão o erro habitual `duplicate function`; uma importação que não existe é
+`E0280 unresolved import` (exit 1).
 
 ```bash
 aether run game.ae --include stdlib/prelude.ae

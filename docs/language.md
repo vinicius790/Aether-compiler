@@ -1,4 +1,4 @@
-# Especificação da linguagem Aether 0.2
+# Especificação da linguagem Aether 0.3
 
 ## Propósito
 
@@ -26,8 +26,45 @@ arrays. Avaliação eager. Funções não são valores.
 
 ## Unidades de compilação
 
-Um arquivo `.ae` contém zero ou mais itens (`fn`, `struct`, `extern fn`).
-O ponto de entrada é `fn main() -> i32` ou `fn main() -> unit`.
+Um arquivo `.ae` contém zero ou mais itens (`fn`, `struct`, `extern fn`,
+`use`). O ponto de entrada é `fn main() -> i32` ou `fn main() -> unit`. Um
+programa pode estender-se por vários ficheiros através de `use` (ver
+[Módulos](#módulos)).
+
+## Módulos
+
+```
+use "relative/path.ae";
+```
+
+`use` é um item de topo que importa **todos** os itens de outro ficheiro
+para o programa. Semântica (0.3):
+
+- **Caminhos relativos ao ficheiro que importa**, não ao diretório
+  corrente: `examples/modules.ae` escreve `use "../stdlib/vec2.ae";`. A
+  extensão `.ae` pode ser omitida (é acrescentada). Para fontes em memória
+  (REPL, `compile_source`) a base é o diretório corrente.
+- **Espaço de nomes plano.** Não há prefixos nem `mod`: `vec2_add` chama-se
+  `vec2_add` em todo o lado, e dois ficheiros que definam o mesmo nome dão o
+  erro habitual `duplicate function` / `duplicate struct`. As importações
+  são transitivas: o que `b.ae` importa também fica visível em quem importa
+  `b.ae`.
+- **Cada ficheiro entra uma vez** (deduplicação pelo caminho canónico):
+  importar o mesmo ficheiro duas vezes, por caminhos diferentes, ou em
+  ciclo (`a` → `b` → `a`) é inofensivo. `--include` / `AETHER_INCLUDE` são
+  `use`s implícitos do ficheiro principal e seguem a mesma regra.
+- **Sem visibilidade.** `pub` é aceite antes de `fn`, `struct` e `extern fn`
+  e registado na AST (`is_pub`), mas **não é verificado**: tudo o que um
+  ficheiro define é visível em quem o importa. `pub use` não existe.
+- Um ficheiro só com `use` e definições (sem `main`) é uma biblioteca; o
+  `main` tem de existir exatamente uma vez no programa inteiro.
+- Importação que não se consegue ler é o erro `E0280 unresolved import`,
+  apontando para o `use` (`cannot read X (imported from FILE:LINE)`); o
+  limite de 8 MiB por ficheiro aplica-se a cada ficheiro importado.
+
+`use` é resolvido pelo *driver* antes da análise semântica; a AST do
+programa final contém os itens de todos os ficheiros, com os diagnósticos a
+apontar para o ficheiro certo.
 
 ## Tipos
 
@@ -209,6 +246,82 @@ a[i]
 
 Índice fora do intervalo é erro de runtime. `len(a)` devolve o número de
 elementos (`N`) como `i32`.
+
+## Tuplas
+
+```
+let t: (i32, bool) = (1, true);
+t.0            // 1
+t.1 = false;   // campos são atribuíveis (t: mut)
+let (a, b) = t;
+```
+
+Tipo `(T1, T2, ...)` e expressão `(e1, e2, ...)` com **dois ou mais**
+elementos (`()` continua a ser `unit`, `(e)` é só `e`). Acesso posicional
+`t.0`, `t.1`, ... (`t.0.1` acede ao elemento 1 do elemento 0). A
+desestruturação `let [mut] (a, b, ...) = expr;` exige tantos nomes quantos
+elementos (E0269); `_` descarta um elemento. Tuplas têm semântica de valor
+como structs. `==` / `!=` comparam elemento a elemento (todos os elementos
+têm de suportar `==`); `<` etc. não existem.
+
+## Enums
+
+```
+enum Shape {
+    Circle(f64),
+    Rect(i32, i32),
+    Empty,
+}
+let c = Shape::Circle(1.5);
+let e = Shape::Empty;
+```
+
+Cada variante tem 0..n cargas posicionais. Construção `Enum::Variante(args)`
+(a aridade e os tipos são verificados: E0267, E0269); variante sem carga
+escreve-se sem parênteses. `==` / `!=` comparam a etiqueta e, se igual, a
+carga elemento a elemento; `<` etc. são rejeitados (E0244). Um enum não
+pode conter-se a si próprio, directa ou indirectamente (E0205); nomes de
+structs e enums partilham o mesmo espaço (E0201). As cargas só são
+acessíveis por `match` / `if let`.
+
+Representação: um objecto cujo campo 0 é a etiqueta (`i32`, índice da
+variante na declaração) e os campos `1..=max_carga` as ranhuras de carga
+(as não usadas pela variante activa ficam `unit`).
+
+## `match`
+
+```
+match s {
+    Shape::Circle(r) => { ... }
+    Shape::Rect(w, _) => { ... }
+    _ => { ... }
+}
+```
+
+`match` é uma **instrução** (como `if`): cada braço é `Padrão => Bloco`
+(vírgula opcional entre braços) e os blocos podem `return` / `break` /
+`continue`. Os braços são testados por ordem. Padrões:
+
+- `Enum::Variante(p1, ..., pn)` com um nome (vincula a carga, imutável) ou
+  `_` por posição (padrões aninhados não são suportados, E0268);
+- literal `i32` / `i64` (também negativo), `bool`, `char`, `string`, para
+  escrutinador do mesmo tipo (E0269; floats não são padrões);
+- `nome` — vincula o escrutinador inteiro e apanha tudo;
+- `_` — apanha tudo.
+
+Exaustividade (E0270): um `match` sobre enum cobre todas as variantes ou
+tem um braço `_`/nome; sobre escalares exige sempre um braço `_`/nome. Uma
+variante repetida é erro (E0271). Um `match` cujos braços todos retornam
+conta como caminho de retorno da função.
+
+## `if let`
+
+```
+if let Shape::Rect(w, h) = s { ... } else { ... }
+```
+
+Açúcar para um `match` de dois braços: o padrão dado e `_ => { else }`
+(bloco vazio sem `else`). Vale qualquer padrão de `match`.
 
 ## Strings
 

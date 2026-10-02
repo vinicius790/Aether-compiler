@@ -9,6 +9,7 @@ use crate::backend::bytecode::{BytecodeModule, CmpOp, Immediate, Op};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,11 +21,20 @@ pub enum Value {
     Str(String),
     Char(char),
     Unit,
-    Array(Vec<Value>),
-    Object(Vec<Value>),
+    /// Copy-on-write aggregate: `Clone` shares the buffer (O(1)); writers go
+    /// through [`Rc::make_mut`] and copy only while the buffer is shared.
+    Array(Rc<Vec<Value>>),
+    /// Struct fields, same copy-on-write scheme as `Array`.
+    Object(Rc<Vec<Value>>),
 }
 
 impl Value {
+    /// Wraps `xs` as an array value.
+    pub fn array(xs: Vec<Value>) -> Value { Value::Array(Rc::new(xs)) }
+
+    /// Wraps `fields` as a struct value.
+    pub fn object(fields: Vec<Value>) -> Value { Value::Object(Rc::new(fields)) }
+
     /// Source-level type name, used in runtime error messages.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -203,8 +213,9 @@ enum Flow {
     Yield,
 }
 
-/// Read target for out-of-range registers (never written to).
-static UNIT: Value = Value::Unit;
+/// Read target for out-of-range registers (never written to). A `const`
+/// reference rather than a `static`: `Value` holds `Rc`, so it is not `Sync`.
+const UNIT: &Value = &Value::Unit;
 
 impl<'a> Vm<'a> {
     pub fn new(module: &'a BytecodeModule, opts: VmOptions) -> Self {
@@ -629,7 +640,7 @@ impl<'a> Vm<'a> {
                 set_reg(Value::Char(c), &mut self.frames, *dest);
             }
             Op::AllocArr { dest, len } => {
-                set_reg(Value::Array(vec![Value::I32(0); *len as usize]), &mut self.frames, *dest);
+                set_reg(Value::array(vec![Value::I32(0); *len as usize]), &mut self.frames, *dest);
             }
             Op::LoadIdx { dest, base, index } => {
                 let idx = reg(&self.frames, *index).as_i32();
@@ -661,13 +672,15 @@ impl<'a> Vm<'a> {
                         if idx < 0 || idx as usize >= xs.len() {
                             return Err(VmError::Runtime(format!("array index {idx} out of bounds")));
                         }
-                        xs[idx as usize] = val;
+                        // Copy-on-write: only copies the buffer if another
+                        // register/value still shares it.
+                        Rc::make_mut(xs)[idx as usize] = val;
                     }
                     _ => return Err(VmError::Runtime("store into non-array".into())),
                 }
             }
             Op::AllocObj { dest, fields } => {
-                set_reg(Value::Object(vec![Value::Unit; *fields as usize]), &mut self.frames, *dest);
+                set_reg(Value::object(vec![Value::Unit; *fields as usize]), &mut self.frames, *dest);
             }
             Op::LoadField { dest, base, field } => {
                 let v = match reg(&self.frames, *base) {
@@ -681,7 +694,7 @@ impl<'a> Vm<'a> {
                 let frame = self.frames.last_mut().expect("frame");
                 if let Some(Value::Object(xs)) = frame.regs.get_mut(*base as usize) {
                     if (*field as usize) < xs.len() {
-                        xs[*field as usize] = val;
+                        Rc::make_mut(xs)[*field as usize] = val;
                     }
                 }
             }
@@ -801,7 +814,7 @@ fn reg(frames: &[Frame], r: u16) -> &Value {
     frames
         .last()
         .and_then(|f| f.regs.get(r as usize))
-        .unwrap_or(&UNIT)
+        .unwrap_or(UNIT)
 }
 
 fn set_reg(v: Value, frames: &mut [Frame], r: u16) {
@@ -1008,7 +1021,9 @@ mod tests {
     use crate::sema::analyze;
     use crate::span::FileId;
 
-    fn run_src(src: &str) -> (Value, String) {
+    fn run_src(src: &str) -> (Value, String) { run_src_at(src, 2) }
+
+    fn run_src_at(src: &str, level: u8) -> (Value, String) {
         let (toks, d1) = tokenize(FileId(0), src);
         assert!(!d1.has_errors());
         let (prog, d2) = parse(toks);
@@ -1016,7 +1031,7 @@ mod tests {
         let (hir, d3) = analyze(&prog);
         assert!(!d3.has_errors());
         let ir = emit_ir(&hir.unwrap());
-        let (ir, _) = optimize(ir, 2);
+        let (ir, _) = optimize(ir, level);
         let bc = assemble(&ir).expect("assemble");
         let (v, out, _) = execute_captured(&bc).expect("vm");
         (v, out)
@@ -1326,5 +1341,93 @@ mod tests {
         assert_eq!(v, Value::I32(n));
         assert!(steps > n as u64 && steps < 20 * n as u64, "steps = {steps}");
         assert!(elapsed.as_secs_f64() < 2.0, "20k-element sum took {elapsed:?} (O(n^2) regression?)");
+    }
+
+    // --- copy-on-write aggregates -------------------------------------
+
+    #[test]
+    fn cow_clone_shares_until_written() {
+        let a = Value::array(vec![Value::I32(1), Value::I32(2)]);
+        let mut b = a.clone();
+        if let (Value::Array(x), Value::Array(y)) = (&a, &b) {
+            assert!(Rc::ptr_eq(x, y), "clone must share the buffer");
+        }
+        if let Value::Array(xs) = &mut b {
+            Rc::make_mut(xs)[0] = Value::I32(9);
+        }
+        assert_eq!(a, Value::array(vec![Value::I32(1), Value::I32(2)]));
+        assert_eq!(b, Value::array(vec![Value::I32(9), Value::I32(2)]));
+        assert_eq!(a.to_string(), "[1, 2]");
+        assert_eq!(Value::object(vec![Value::I32(1)]).to_string(), "{1}");
+        assert_eq!(format!("{:?}", Value::array(vec![])), "Array([])");
+    }
+
+    #[test]
+    fn cow_shared_array_is_not_mutated_through_the_other_handle() {
+        let src = r#"
+            fn poke(a: [i32; 3]) -> i32 { let mut c = a; c[1] = 50; return c[1]; }
+            fn main() -> i32 {
+                let a = [1, 2, 3];
+                let mut b = a;
+                let c = b;
+                b[0] = 9;
+                let n = poke(a);
+                print_i32(a[0]); print_i32(b[0]); print_i32(c[0]);
+                print_i32(a[1]); print_i32(n);
+                return a[0] + b[0];
+            }
+        "#;
+        for level in [0u8, 2u8] {
+            let (v, out) = run_src_at(src, level);
+            assert_eq!(v, Value::I32(10), "-O{level}");
+            assert_eq!(out, "1\n9\n1\n2\n50\n", "-O{level}");
+        }
+    }
+
+    #[test]
+    fn cow_nested_array_write_back_still_works() {
+        let src = r#"
+            fn main() -> i32 {
+                let mut g = [[1, 2], [3, 4]];
+                let snap = g;
+                let mut row = g[1];
+                g[1][0] = 30;
+                row[1] = 40;
+                g[0] = row;
+                print_i32(g[0][0]); print_i32(g[0][1]); print_i32(g[1][0]); print_i32(g[1][1]);
+                print_i32(snap[0][0]); print_i32(snap[1][0]); print_i32(row[0]);
+                return g[0][1] + snap[1][1];
+            }
+        "#;
+        for level in [0u8, 2u8] {
+            let (v, out) = run_src_at(src, level);
+            assert_eq!(v, Value::I32(44), "-O{level}");
+            assert_eq!(out, "3\n40\n30\n4\n1\n3\n3\n", "-O{level}");
+        }
+    }
+
+    #[test]
+    fn cow_struct_in_array_in_struct() {
+        let src = r#"
+            struct In { v: i32 }
+            struct Out { xs: [In; 2], k: i32 }
+            fn main() -> i32 {
+                let mut o = Out { xs: [In { v: 1 }, In { v: 2 }], k: 7 };
+                let keep = o;
+                let mut inner = o.xs[1];
+                inner.v = 20;
+                o.xs[1] = inner;
+                o.xs[0].v = 10;
+                o.k = 8;
+                print_i32(o.xs[0].v); print_i32(o.xs[1].v); print_i32(o.k);
+                print_i32(keep.xs[0].v); print_i32(keep.xs[1].v); print_i32(keep.k);
+                return o.xs[0].v + keep.xs[1].v;
+            }
+        "#;
+        for level in [0u8, 2u8] {
+            let (v, out) = run_src_at(src, level);
+            assert_eq!(v, Value::I32(12), "-O{level}");
+            assert_eq!(out, "10\n20\n8\n1\n2\n7\n", "-O{level}");
+        }
     }
 }

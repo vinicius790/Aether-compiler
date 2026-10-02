@@ -107,9 +107,18 @@ pub fn emit_llvm_ir(module: &IrModule) -> String {
     out.push_str("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
     out.push_str("target triple = \"x86_64-pc-linux-gnu\"\n\n");
 
+    // Structs and enums get a named type; an enum is `{ i32 tag, slots... }`
+    // with each slot typed by the first variant that uses it. Tuples are
+    // spelled out as literal struct types wherever they appear.
     for (name, ty) in &module.structs {
-        if let Type::Struct { fields, .. } = ty {
-            let parts: Vec<String> = fields.iter().map(|(_, t)| llvm_ty(t)).collect();
+        if let Some(fields) = ty.layout_fields() {
+            let parts: Vec<String> = fields.iter().map(llvm_ty).collect();
+            if ty.enum_has_slot_conflict() {
+                let _ = writeln!(
+                    out,
+                    "; UNSUPPORTED: enum {name} puts different types in one payload slot (VM-only)"
+                );
+            }
             let _ = writeln!(out, "{} = type {{ {} }}", struct_name(name), parts.join(", "));
         }
     }
@@ -548,7 +557,7 @@ impl FnCtx<'_, '_> {
         let b = self.load(base);
         let p = self.tmp();
         match self.regs.ty(base).cloned() {
-            Some(st @ Type::Struct { .. }) => {
+            Some(st @ (Type::Struct { .. } | Type::Tuple(_) | Type::Enum { .. })) => {
                 let sty = llvm_ty(&st);
                 self.line(&format!("{p} = getelementptr {sty}, ptr {b}, i32 0, i32 {index}"));
             }
@@ -731,6 +740,10 @@ fn emit_inst(fx: &mut FnCtx, inst: &Inst) {
             fx.store(*dest, &t);
         }
         Inst::AllocStruct { dest, ty } => {
+            if ty.enum_has_slot_conflict() {
+                fx.line("; UNSUPPORTED: enum with mixed payload types per slot");
+                fx.line("call void @abort()");
+            }
             let t = fx.tmp();
             fx.line(&format!("{t} = alloca {}", llvm_ty(ty)));
             fx.store(*dest, &t);
@@ -756,8 +769,9 @@ fn emit_bin(fx: &mut FnCtx, dest: Reg, op: BinOp, ty: &Type, lhs: Reg, rhs: Reg)
             fx.line(&format!("{c} = call i32 @strcmp(ptr {a}, ptr {b})"));
             fx.line(&format!("{t} = icmp {} i32 {c}, 0", icmp_pred(op)));
         }
-        Type::Array { .. } | Type::Struct { .. } => {
-            // Content comparison of the backing storage.
+        Type::Array { .. } | Type::Struct { .. } | Type::Tuple(_) | Type::Enum { .. } => {
+            // Content comparison of the backing storage (the IR lowers
+            // tuple/enum equality elementwise; this is the fallback).
             let aty = llvm_ty(ty);
             let size = format!("ptrtoint (ptr getelementptr ({aty}, ptr null, i32 1) to i64)");
             let c = fx.tmp();
@@ -980,9 +994,12 @@ fn default_return(ret_ty: &Type) -> String {
         Type::Unit | Type::Error => "ret void".into(),
         Type::F64 => "ret double 0.0".into(),
         Type::Bool => "ret i1 false".into(),
-        Type::String | Type::Array { .. } | Type::Struct { .. } | Type::Fn { .. } => {
-            "ret ptr null".into()
-        }
+        Type::String
+        | Type::Array { .. }
+        | Type::Struct { .. }
+        | Type::Tuple(_)
+        | Type::Enum { .. }
+        | Type::Fn { .. } => "ret ptr null".into(),
         other => format!("ret {} 0", llvm_ty(other)),
     }
 }
@@ -1002,7 +1019,11 @@ fn llvm_ty(ty: &Type) -> String {
         Type::F64 => "double".into(),
         Type::String | Type::Fn { .. } => "ptr".into(),
         Type::Array { elem, len } => format!("[{len} x {}]", llvm_ty(elem)),
-        Type::Struct { name, .. } => struct_name(name),
+        Type::Struct { name, .. } | Type::Enum { name, .. } => struct_name(name),
+        Type::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(llvm_ty).collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
     }
 }
 
@@ -1024,7 +1045,10 @@ fn llvm_ret(ty: &Type) -> String {
 }
 
 fn is_aggregate(ty: &Type) -> bool {
-    matches!(ty, Type::Array { .. } | Type::Struct { .. })
+    matches!(
+        ty,
+        Type::Array { .. } | Type::Struct { .. } | Type::Tuple(_) | Type::Enum { .. }
+    )
 }
 
 fn struct_name(name: &str) -> String {

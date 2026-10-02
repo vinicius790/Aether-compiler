@@ -39,14 +39,25 @@
 - [x] Registradores `u16`, opcodes `Cmp` / `RemI64` / `NegI64` / conversões em falta; combinação sem opcode = erro E0300
 - [x] Semântica de valor para arrays/structs, divisão com wrapping, curto-circuito `&&` / `||`, `len` em caracteres
 - [x] Fuzzer tipado de agregados (`--kind agg`) e `tests/regressions.rs` (R1–R22)
+- [x] Módulos de ficheiro: `use "path";` (0.3.0; resolução transitiva no driver, deduplicação, caminhos relativos ao ficheiro; `stdlib/vec2.ae`, `stdlib/rng.ae`, `tests/modules.rs`)
+- [x] Tuplas `(T1, T2)`, enums com cargas posicionais, `match` exaustivo (E0270/E0271), `if let`, `let (a, b) = t;` (`tests/enums_tuples.rs`, `examples/shapes.ae`)
 
 ## Limitações conhecidas
 
 - Inferência de tipos apenas em `let` a partir do inicializador (não Hindley–Milner).
 - Funções de primeira classe / closures: não implementadas.
-- Módulos / `import`: não implementados; um arquivo = um programa.
+- Módulos: `use "path";` junta ficheiros num espaço de nomes plano; `pub` é
+  aceite mas a visibilidade não é verificada (pendente); não há `mod` nem
+  nomes qualificados.
 - Strings são imutáveis e concatenáveis; não há fatiamento.
 - Arrays têm tamanho fixo conhecido em tempo de compilação.
+- `match` é instrução, não expressão; padrões aninhados (literal dentro de
+  variante) não são suportados; enums não podem ser recursivos (não há
+  indireção).
+- LLVM: um enum cujas variantes põem tipos diferentes na mesma ranhura de
+  carga (`Circle(f64)` / `Rect(i32, i32)`) é só-VM — o emissor declara a
+  struct com o tipo da primeira variante e emite `; UNSUPPORTED` + `abort`
+  na alocação.
 - A IR não é SSA. O emissor LLVM aloca um `alloca` por registrador da IR
   (`load`/`store`), pronto para `mem2reg`; **não é um gerador LLVM de
   produção**. A VM é o backend de execução e o contrato.
@@ -71,6 +82,10 @@
 
 ## Roadmap
 
+Feito em 0.3.0: tuplas, enums com cargas, `match` / `if let`,
+desestruturação de tuplas; igualdade elemento a elemento para tuplas, enums
+e structs na IR.
+
 Feito em 0.2.2: stack slots (`alloca`) no LLVM prontos para `mem2reg`;
 inlining de folhas no otimizador próprio; gerador estendido a structs,
 arrays e strings (`--kind agg`).
@@ -81,5 +96,7 @@ natives do host (`Host::register`), `--include`/prelúdio, `bench`, REPL com
 estado, compactação de registradores, otimizador em ponto fixo com remoção
 de funções mortas.
 
-1. Módulos simples (`mod` / `use`).
+Feito em 0.3.0: módulos de ficheiro (`use "path";`).
+
+1. Visibilidade (`pub` verificado) e nomes qualificados nos módulos.
 2. Relatórios de cobertura LLVM / `cargo-fuzz` sobre a IR (o greybox da VM já existe).

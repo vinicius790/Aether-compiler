@@ -1,0 +1,273 @@
+fn area(%0: Shape /* s */) -> f64 {
+bb0:
+  %1 = mov %0
+  %2 = field %0.0
+  %3 = const 0_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb2, bb3
+bb1:
+  ret
+bb2:
+  %5 = field %1.1
+  %6 = const 3_f64
+  %7 = *.f64 %6, %5
+  %8 = *.f64 %7, %5
+  ret %8
+bb3:
+  %3 = const 1_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb5, bb6
+bb5:
+  %5 = field %1.1
+  %6 = field %1.2
+  %7 = *.f64 %5, %6
+  ret %7
+bb6:
+  %3 = const 2_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb8, bb1
+bb8:
+  %5 = const 0_f64
+  ret %5
+}
+
+fn describe(%0: Shape /* s */) -> string {
+bb0:
+  %1 = mov %0
+  %2 = field %0.0
+  %3 = const 0_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb2, bb3
+bb2:
+  %5 = const "circle"
+  ret %5
+bb3:
+  %3 = const 1_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb5, bb6
+bb5:
+  %6 = field %1.1
+  %7 = field %1.2
+  %4 = ==.f64 %6, %7
+  br %4, bb7, bb9
+bb6:
+  %5 = const "nothing"
+  ret %5
+bb7:
+  %5 = const "square"
+  ret %5
+bb9:
+  %5 = const "rectangle"
+  ret %5
+}
+
+fn min_max(%0: i32 /* a */, %1: i32 /* b */) -> (i32, i32) {
+bb0:
+  %2 = <.i32 %0, %1
+  br %2, bb1, bb3
+bb1:
+  %3 = alloc (i32, i32)
+  store %3.0 = %0
+  store %3.1 = %1
+  ret %3
+bb3:
+  %3 = alloc (i32, i32)
+  store %3.0 = %1
+  store %3.1 = %0
+  ret %3
+}
+
+fn code_for(%0: i32 /* x */) -> i32 {
+bb0:
+  %1 = mov %0
+  %2 = const 4_i32
+  %3 = ==.i32 %0, %2
+  br %3, bb2, bb3
+bb2:
+  %1 = const 40_i32
+  ret %1
+bb3:
+  %2 = const 9_i32
+  %3 = ==.i32 %1, %2
+  br %3, bb5, bb6
+bb5:
+  %1 = const 0_i32
+  ret %1
+bb6:
+  %1 = const 1_i32
+  ret %1
+}
+
+fn main() -> i32 {
+bb0:
+  %0 = alloc [Shape; 4]
+  %1 = alloc Shape
+  %2 = const 0_i32
+  store %1.0 = %2
+  %3 = const 2_f64
+  store %1.1 = %3
+  %4 = const 0_i32
+  store %0[%4] = %1
+  %5 = alloc Shape
+  %6 = const 1_i32
+  store %5.0 = %6
+  %7 = const 3_f64
+  store %5.1 = %7
+  %8 = const 4_f64
+  store %5.2 = %8
+  %9 = const 1_i32
+  store %0[%9] = %5
+  %10 = alloc Shape
+  %11 = const 1_i32
+  store %10.0 = %11
+  %12 = const 5_f64
+  store %10.1 = %12
+  %13 = const 5_f64
+  store %10.2 = %13
+  %14 = const 2_i32
+  store %0[%14] = %10
+  %15 = alloc Shape
+  %16 = const 2_i32
+  store %15.0 = %16
+  %17 = const 3_i32
+  store %0[%17] = %15
+  %18 = mov %0
+  %19 = const 0_f64
+  %20 = const 0_i32
+  %21 = const 4_i32
+  jmp bb1
+bb1:
+  %22 = <.i32 %20, %21
+  br %22, bb2, bb4
+bb2:
+  %1 = load %18[%20]
+  %23 = call describe(%1)
+  call println(%23)
+  %3 = call area(%1)
+  call print_f64(%3)
+  %7 = call area(%1)
+  %8 = +.f64 %19, %7
+  %19 = mov %8
+  jmp bb3
+bb3:
+  %2 = const 1_i32
+  %20 = +.i32 %20, %2
+  jmp bb1
+bb4:
+  call print_f64(%19)
+  %24 = alloc Named
+  %23 = const "box"
+  store %24.0 = %23
+  %1 = alloc Shape
+  %2 = const 1_i32
+  store %1.0 = %2
+  %3 = const 2_f64
+  store %1.1 = %3
+  %7 = const 8_f64
+  store %1.2 = %7
+  store %24.1 = %1
+  %25 = mov %24
+  %5 = field %24.1
+  %10 = mov %5
+  %4 = field %5.0
+  %6 = const 1_i32
+  %22 = ==.i32 %4, %6
+  br %22, bb6, bb7
+bb5:
+  %2 = const 9_i32
+  %4 = const 4_i32
+  %26 = call min_max(%2, %4)
+  %6 = field %26.0
+  %9 = field %26.1
+  %11 = mov %9
+  %27 = alloc (i32, i32)
+  store %27.0 = %6
+  store %27.1 = %9
+  %28 = mov %27
+  %14 = field %27.0
+  call print_i32(%14)
+  %16 = field %27.1
+  call print_i32(%16)
+  %29 = alloc (i32, i32)
+  %17 = const 4_i32
+  store %29.0 = %17
+  %20 = const 9_i32
+  store %29.1 = %20
+  %21 = field %27.0
+  %30 = field %29.0
+  %22 = ==.i32 %21, %30
+  %31 = mov %22
+  br %22, bb10, bb9
+bb6:
+  %3 = field %10.1
+  %7 = field %10.2
+  %23 = field %25.0
+  call println(%23)
+  %8 = *.f64 %3, %7
+  call print_f64(%8)
+  jmp bb5
+bb7:
+  %23 = const "not a box"
+  call println(%23)
+  jmp bb5
+bb9:
+  br %31, bb12, bb14
+bb10:
+  %2 = field %28.1
+  %4 = field %29.1
+  %22 = ==.i32 %2, %4
+  %31 = mov %22
+  br %22, bb9, bb9
+bb12:
+  %23 = const "pair ok"
+  call println(%23)
+  jmp bb14
+bb14:
+  %2 = const 0_i32
+  %1 = load %18[%2]
+  %5 = alloc Shape
+  %4 = const 0_i32
+  store %5.0 = %4
+  %3 = const 2_f64
+  store %5.1 = %3
+  %6 = field %1.0
+  %9 = field %5.0
+  %22 = ==.i32 %6, %9
+  br %22, bb16, bb15
+bb15:
+  %31 = !.bool %22
+  br %31, bb24, bb26
+bb16:
+  %2 = const 0_i32
+  %31 = ==.i32 %6, %2
+  br %31, bb17, bb18
+bb17:
+  %3 = field %1.1
+  %7 = field %5.1
+  %31 = ==.f64 %3, %7
+  %22 = mov %31
+  br %31, bb15, bb15
+bb18:
+  %2 = const 1_i32
+  %31 = ==.i32 %6, %2
+  br %31, bb20, bb15
+bb20:
+  %3 = field %1.1
+  %7 = field %5.1
+  %31 = ==.f64 %3, %7
+  %22 = mov %31
+  br %31, bb22, bb15
+bb22:
+  %3 = field %1.2
+  %7 = field %5.2
+  %31 = ==.f64 %3, %7
+  %22 = mov %31
+  br %31, bb15, bb15
+bb24:
+  %2 = const 1_i32
+  ret %2
+bb26:
+  %2 = call code_for(%11)
+  ret %2
+}
+

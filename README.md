@@ -3,7 +3,7 @@
 [![CI](https://img.shields.io/badge/CI-cargo%20test-0B6-blue)](.github/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.75-orange)](rust-toolchain.toml)
-[![Version](https://img.shields.io/badge/version-0.2.2-lightgrey)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-lightgrey)](CHANGELOG.md)
 
 A small, statically typed imperative language and a complete compiler
 pipeline — lexer through optimizer through a register VM — plus an
@@ -153,7 +153,7 @@ tests/        integration tests against the `aether` binary
 
 ## Compatibility
 
-- Source language version: **Aether 0.2**
+- Source language version: **Aether 0.3**
 - Bytecode is **not** stable across releases
 - LLVM text is **not** a supported ABI
 

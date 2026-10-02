@@ -8,6 +8,7 @@ examples:
 	cargo run --quiet -- run examples/fib.ae
 	cargo run --quiet -- run examples/fib.ae --include stdlib/prelude.ae
 	cargo run --quiet -- run examples/opaque.ae -O2
+	cargo run --quiet -- run examples/modules.ae
 	cargo run --quiet -- run stdlib/math.ae
 	cargo run --quiet -- optimize examples/opt_demo.ae
 	cargo run --quiet -- verify examples/fib.ae

@@ -14,8 +14,23 @@ recebem os argumentos. `Ret` escreve no `ret_reg` do chamador.
 
 ## Semântica de valor
 
-Arrays e structs copiam-se por valor (cópia profunda). A aritmética inteira,
-incluindo a divisão, usa wrapping: `i32::MIN / -1 == i32::MIN`.
+Arrays e structs comportam-se como valores: `let b = a; b[0] = 9` não altera
+`a`. A implementação é *copy-on-write*: `Value::Array(Rc<Vec<Value>>)` e
+`Value::Object(Rc<Vec<Value>>)` (`std::rc::Rc`; a VM é single-threaded e
+`Value` não é `Send`/`Sync`). `Clone` partilha o buffer em O(1); as escritas
+(`StoreIdx`, `StoreField`) passam por `Rc::make_mut`, que só copia o buffer
+se ainda houver outro detentor. Construa aggregates com `Value::array(vec)` /
+`Value::object(vec)`; o pattern `Value::Array(xs)` continua a funcionar
+(`xs: &Rc<Vec<Value>>` deref-coage a `&Vec<Value>`).
+
+Custo (release, `bench`): passar um array de 10000 elementos a uma função
+só de leitura 1000 vezes caiu de ~81 ms para ~0,6 ms em `-O0` (o resto é a
+construção do literal; a chamada passou a O(1)); uma função que muta a sua
+cópia paga exactamente uma cópia por chamada, na primeira escrita, em vez de
+uma por `Call`/`Move` (~162 ms → ~20 ms em `-O0`, ~78 ms → ~20 ms em `-O2`).
+
+A aritmética inteira, incluindo a divisão, usa wrapping:
+`i32::MIN / -1 == i32::MIN`.
 
 ## Leitura de registradores por referência
 
@@ -28,8 +43,8 @@ valor o exige:
 |--------------------------|-------------------------------------|
 | aritmética, comparações  | nada (escalares lidos por `&Value`) |
 | `LoadIdx`, `LoadField`   | **só o elemento**, nunca o contentor |
-| `StoreIdx`, `StoreField` | o valor armazenado                  |
-| `Move`, argumentos de `Call` | o valor (cópia profunda)        |
+| `StoreIdx`, `StoreField` | o valor armazenado; o contentor só se o `Rc` estiver partilhado |
+| `Move`, argumentos de `Call` | o valor (aggregates: só o `Rc`, O(1)) |
 | `Ret`                    | nada — o valor é movido do frame que termina |
 
 Consequência: `s = s + xs[i]` num loop é O(1) por iteração; antes clonava
@@ -74,6 +89,23 @@ escrito nesse registrador; uma `extern` que devolve unit ignora-o. Sem
 binding, o erro continua a ser
 ``extern function `nome` has no implementation in the VM``. Um `Err` do
 closure aborta a execução como qualquer `VmError`.
+
+Aggregates chegam ao host como `Value::Array`/`Value::Object`; o `Rc` é
+transparente na leitura e devolver um array é apenas embrulhar um `Vec`:
+
+```rust
+.register("sum", |args| {
+    let mut s = 0;
+    if let Some(Value::Array(xs)) = args.first() {
+        for x in xs.iter() { s += x.as_i32(); }   // xs: &Rc<Vec<Value>>
+    }
+    Ok(Value::I32(s))
+})
+.register("pair", |_| Ok(Value::array(vec![Value::I32(1), Value::I32(2)])))
+```
+
+Para alterar um array recebido, clone o `Value` (O(1)) e escreva via
+`Rc::make_mut`; o chamador nunca vê a mutação.
 
 `run_captured`/`execute_captured` são `execute_captured_with(m,
 VmOptions::default(), vec![])`. A camada de embedding fica em

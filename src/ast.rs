@@ -13,7 +13,18 @@ pub struct Program {
 pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
+    Enum(EnumDecl),
     Extern(ExternDecl),
+    /// `use "path";` — a file import, resolved by the driver before sema.
+    Use(UseDecl),
+}
+
+/// `use "relative/path.ae";` (`.ae` may be omitted). `path` is the literal
+/// as written; the driver resolves it relative to the importing file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseDecl {
+    pub path: String,
+    pub span: Span,
 }
 
 impl Item {
@@ -21,7 +32,9 @@ impl Item {
         match self {
             Item::Fn(f) => f.span,
             Item::Struct(s) => s.span,
+            Item::Enum(e) => e.span,
             Item::Extern(e) => e.span,
+            Item::Use(u) => u.span,
         }
     }
 
@@ -29,13 +42,17 @@ impl Item {
         match self {
             Item::Fn(f) => &f.name.name,
             Item::Struct(s) => &s.name.name,
+            Item::Enum(e) => &e.name.name,
             Item::Extern(e) => &e.name.name,
+            Item::Use(u) => &u.path,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
+    /// `pub` was written. Recorded only; visibility is not enforced in 0.3.
+    pub is_pub: bool,
     pub name: Ident,
     pub params: Vec<Param>,
     pub return_ty: TypeExpr,
@@ -45,6 +62,7 @@ pub struct FnDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternDecl {
+    pub is_pub: bool,
     pub name: Ident,
     pub params: Vec<Param>,
     pub return_ty: TypeExpr,
@@ -60,6 +78,7 @@ pub struct Param {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
+    pub is_pub: bool,
     pub name: Ident,
     pub fields: Vec<FieldDecl>,
     pub span: Span,
@@ -69,6 +88,22 @@ pub struct StructDecl {
 pub struct FieldDecl {
     pub name: Ident,
     pub ty: TypeExpr,
+    pub span: Span,
+}
+
+/// `enum Name { Variant(T1, T2), Unit }` — variants carry 0..n positional
+/// payloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub name: Ident,
+    pub variants: Vec<VariantDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantDecl {
+    pub name: Ident,
+    pub payload: Vec<TypeExpr>,
     pub span: Span,
 }
 
@@ -86,6 +121,20 @@ pub enum Stmt {
         name: Ident,
         ty: Option<TypeExpr>,
         init: Option<Expr>,
+        span: Span,
+    },
+    /// `let (a, b) = t;` — tuple destructuring; sema desugars it into a
+    /// temporary plus one `let` per element.
+    LetTuple {
+        mutable: bool,
+        names: Vec<Ident>,
+        init: Expr,
+        span: Span,
+    },
+    /// `match e { Pattern => Block ... }`; `if let` is parsed into this.
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
         span: Span,
     },
     Assign {
@@ -139,6 +188,8 @@ impl Stmt {
     pub fn span(&self) -> Span {
         match self {
             Stmt::Let { span, .. }
+            | Stmt::LetTuple { span, .. }
+            | Stmt::Match { span, .. }
             | Stmt::Assign { span, .. }
             | Stmt::Expr { span, .. }
             | Stmt::Return { span, .. }
@@ -151,6 +202,35 @@ impl Stmt {
             | Stmt::Block { span, .. } => *span,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternKind {
+    /// `_`
+    Wildcard,
+    /// `name` — binds the scrutinee (or payload slot) to a fresh local.
+    Binding(Ident),
+    /// `1`, `-1`, `true`, `'c'`, `"s"`
+    Literal(Literal),
+    /// `Enum::Variant(p1, p2)` / `Enum::Variant`
+    Variant {
+        enum_name: Ident,
+        variant: Ident,
+        fields: Vec<Pattern>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,6 +270,16 @@ pub enum ExprKind {
     StructLit {
         name: Ident,
         fields: Vec<(Ident, Expr)>,
+    },
+    /// `(a, b, ...)` with at least two elements (`()` is `Literal::Unit`).
+    Tuple {
+        elements: Vec<Expr>,
+    },
+    /// `Enum::Variant(args)` / `Enum::Variant`
+    EnumLit {
+        enum_name: Ident,
+        variant: Ident,
+        args: Vec<Expr>,
     },
     Cast {
         expr: Box<Expr>,
@@ -325,6 +415,8 @@ pub enum TypeExprKind {
         elem: Box<TypeExpr>,
         len: i64,
     },
+    /// `(T1, T2, ...)` with at least two elements.
+    Tuple(Vec<TypeExpr>),
     Unit,
 }
 
@@ -390,6 +482,13 @@ fn dump_item(item: &Item, n: usize, out: &mut String) {
             }
             out.push_str(&format!("{}}}\n", indent(n)));
         }
+        Item::Enum(e) => {
+            out.push_str(&format!("{}enum {} {{\n", indent(n), e.name.name));
+            for v in &e.variants {
+                out.push_str(&format!("{}{},\n", indent(n + 1), variant_str(v)));
+            }
+            out.push_str(&format!("{}}}\n", indent(n)));
+        }
         Item::Extern(e) => {
             out.push_str(&format!(
                 "{}extern fn {}(...) -> {};\n",
@@ -397,6 +496,9 @@ fn dump_item(item: &Item, n: usize, out: &mut String) {
                 e.name.name,
                 type_str(&e.return_ty)
             ));
+        }
+        Item::Use(u) => {
+            out.push_str(&format!("{}use {:?};\n", indent(n), u.path));
         }
     }
 }
@@ -434,6 +536,26 @@ fn dump_stmt(stmt: &Stmt, n: usize, out: &mut String) {
                 out.push_str(&format!(" = {}", expr_str(init)));
             }
             out.push_str(";\n");
+        }
+        Stmt::LetTuple {
+            mutable, names, init, ..
+        } => {
+            let names: Vec<_> = names.iter().map(|n| n.name.clone()).collect();
+            out.push_str(&format!(
+                "{}let {}({}) = {};\n",
+                indent(n),
+                if *mutable { "mut " } else { "" },
+                names.join(", "),
+                expr_str(init)
+            ));
+        }
+        Stmt::Match { scrutinee, arms, .. } => {
+            out.push_str(&format!("{}match {} {{\n", indent(n), expr_str(scrutinee)));
+            for arm in arms {
+                out.push_str(&format!("{}{} => ", indent(n + 1), pattern_str(&arm.pattern)));
+                dump_block(&arm.body, n + 1, out);
+            }
+            out.push_str(&format!("{}}}\n", indent(n)));
         }
         Stmt::Assign { target, value, .. } => {
             out.push_str(&format!(
@@ -526,8 +648,67 @@ fn expr_str(expr: &Expr) -> String {
                 .collect();
             format!("{} {{ {} }}", name.name, f.join(", "))
         }
+        ExprKind::Tuple { elements } => {
+            let e: Vec<_> = elements.iter().map(expr_str).collect();
+            format!("({})", e.join(", "))
+        }
+        ExprKind::EnumLit {
+            enum_name,
+            variant,
+            args,
+        } => {
+            let a: Vec<_> = args.iter().map(expr_str).collect();
+            if a.is_empty() {
+                format!("{}::{}", enum_name.name, variant.name)
+            } else {
+                format!("{}::{}({})", enum_name.name, variant.name, a.join(", "))
+            }
+        }
         ExprKind::Cast { expr, ty } => format!("({} as {})", expr_str(expr), type_str(ty)),
         ExprKind::Group(e) => format!("({})", expr_str(e)),
+    }
+}
+
+/// Source form of a pattern (shared by `dump-ast` and the pretty-printer).
+pub fn pattern_str(p: &Pattern) -> String {
+    match &p.kind {
+        PatternKind::Wildcard => "_".into(),
+        PatternKind::Binding(id) => id.name.clone(),
+        PatternKind::Literal(lit) => literal_str(lit),
+        PatternKind::Variant {
+            enum_name,
+            variant,
+            fields,
+        } => {
+            if fields.is_empty() {
+                format!("{}::{}", enum_name.name, variant.name)
+            } else {
+                let f: Vec<_> = fields.iter().map(pattern_str).collect();
+                format!("{}::{}({})", enum_name.name, variant.name, f.join(", "))
+            }
+        }
+    }
+}
+
+/// Source form of a literal.
+pub fn literal_str(lit: &Literal) -> String {
+    match lit {
+        Literal::Int(v) => v.to_string(),
+        Literal::Float(v) => format!("{v}"),
+        Literal::Bool(v) => v.to_string(),
+        Literal::String(s) => format!("{s:?}"),
+        Literal::Char(c) => format!("{c:?}"),
+        Literal::Unit => "()".into(),
+    }
+}
+
+/// Source form of an enum variant declaration: `Circle(f64)` / `Empty`.
+pub fn variant_str(v: &VariantDecl) -> String {
+    if v.payload.is_empty() {
+        v.name.name.clone()
+    } else {
+        let p: Vec<_> = v.payload.iter().map(type_str).collect();
+        format!("{}({})", v.name.name, p.join(", "))
     }
 }
 
@@ -535,6 +716,10 @@ fn type_str(ty: &TypeExpr) -> String {
     match &ty.kind {
         TypeExprKind::Named(n) => n.clone(),
         TypeExprKind::Array { elem, len } => format!("[{}; {len}]", type_str(elem)),
+        TypeExprKind::Tuple(elems) => {
+            let e: Vec<_> = elems.iter().map(type_str).collect();
+            format!("({})", e.join(", "))
+        }
         TypeExprKind::Unit => "unit".into(),
     }
 }

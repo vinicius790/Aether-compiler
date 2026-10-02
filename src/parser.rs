@@ -75,7 +75,13 @@ impl Parser {
                     while !self.is_eof()
                         && !matches!(
                             self.peek_kind(),
-                            TokenKind::Fn | TokenKind::Struct | TokenKind::Extern | TokenKind::Eof
+                            TokenKind::Fn
+                                | TokenKind::Struct
+                                | TokenKind::Enum
+                                | TokenKind::Extern
+                                | TokenKind::Use
+                                | TokenKind::Pub
+                                | TokenKind::Eof
                         )
                     {
                         self.bump();
@@ -94,21 +100,49 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Option<Item> {
+        // `pub` is accepted and recorded; visibility is not enforced in 0.3.
+        let is_pub = self.eat(TokenKind::Pub);
         match self.peek_kind() {
-            TokenKind::Fn => self.parse_fn().map(Item::Fn),
-            TokenKind::Struct => self.parse_struct().map(Item::Struct),
-            TokenKind::Extern => self.parse_extern().map(Item::Extern),
-            TokenKind::Eof => None,
+            TokenKind::Fn => self.parse_fn().map(|mut f| {
+                f.is_pub = is_pub;
+                Item::Fn(f)
+            }),
+            TokenKind::Struct => self.parse_struct().map(|mut s| {
+                s.is_pub = is_pub;
+                Item::Struct(s)
+            }),
+            TokenKind::Enum => self.parse_enum().map(Item::Enum),
+            TokenKind::Extern => self.parse_extern().map(|mut e| {
+                e.is_pub = is_pub;
+                Item::Extern(e)
+            }),
+            TokenKind::Use if !is_pub => self.parse_use().map(Item::Use),
+            TokenKind::Eof if !is_pub => None,
             _ => {
                 let tok = self.peek().clone();
                 self.error_at(
                     format!("expected item, found `{}`", tok.lexeme),
                     tok.span,
-                    Some("items start with `fn`, `struct` or `extern`"),
+                    Some("items start with `fn`, `struct`, `enum`, `extern` or `use`; `pub` may precede fn/struct/enum/extern"),
                 );
                 None
             }
         }
+    }
+
+    /// `use "relative/path.ae";` — resolved by the driver, not here.
+    fn parse_use(&mut self) -> Option<UseDecl> {
+        let start = self.expect(TokenKind::Use)?.span;
+        let tok = self.expect(TokenKind::String)?;
+        let (path, bad) = unescape_string(&tok.lexeme);
+        if bad {
+            self.bad_unicode_escape(tok.span);
+        }
+        let end = self.expect(TokenKind::Semicolon)?.span;
+        Some(UseDecl {
+            path,
+            span: start.merge(end),
+        })
     }
 
     fn parse_fn(&mut self) -> Option<FnDecl> {
@@ -130,6 +164,7 @@ impl Parser {
         };
         let end = body.as_ref().map(|b| b.span).unwrap_or(self.prev_span());
         Some(FnDecl {
+            is_pub: false,
             name,
             params,
             return_ty,
@@ -152,6 +187,7 @@ impl Parser {
         };
         self.expect(TokenKind::Semicolon)?;
         Some(ExternDecl {
+            is_pub: false,
             name,
             params,
             return_ty,
@@ -202,8 +238,45 @@ impl Parser {
         }
         let end = self.expect(TokenKind::RBrace)?.span;
         Some(StructDecl {
+            is_pub: false,
             name,
             fields,
+            span: start.merge(end),
+        })
+    }
+
+    /// `enum Name { Variant(T, ...), Unit, ... }`
+    fn parse_enum(&mut self) -> Option<EnumDecl> {
+        let start = self.expect(TokenKind::Enum)?.span;
+        let name = self.parse_ident()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.is_eof() {
+            let vname = self.parse_ident()?;
+            let mut payload = Vec::new();
+            if self.eat(TokenKind::LParen) {
+                while !self.check(TokenKind::RParen) && !self.is_eof() {
+                    payload.push(self.parse_type()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+            }
+            let span = vname.span.merge(self.prev_span());
+            variants.push(VariantDecl {
+                name: vname,
+                payload,
+                span,
+            });
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Some(EnumDecl {
+            name,
+            variants,
             span: start.merge(end),
         })
     }
@@ -244,7 +317,7 @@ impl Parser {
                 // else is skipped so the loop always advances.
                 if matches!(
                     self.peek_kind(),
-                    TokenKind::Fn | TokenKind::Struct | TokenKind::Extern
+                    TokenKind::Fn | TokenKind::Struct | TokenKind::Enum | TokenKind::Extern
                 ) {
                     break;
                 }
@@ -322,6 +395,7 @@ impl Parser {
                 | TokenKind::Break
                 | TokenKind::Continue
                 | TokenKind::Yield
+                | TokenKind::Match
                 | TokenKind::LBrace
         )
     }
@@ -334,6 +408,7 @@ impl Parser {
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             TokenKind::Break | TokenKind::Continue | TokenKind::Yield => self.parse_jump(),
+            TokenKind::Match => self.parse_match(),
             TokenKind::LBrace => self.parse_block_stmt(),
             _ => self.parse_expr_stmt(),
         }
@@ -397,6 +472,9 @@ impl Parser {
     fn parse_let(&mut self) -> Option<Stmt> {
         let start = self.expect(TokenKind::Let)?.span;
         let mutable = self.eat(TokenKind::Mut);
+        if self.check(TokenKind::LParen) {
+            return self.parse_let_tuple(start, mutable);
+        }
         let name = self.parse_ident()?;
         let ty = if self.eat(TokenKind::Colon) {
             Some(self.parse_type()?)
@@ -418,6 +496,156 @@ impl Parser {
         })
     }
 
+    /// `let (a, b, ...) = expr;`
+    fn parse_let_tuple(&mut self, start: Span, mutable: bool) -> Option<Stmt> {
+        let open = self.expect(TokenKind::LParen)?.span;
+        let mut names = Vec::new();
+        while !self.check(TokenKind::RParen) && !self.is_eof() {
+            names.push(self.parse_ident()?);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        let close = self.expect(TokenKind::RParen)?.span;
+        if names.len() < 2 {
+            self.error_at(
+                "tuple patterns need at least two names",
+                open.merge(close),
+                Some("write `let (a, b) = t;`"),
+            );
+        }
+        self.expect(TokenKind::Eq)?;
+        let init = self.parse_expr()?;
+        self.expect(TokenKind::Semicolon)?;
+        Some(Stmt::LetTuple {
+            mutable,
+            names,
+            init,
+            span: start.merge(self.prev_span()),
+        })
+    }
+
+    /// `match expr { Pattern => Block ,? ... }`
+    fn parse_match(&mut self) -> Option<Stmt> {
+        self.enter_nesting()?;
+        let result = self.parse_match_inner();
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_match_inner(&mut self) -> Option<Stmt> {
+        let start = self.expect(TokenKind::Match)?.span;
+        let scrutinee = self.parse_expr()?;
+        self.expect(TokenKind::LBrace)?;
+        let mut arms = Vec::new();
+        while !self.check(TokenKind::RBrace) && !self.is_eof() {
+            let pattern = self.parse_pattern()?;
+            self.expect(TokenKind::FatArrow)?;
+            let body = self.parse_block()?;
+            let span = pattern.span.merge(body.span);
+            arms.push(MatchArm {
+                pattern,
+                body,
+                span,
+            });
+            self.eat(TokenKind::Comma);
+        }
+        let end = self.expect(TokenKind::RBrace)?.span;
+        Some(Stmt::Match {
+            scrutinee,
+            arms,
+            span: start.merge(end),
+        })
+    }
+
+    /// Pattern ::= "_" | Ident | Ident "::" Ident ("(" Pattern,* ")")? | Literal
+    fn parse_pattern(&mut self) -> Option<Pattern> {
+        self.enter_nesting()?;
+        let result = self.parse_pattern_inner();
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_pattern_inner(&mut self) -> Option<Pattern> {
+        match self.peek_kind() {
+            TokenKind::Ident => {
+                let id = self.parse_ident()?;
+                if id.name == "_" {
+                    return Some(Pattern {
+                        kind: PatternKind::Wildcard,
+                        span: id.span,
+                    });
+                }
+                if self.eat(TokenKind::ColonColon) {
+                    let variant = self.parse_ident()?;
+                    let mut fields = Vec::new();
+                    if self.eat(TokenKind::LParen) {
+                        while !self.check(TokenKind::RParen) && !self.is_eof() {
+                            fields.push(self.parse_pattern()?);
+                            if !self.eat(TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(TokenKind::RParen)?;
+                    }
+                    let span = id.span.merge(self.prev_span());
+                    return Some(Pattern {
+                        kind: PatternKind::Variant {
+                            enum_name: id,
+                            variant,
+                            fields,
+                        },
+                        span,
+                    });
+                }
+                Some(Pattern {
+                    span: id.span,
+                    kind: PatternKind::Binding(id),
+                })
+            }
+            TokenKind::Int
+            | TokenKind::Float
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::String
+            | TokenKind::Char => {
+                let e = self.parse_literal()?;
+                match e.kind {
+                    ExprKind::Literal(lit) => Some(Pattern {
+                        kind: PatternKind::Literal(lit),
+                        span: e.span,
+                    }),
+                    _ => None,
+                }
+            }
+            TokenKind::Minus => {
+                let start = self.bump().span;
+                let e = self.parse_literal()?;
+                let lit = match e.kind {
+                    ExprKind::Literal(Literal::Int(v)) => Literal::Int(v.wrapping_neg()),
+                    ExprKind::Literal(Literal::Float(v)) => Literal::Float(-v),
+                    _ => {
+                        self.error_at("expected a number after `-` in pattern", e.span, None);
+                        return None;
+                    }
+                };
+                Some(Pattern {
+                    kind: PatternKind::Literal(lit),
+                    span: start.merge(e.span),
+                })
+            }
+            _ => {
+                let tok = self.peek().clone();
+                self.error_at(
+                    format!("expected pattern, found `{}`", tok.lexeme),
+                    tok.span,
+                    Some("patterns: `_`, a name, a literal, or `Enum::Variant(a, _)`"),
+                );
+                None
+            }
+        }
+    }
+
     fn parse_if(&mut self) -> Option<Stmt> {
         // `else if` chains recurse here without going through a block, so
         // they count towards the nesting limit as well.
@@ -429,24 +657,12 @@ impl Parser {
 
     fn parse_if_inner(&mut self) -> Option<Stmt> {
         let start = self.expect(TokenKind::If)?.span;
+        if self.check(TokenKind::Let) {
+            return self.parse_if_let(start);
+        }
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
-        let else_block = if self.eat(TokenKind::Else) {
-            if self.check(TokenKind::If) {
-                // else if → wrap in a block containing a single if
-                let inner = self.parse_if()?;
-                let span = inner.span();
-                Some(Block {
-                    stmts: vec![inner],
-                    tail: None,
-                    span,
-                })
-            } else {
-                Some(self.parse_block()?)
-            }
-        } else {
-            None
-        };
+        let else_block = self.parse_else()?;
         let end = else_block
             .as_ref()
             .map(|b| b.span)
@@ -455,6 +671,63 @@ impl Parser {
             cond,
             then_block,
             else_block,
+            span: start.merge(end),
+        })
+    }
+
+    /// Optional `else Block` / `else if ...` (the latter wrapped in a block).
+    fn parse_else(&mut self) -> Option<Option<Block>> {
+        if !self.eat(TokenKind::Else) {
+            return Some(None);
+        }
+        if self.check(TokenKind::If) {
+            let inner = self.parse_if()?;
+            let span = inner.span();
+            return Some(Some(Block {
+                stmts: vec![inner],
+                tail: None,
+                span,
+            }));
+        }
+        Some(Some(self.parse_block()?))
+    }
+
+    /// `if let Pattern = expr Block (else Block)?` → a two-arm `match`
+    /// whose second arm is `_` (an empty block when there is no `else`).
+    fn parse_if_let(&mut self, start: Span) -> Option<Stmt> {
+        self.expect(TokenKind::Let)?;
+        let pattern = self.parse_pattern()?;
+        self.expect(TokenKind::Eq)?;
+        let scrutinee = self.parse_expr()?;
+        let then_block = self.parse_block()?;
+        let else_block = self.parse_else()?;
+        let end = else_block
+            .as_ref()
+            .map(|b| b.span)
+            .unwrap_or(then_block.span);
+        let else_body = else_block.unwrap_or(Block {
+            stmts: Vec::new(),
+            tail: None,
+            span: end,
+        });
+        let arms = vec![
+            MatchArm {
+                span: pattern.span.merge(then_block.span),
+                pattern,
+                body: then_block,
+            },
+            MatchArm {
+                pattern: Pattern {
+                    kind: PatternKind::Wildcard,
+                    span: else_body.span,
+                },
+                span: else_body.span,
+                body: else_body,
+            },
+        ];
+        Some(Stmt::Match {
+            scrutinee,
+            arms,
             span: start.merge(end),
         })
     }
@@ -610,6 +883,29 @@ impl Parser {
 
     fn parse_ident_expr(&mut self) -> Option<Expr> {
         let id = self.parse_ident()?;
+        // enum variant: Ident '::' Ident ('(' args ')')?
+        if self.eat(TokenKind::ColonColon) {
+            let variant = self.parse_ident()?;
+            let mut args = Vec::new();
+            if self.eat(TokenKind::LParen) {
+                while !self.check(TokenKind::RParen) && !self.is_eof() {
+                    args.push(self.parse_expr()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+            }
+            let expr = Expr {
+                span: id.span.merge(self.prev_span()),
+                kind: ExprKind::EnumLit {
+                    enum_name: id,
+                    variant,
+                    args,
+                },
+            };
+            return self.parse_postfix(expr);
+        }
         // struct literal: Ident '{' field: expr, ... '}'
         if self.check(TokenKind::LBrace) {
             // Ambiguous with block after `if cond`. We only parse a
@@ -636,6 +932,30 @@ impl Parser {
             });
         }
         let inner = self.parse_expr()?;
+        if self.check(TokenKind::Comma) {
+            // tuple: (a, b, ...) — a trailing comma is allowed after two elements
+            let mut elements = vec![inner];
+            while self.eat(TokenKind::Comma) {
+                if self.check(TokenKind::RParen) {
+                    break;
+                }
+                elements.push(self.parse_expr()?);
+            }
+            let end = self.expect(TokenKind::RParen)?.span;
+            let span = start.merge(end);
+            if elements.len() < 2 {
+                self.error_at(
+                    "tuples need at least two elements",
+                    span,
+                    Some("write `(a, b)`; `(a)` is just `a`"),
+                );
+            }
+            let expr = Expr {
+                kind: ExprKind::Tuple { elements },
+                span,
+            };
+            return self.parse_postfix(expr);
+        }
         let end = self.expect(TokenKind::RParen)?.span;
         let expr = Expr {
             kind: ExprKind::Group(Box::new(inner)),
@@ -749,15 +1069,41 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     self.bump();
-                    let field = self.parse_ident()?;
-                    let span = expr.span.merge(field.span);
-                    expr = Expr {
-                        kind: ExprKind::Field {
-                            base: Box::new(expr),
-                            field,
-                        },
-                        span,
+                    // `t.0`: the lexer yields an integer after the dot;
+                    // `t.0.1` lexes as the float `0.1`, split here.
+                    let fields: Vec<Ident> = match self.peek_kind() {
+                        TokenKind::Int | TokenKind::Float => {
+                            let tok = self.bump();
+                            let mut parts = Vec::new();
+                            for part in tok.lexeme.split('.') {
+                                match part.parse::<usize>() {
+                                    Ok(i) if !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()) => {
+                                        parts.push(Ident::new(i.to_string(), tok.span));
+                                    }
+                                    _ => {
+                                        self.error_at(
+                                            format!("invalid tuple index `{}`", tok.lexeme),
+                                            tok.span,
+                                            Some("tuple fields are accessed as `t.0`, `t.1`, ..."),
+                                        );
+                                        return None;
+                                    }
+                                }
+                            }
+                            parts
+                        }
+                        _ => vec![self.parse_ident()?],
                     };
+                    for field in fields {
+                        let span = expr.span.merge(field.span);
+                        expr = Expr {
+                            kind: ExprKind::Field {
+                                base: Box::new(expr),
+                                field,
+                            },
+                            span,
+                        };
+                    }
                 }
                 _ => break,
             }
@@ -836,15 +1182,37 @@ impl Parser {
             }
             TokenKind::LParen => {
                 let start = self.bump().span;
-                self.expect(TokenKind::RParen)?;
-                Some(TypeExpr::unit(start.merge(self.prev_span())))
+                if self.eat(TokenKind::RParen) {
+                    return Some(TypeExpr::unit(start.merge(self.prev_span())));
+                }
+                let mut elems = Vec::new();
+                while !self.check(TokenKind::RParen) && !self.is_eof() {
+                    elems.push(self.parse_type()?);
+                    if !self.eat(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                let end = self.expect(TokenKind::RParen)?.span;
+                let span = start.merge(end);
+                if elems.len() < 2 {
+                    self.error_at(
+                        "tuple types need at least two elements",
+                        span,
+                        Some("write `(T1, T2)`; `()` is the unit type"),
+                    );
+                    return None;
+                }
+                Some(TypeExpr {
+                    kind: TypeExprKind::Tuple(elems),
+                    span,
+                })
             }
             _ => {
                 let tok = self.peek().clone();
                 self.error_at(
                     format!("expected type, found `{}`", tok.lexeme),
                     tok.span,
-                    Some("valid types: i32, i64, f64, bool, string, unit, [T; N], or a struct name"),
+                    Some("valid types: i32, i64, f64, bool, string, unit, [T; N], (T1, T2), or a struct/enum name"),
                 );
                 None
             }
@@ -943,8 +1311,10 @@ impl Parser {
                     | TokenKind::While
                     | TokenKind::For
                     | TokenKind::Return
+                    | TokenKind::Match
                     | TokenKind::Fn
                     | TokenKind::Struct
+                    | TokenKind::Enum
             ) {
                 return;
             }
@@ -1462,6 +1832,60 @@ mod tests {
         // `\u` without a brace is an unknown escape, kept verbatim as before
         let e = return_expr(r#"fn main() -> i32 { return "\u41"; }"#);
         assert_eq!(e.kind, ExprKind::Literal(Literal::String("\\u41".into())));
+    }
+
+    #[test]
+    fn parses_enum_match_if_let_and_tuples() {
+        let src = "
+            enum Shape { Circle(f64), Rect(i32, i32), Empty }
+            fn main() -> i32 {
+                let t = (1, (2, 3));
+                let (a, b) = t.1;
+                let s = Shape::Rect(t.0, t.1.1);
+                match s {
+                    Shape::Circle(r) => { }
+                    Shape::Rect(w, _) => { }
+                    -1 => { }
+                    'c' => { }
+                    _ => { }
+                }
+                if let Shape::Empty = s { } else { }
+                let p: (i32, bool) = (1, true);
+                return 0;
+            }";
+        let (prog, diags) = parse_src(src);
+        assert!(!diags.has_errors(), "{}", render(&diags));
+        assert!(matches!(prog.items[0], Item::Enum(ref e) if e.variants.len() == 3
+            && e.variants[1].payload.len() == 2 && e.variants[2].payload.is_empty()));
+        let Item::Fn(f) = &prog.items[1] else { panic!() };
+        let stmts = &f.body.as_ref().unwrap().stmts;
+        assert!(matches!(&stmts[0], Stmt::Let { init: Some(Expr { kind: ExprKind::Tuple { elements }, .. }), .. } if elements.len() == 2));
+        assert!(matches!(&stmts[1], Stmt::LetTuple { names, .. } if names.len() == 2));
+        // `t.1.1` lexes as the float `1.1` and is split into two field accesses
+        let Stmt::Let { init: Some(Expr { kind: ExprKind::EnumLit { args, .. }, .. }), .. } = &stmts[2] else { panic!() };
+        assert!(matches!(&args[1].kind, ExprKind::Field { base, field } if field.name == "1"
+            && matches!(&base.kind, ExprKind::Field { field, .. } if field.name == "1")));
+        let Stmt::Match { arms, .. } = &stmts[3] else { panic!() };
+        assert_eq!(arms.len(), 5);
+        assert!(matches!(&arms[1].pattern.kind, PatternKind::Variant { fields, .. }
+            if matches!(fields[1].kind, PatternKind::Wildcard)));
+        assert!(matches!(&arms[2].pattern.kind, PatternKind::Literal(Literal::Int(-1))));
+        assert!(matches!(&arms[4].pattern.kind, PatternKind::Wildcard));
+        // `if let` desugars to a two-arm match ending in `_`
+        let Stmt::Match { arms, .. } = &stmts[4] else { panic!() };
+        assert_eq!(arms.len(), 2);
+        assert!(matches!(&arms[1].pattern.kind, PatternKind::Wildcard));
+        assert!(matches!(&stmts[5], Stmt::Let { ty: Some(TypeExpr { kind: TypeExprKind::Tuple(ts), .. }), .. } if ts.len() == 2));
+        // round trip through the pretty-printer and the AST dump
+        let pretty = crate::pretty::pretty_program(&prog);
+        assert!(pretty.contains("Shape::Rect(w, _) => {"), "{pretty}");
+        assert!(pretty.contains("let (a, b) = t.1;"), "{pretty}");
+        assert!(crate::ast::dump_program(&prog).contains("enum Shape {"));
+        // float literals still lex as floats; `(a)` is a group, `(a,)` is not a tuple
+        let e = return_expr("fn main() -> f64 { return 1.5; }");
+        assert!(matches!(e.kind, ExprKind::Literal(Literal::Float(_))));
+        let (_, diags) = parse_src("fn main() -> i32 { let t = (1,); return 0; }");
+        assert!(diags.has_errors());
     }
 
     #[test]

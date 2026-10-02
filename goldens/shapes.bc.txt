@@ -1,0 +1,297 @@
+; strings: 7
+;   [0] "circle"
+;   [1] "nothing"
+;   [2] "square"
+;   [3] "rectangle"
+;   [4] "box"
+;   [5] "not a box"
+;   [6] "pair ok"
+
+fn print #0 arity=1 regs=1
+
+fn println #1 arity=1 regs=1
+
+fn print_i32 #2 arity=1 regs=1
+
+fn print_i64 #3 arity=1 regs=1
+
+fn print_f64 #4 arity=1 regs=1
+
+fn print_bool #5 arity=1 regs=1
+
+fn len #6 arity=1 regs=1
+
+fn assert #7 arity=1 regs=1
+
+fn print_char #8 arity=1 regs=1
+
+fn to_string #9 arity=1 regs=1
+
+fn i64_to_string #10 arity=1 regs=1
+
+fn f64_to_string #11 arity=1 regs=1
+
+fn char_to_string #12 arity=1 regs=1
+
+fn abs #13 arity=1 regs=1
+
+fn min #14 arity=1 regs=1
+
+fn max #15 arity=1 regs=1
+
+fn clamp #16 arity=1 regs=1
+
+fn sqrt #17 arity=1 regs=1
+
+fn floor #18 arity=1 regs=1
+
+fn ceil #19 arity=1 regs=1
+
+fn pow_i32 #20 arity=1 regs=1
+
+fn area #21 arity=1 regs=9
+  0000  mov r1, r0
+  0001  loadfld r2, r0.0
+  0002  loadimm r3, I32(0)
+  0003  eqi32 r4, r2, r3
+  0004  jz r4, 7
+  0005  jmp 12
+  0006  retvoid
+  0007  loadfld r5, r1.1
+  0008  loadimm r6, F64(4613937818241073152)
+  0009  mulf64 r7, r6, r5
+  0010  mulf64 r8, r7, r5
+  0011  ret r8
+  0012  loadimm r3, I32(1)
+  0013  eqi32 r4, r2, r3
+  0014  jz r4, 16
+  0015  jmp 20
+  0016  loadfld r5, r1.1
+  0017  loadfld r6, r1.2
+  0018  mulf64 r7, r5, r6
+  0019  ret r7
+  0020  loadimm r3, I32(2)
+  0021  eqi32 r4, r2, r3
+  0022  jz r4, 24
+  0023  jmp 6
+  0024  loadimm r5, F64(0)
+  0025  ret r5
+
+fn describe #22 arity=1 regs=8
+  0000  mov r1, r0
+  0001  loadfld r2, r0.0
+  0002  loadimm r3, I32(0)
+  0003  eqi32 r4, r2, r3
+  0004  jz r4, 6
+  0005  jmp 8
+  0006  loadstr r5, str[0]
+  0007  ret r5
+  0008  loadimm r3, I32(1)
+  0009  eqi32 r4, r2, r3
+  0010  jz r4, 12
+  0011  jmp 17
+  0012  loadfld r6, r1.1
+  0013  loadfld r7, r1.2
+  0014  eqf64 r4, r6, r7
+  0015  jz r4, 19
+  0016  jmp 21
+  0017  loadstr r5, str[1]
+  0018  ret r5
+  0019  loadstr r5, str[2]
+  0020  ret r5
+  0021  loadstr r5, str[3]
+  0022  ret r5
+
+fn min_max #23 arity=2 regs=4
+  0000  lti32 r2, r0, r1
+  0001  jz r2, 3
+  0002  jmp 7
+  0003  allocobj r3, 2
+  0004  storefld r3.0, r0
+  0005  storefld r3.1, r1
+  0006  ret r3
+  0007  allocobj r3, 2
+  0008  storefld r3.0, r1
+  0009  storefld r3.1, r0
+  0010  ret r3
+
+fn code_for #24 arity=1 regs=4
+  0000  mov r1, r0
+  0001  loadimm r2, I32(4)
+  0002  eqi32 r3, r0, r2
+  0003  jz r3, 5
+  0004  jmp 7
+  0005  loadimm r1, I32(40)
+  0006  ret r1
+  0007  loadimm r2, I32(9)
+  0008  eqi32 r3, r1, r2
+  0009  jz r3, 11
+  0010  jmp 13
+  0011  loadimm r1, I32(0)
+  0012  ret r1
+  0013  loadimm r1, I32(1)
+  0014  ret r1
+
+fn main #25 arity=0 regs=32
+  0000  allocarr r0, 4
+  0001  allocobj r1, 3
+  0002  loadimm r2, I32(0)
+  0003  storefld r1.0, r2
+  0004  loadimm r3, F64(4611686018427387904)
+  0005  storefld r1.1, r3
+  0006  loadimm r4, I32(0)
+  0007  storeidx r0[r4], r1
+  0008  allocobj r5, 3
+  0009  loadimm r6, I32(1)
+  0010  storefld r5.0, r6
+  0011  loadimm r7, F64(4613937818241073152)
+  0012  storefld r5.1, r7
+  0013  loadimm r8, F64(4616189618054758400)
+  0014  storefld r5.2, r8
+  0015  loadimm r9, I32(1)
+  0016  storeidx r0[r9], r5
+  0017  allocobj r10, 3
+  0018  loadimm r11, I32(1)
+  0019  storefld r10.0, r11
+  0020  loadimm r12, F64(4617315517961601024)
+  0021  storefld r10.1, r12
+  0022  loadimm r13, F64(4617315517961601024)
+  0023  storefld r10.2, r13
+  0024  loadimm r14, I32(2)
+  0025  storeidx r0[r14], r10
+  0026  allocobj r15, 3
+  0027  loadimm r16, I32(2)
+  0028  storefld r15.0, r16
+  0029  loadimm r17, I32(3)
+  0030  storeidx r0[r17], r15
+  0031  mov r18, r0
+  0032  loadimm r19, F64(0)
+  0033  loadimm r20, I32(0)
+  0034  loadimm r21, I32(4)
+  0035  jmp 36
+  0036  lti32 r22, r20, r21
+  0037  jz r22, 39
+  0038  jmp 51
+  0039  loadidx r1, r18[r20]
+  0040  call f22 -> Some(23) [1]
+  0041  native #1 -> None [23]
+  0042  call f21 -> Some(3) [1]
+  0043  native #4 -> None [3]
+  0044  call f21 -> Some(7) [1]
+  0045  addf64 r8, r19, r7
+  0046  mov r19, r8
+  0047  jmp 48
+  0048  loadimm r2, I32(1)
+  0049  addi32 r20, r20, r2
+  0050  jmp 36
+  0051  native #4 -> None [19]
+  0052  allocobj r24, 2
+  0053  loadstr r23, str[4]
+  0054  storefld r24.0, r23
+  0055  allocobj r1, 3
+  0056  loadimm r2, I32(1)
+  0057  storefld r1.0, r2
+  0058  loadimm r3, F64(4611686018427387904)
+  0059  storefld r1.1, r3
+  0060  loadimm r7, F64(4620693217682128896)
+  0061  storefld r1.2, r7
+  0062  storefld r24.1, r1
+  0063  mov r25, r24
+  0064  loadfld r5, r24.1
+  0065  mov r10, r5
+  0066  loadfld r4, r5.0
+  0067  loadimm r6, I32(1)
+  0068  eqi32 r22, r4, r6
+  0069  jz r22, 96
+  0070  jmp 103
+  0071  loadimm r2, I32(9)
+  0072  loadimm r4, I32(4)
+  0073  call f23 -> Some(26) [2, 4]
+  0074  loadfld r6, r26.0
+  0075  loadfld r9, r26.1
+  0076  mov r11, r9
+  0077  allocobj r27, 2
+  0078  storefld r27.0, r6
+  0079  storefld r27.1, r9
+  0080  mov r28, r27
+  0081  loadfld r14, r27.0
+  0082  native #2 -> None [14]
+  0083  loadfld r16, r27.1
+  0084  native #2 -> None [16]
+  0085  allocobj r29, 2
+  0086  loadimm r17, I32(4)
+  0087  storefld r29.0, r17
+  0088  loadimm r20, I32(9)
+  0089  storefld r29.1, r20
+  0090  loadfld r21, r27.0
+  0091  loadfld r30, r29.0
+  0092  eqi32 r22, r21, r30
+  0093  mov r31, r22
+  0094  jz r22, 108
+  0095  jmp 106
+  0096  loadfld r3, r10.1
+  0097  loadfld r7, r10.2
+  0098  loadfld r23, r25.0
+  0099  native #1 -> None [23]
+  0100  mulf64 r8, r3, r7
+  0101  native #4 -> None [8]
+  0102  jmp 71
+  0103  loadstr r23, str[5]
+  0104  native #1 -> None [23]
+  0105  jmp 71
+  0106  jz r31, 114
+  0107  jmp 117
+  0108  loadfld r2, r28.1
+  0109  loadfld r4, r29.1
+  0110  eqi32 r22, r2, r4
+  0111  mov r31, r22
+  0112  jz r22, 106
+  0113  jmp 106
+  0114  loadstr r23, str[6]
+  0115  native #1 -> None [23]
+  0116  jmp 117
+  0117  loadimm r2, I32(0)
+  0118  loadidx r1, r18[r2]
+  0119  allocobj r5, 3
+  0120  loadimm r4, I32(0)
+  0121  storefld r5.0, r4
+  0122  loadimm r3, F64(4611686018427387904)
+  0123  storefld r5.1, r3
+  0124  loadfld r6, r1.0
+  0125  loadfld r9, r5.0
+  0126  eqi32 r22, r6, r9
+  0127  jz r22, 132
+  0128  jmp 129
+  0129  not r31, r22
+  0130  jz r31, 158
+  0131  jmp 160
+  0132  loadimm r2, I32(0)
+  0133  eqi32 r31, r6, r2
+  0134  jz r31, 136
+  0135  jmp 142
+  0136  loadfld r3, r1.1
+  0137  loadfld r7, r5.1
+  0138  eqf64 r31, r3, r7
+  0139  mov r22, r31
+  0140  jz r31, 129
+  0141  jmp 129
+  0142  loadimm r2, I32(1)
+  0143  eqi32 r31, r6, r2
+  0144  jz r31, 146
+  0145  jmp 129
+  0146  loadfld r3, r1.1
+  0147  loadfld r7, r5.1
+  0148  eqf64 r31, r3, r7
+  0149  mov r22, r31
+  0150  jz r31, 152
+  0151  jmp 129
+  0152  loadfld r3, r1.2
+  0153  loadfld r7, r5.2
+  0154  eqf64 r31, r3, r7
+  0155  mov r22, r31
+  0156  jz r31, 129
+  0157  jmp 129
+  0158  loadimm r2, I32(1)
+  0159  ret r2
+  0160  call f24 -> Some(2) [11]
+  0161  ret r2

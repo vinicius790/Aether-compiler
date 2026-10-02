@@ -651,7 +651,9 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
                 let (name, span) = match it {
                     Item::Fn(f) => (f.name.name.clone(), f.span),
                     Item::Struct(s) => (s.name.name.clone(), s.span),
+                    Item::Enum(en) => (en.name.name.clone(), en.span),
                     Item::Extern(e) => (e.name.name.clone(), e.span),
+                    Item::Use(u) => (format!("use {}", u.path), u.span),
                 };
                 let (lo, hi) = (span.start.0 as usize, span.end.0 as usize);
                 let src = if lo < hi && hi <= buf.len() && buf.is_char_boundary(lo) && buf.is_char_boundary(hi) {

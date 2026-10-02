@@ -1,0 +1,31 @@
+// File modules: `use` pulls another file's items into this program.
+// Paths are relative to the importing file, so from examples/ the stdlib
+// lives one directory up. Try: aether run examples/modules.ae
+
+use "../stdlib/vec2.ae";
+use "../stdlib/rng.ae";
+use "../stdlib/vec2.ae"; // importing twice is harmless: included once
+
+fn main() -> i32 {
+    let a = vec2_new(3.0, 4.0);
+    let b = vec2_new(1.0, 2.0);
+    print_f64(vec2_length(a));            // 5
+    print_f64(vec2_dot(a, b));            // 11
+    let c = vec2_scale(vec2_sub(vec2_add(a, b), b), 2.0);
+    print_f64(c.x);                       // 6
+    print_f64(c.y);                       // 8
+
+    let mut s = 12345;
+    let mut i = 0;
+    let mut sum = 0;
+    while i < 5 {
+        s = rng_next(s);
+        let d = rng_range(s, 1, 7);       // a die: 1..6
+        assert(d >= 1 && d <= 6);
+        sum = sum + d;
+        i = i + 1;
+    }
+    print_i32(s);
+    print_i32(sum);
+    return 0;
+}

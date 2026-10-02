@@ -1,0 +1,29 @@
+// Aether stdlib: xorshift32 pseudo-random numbers on i32. Meant to be
+// imported, not run:
+//
+//     use "stdlib/rng.ae";
+//
+// The state is a plain i32 (never 0) that the caller threads through:
+//
+//     let mut s = 2463534242 as i32;   // any non-zero seed
+//     s = rng_next(s);
+//     let d = rng_range(s, 1, 7);      // 1..7 (a die)
+//
+// `>>` is arithmetic in Aether, so the logical shift of the reference
+// algorithm is recovered by masking the sign bits away.
+
+// Advance the generator: returns the next state (also the next value).
+fn rng_next(state: i32) -> i32 {
+    let mut x = state;
+    if x == 0 { x = 1; }
+    x = x ^ (x << 13);
+    x = x ^ ((x >> 17) & 0x7FFF);
+    x = x ^ (x << 5);
+    return x;
+}
+
+// Map a state to lo..hi (hi exclusive). Returns lo when hi <= lo.
+fn rng_range(state: i32, lo: i32, hi: i32) -> i32 {
+    if hi <= lo { return lo; }
+    return lo + (state & 0x7FFFFFFF) % (hi - lo);
+}

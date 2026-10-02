@@ -90,6 +90,17 @@ binding, o erro continua a ser
 ``extern function `nome` has no implementation in the VM``. Um `Err` do
 closure aborta a execução como qualquer `VmError`.
 
+O valor devolvido por um `extern fn` é **validado** contra o tipo de retorno
+declarado (`BcFunction::ret_ty`): escalares pela etiqueta exacta (`i32` não
+aceita `I64`, `Unit` nem `Str`), arrays pelo comprimento e elementos, structs
+e tuplas campo a campo, enums pela etiqueta e pela carga da variante activa.
+Uma discordância aborta com
+``extern function `f` returned string `x` but is declared to return `i32` ``
+em vez de entregar lixo ao script. Uma `extern` que devolve unit ignora o
+valor. Registar o mesmo nome duas vezes mantém o último binding. O closure é
+chamado exactamente uma vez por `Call` em ordem de programa a qualquer `-O`:
+chamadas nunca são removidas, fundidas (CSE), reordenadas nem inlined.
+
 Aggregates chegam ao host como `Value::Array`/`Value::Object`; o `Rc` é
 transparente na leitura e devolver um array é apenas embrulhar um `Vec`:
 
@@ -142,13 +153,49 @@ impl Vm<'_> {
 
 `Op::Yield` (disassembly `yield`) é um ponto de escalonamento cooperativo:
 `run_budget` devolve `Yielded` logo a seguir a avançar o `pc`; `run()`
-trata-o como `nop`. Conta como uma instrução para `steps()`. Nenhum
-emissor o gera ainda — a frontend irá adicionar uma instrução `yield;`.
+trata-o como `nop`. Conta como uma instrução para `steps()`. A instrução
+`yield;` da linguagem gera-o. O otimizador nunca remove nem funde um `yield`
+(DCE trata-o como efeito) e o inliner copia-o tal e qual para o caller: o
+número de suspensões de um programa é igual a `-O0` e `-O2`, mesmo com
+`yield` dentro de funções inlined, chamadas aninhadas e laços. O que muda
+com o inlining é o número de instruções (`steps()`), logo as fronteiras de um
+orçamento fixo.
+
+### Casos limite de `run_budget`
+
+- `run_budget(0)` não avança nada e devolve `Yielded` (inicia a VM, por isso
+  um módulo sem `main` dá `MissingMain` já aqui).
+- Depois de `Finished`, qualquer orçamento (0 incluído) devolve o mesmo
+  `Finished(v)` sem contar passos.
+- Depois de um erro a VM fica *halted*: `run`/`run_budget` devolvem
+  `vm halted after a previous error` (não repetem o erro original).
+- Equivalência: para qualquer orçamento `n >= 1`, valor, stdout e `steps()`
+  são idênticos aos de `run()` (testado em todos os exemplos).
+
+## Valores, conversões e formatação
+
+- Inteiros: wrapping em tudo (`i32::MIN / -1 == i32::MIN`, `abs(MIN) == MIN`,
+  `-MIN == MIN`); deslocamentos mascarados (`& 31` / `& 63`); `i64 as i32`
+  trunca; divisão por zero é erro.
+- `f64 as i32/i64` satura nos limites e `NaN` dá 0; `i32 as char` com valor
+  que não é escalar Unicode (negativo, surrogate, `> 0x10FFFF`) dá U+FFFD.
+- `f64` imprime com o `Display` do Rust: `NaN`, `inf`, `-inf`, `-0`, `2` para
+  `2.0`, sem notação científica (`1e21` → `1000000000000000000000`, `1e-7` →
+  `0.0000001`). O emissor LLVM de estudo formata de outro modo.
+- `let x: T;` sem inicializador: `i32`/`i64`/`f64`/`bool`/`string`/`char`
+  valem `0`/`0`/`0`/`false`/`""`/`'\0'`. Arrays, structs, tuplas e enums
+  ficam `Unit`: ler ou escrever neles é agora erro de runtime claro
+  (`cannot store into a value of type unit`), não lixo silencioso.
+- `len` e a indexação de strings contam chars e são O(n) por acesso.
 
 ## Limites
 
 - 50 milhões de instruções por execução (configurável)
-- 10 mil frames de chamada
+- 10 mil frames de chamada; `main` conta como 1, logo `max_call_depth = L`
+  admite exactamente `L` frames vivos (`StackOverflow` ao empilhar o `L+1`)
+  e `max_steps = N` admite exactamente `N` instruções (a `N+1` dá
+  `StepLimit`). Com inlining um `-O2` pode usar menos frames que `-O0`
+- strings até 256 MiB (`MAX_STRING_BYTES`) e arrays até 2^28 elementos
 - divisão por zero e índice inválido abortam com `VmError`
 - chamar uma `extern fn` sem binding é `VmError` (antes
   comportava-se como `print`)

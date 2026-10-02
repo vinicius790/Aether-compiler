@@ -218,23 +218,17 @@ fn touch(r: Reg, mentioned: &mut [bool], order: &mut Vec<u32>) -> bool {
     true
 }
 
-fn bit_set(words: &mut [u64], bit: usize) {
-    words[bit / 64] |= 1u64 << (bit % 64);
-}
-
-
-/// Computes `(old -> new)` and the new register count, or `None` to leave the
-/// function untouched.
-/// First color that is free in every block of the register and holds either
-/// nothing yet or exactly the register's type.
+/// First color that is not forbidden (`stamp[c] == epoch`), not a parameter
+/// register, and holds either nothing yet or exactly the register's type.
 fn pick_color(
-    forbidden: &[u64],
+    stamp: &[u32],
+    epoch: u32,
+    reserved: &[bool],
     color_type: &[Option<Type>],
     ty: &Option<Type>,
-    limit: usize,
 ) -> Option<usize> {
-    (0..limit)
-        .filter(|&c| forbidden[c / 64] & (1u64 << (c % 64)) == 0)
+    (0..color_type.len())
+        .filter(|&c| !reserved[c] && stamp[c] != epoch)
         .find(|&c| match (&color_type[c], ty) {
             (None, _) => true,
             (Some(held), Some(t)) => held == t,
@@ -242,6 +236,8 @@ fn pick_color(
         })
 }
 
+/// Computes `(old -> new)` and the new register count, or `None` to leave the
+/// function untouched.
 fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)> {
     if f.is_extern || f.blocks.is_empty() {
         return None;
@@ -323,19 +319,15 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
         }
     }
 
-    // Greedy coloring. `used[b]` is the set of colors already given to
-    // registers live in block b; a register's forbidden set is the union over
-    // its blocks plus every parameter register.
-    let words = (n + 63) / 64;
-    let mut reserved = vec![0u64; words];
-    for (i, p) in is_param.iter().enumerate() {
-        if *p {
-            bit_set(&mut reserved, i);
-        }
-    }
-    let mut used: Vec<Vec<u64>> = vec![vec![0u64; words]; f.blocks.len()];
+    // Greedy coloring. `used[b]` lists the colors already given to registers
+    // live in block b (sparse: a dense per-block bitset costs blocks x
+    // registers bits, gigabytes for a function with tens of thousands of
+    // blocks). A register's forbidden set is the union over its blocks, kept
+    // as an epoch stamp per color, plus every parameter register.
+    let mut used: Vec<Vec<u32>> = vec![Vec::new(); f.blocks.len()];
+    let mut stamp = vec![0u32; n];
+    let mut epoch = 0u32;
     let mut map = vec![u32::MAX; n];
-    let mut forbidden = vec![0u64; words];
     let mut max_color = 0usize;
     // Type held by each color; a register of unknown type gets a color of its
     // own (`Type::Error` marks it so nothing else matches it).
@@ -345,19 +337,19 @@ fn plan(f: &IrFunction, rets: &HashMap<String, Type>) -> Option<(Vec<u32>, u32)>
         let color = if is_param[i] {
             i
         } else {
-            forbidden.copy_from_slice(&reserved);
+            epoch += 1;
             for &b in &blocks_of[i] {
-                for (w, word) in used[b as usize].iter().enumerate() {
-                    forbidden[w] |= *word;
+                for &c in &used[b as usize] {
+                    stamp[c as usize] = epoch;
                 }
             }
-            pick_color(&forbidden, &color_type, &types[i], n)?
+            pick_color(&stamp, epoch, &is_param, &color_type, &types[i])?
         };
         color_type[color] = Some(types[i].clone().unwrap_or(Type::Error));
         map[i] = color as u32;
         max_color = max_color.max(color);
         for &b in &blocks_of[i] {
-            bit_set(&mut used[b as usize], color);
+            used[b as usize].push(color as u32);
         }
     }
 

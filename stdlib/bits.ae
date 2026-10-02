@@ -1,4 +1,4 @@
-fn band(a: i32, b: i32) -> i32 {
+pub fn band(a: i32, b: i32) -> i32 {
     // no bitwise ops in 0.2; emulate AND on 0/1 flags
     if a != 0 {
         if b != 0 { return 1; }

@@ -14,6 +14,17 @@ copiar rotinas, e **ficheiros importáveis** (sem `main`), para trazer com
 | `vec2.ae` | `Vec2`, vec2_new, vec2_add, vec2_sub, vec2_scale, vec2_dot, vec2_length | importável |
 | `rng.ae` | rng_next, rng_range (xorshift32 em `i32`) | importável |
 
+## Visibilidade
+
+A API de cada ficheiro importável está marcada `pub` (`pub fn`, `pub struct`);
+um item sem `pub` seria privado ao seu ficheiro e `E0281` ("`NOME` is private
+to `FICHEIRO`") se outro ficheiro o usasse. Os ficheiros autónomos
+(`math.ae`, `cmp.ae`, `loops.ae`, `bits.ae`) também têm a API `pub`, e correm
+sozinhos com o seu próprio `main` (que não é `pub`); como definem `main`, não se
+podem importar para um programa que já tenha o seu. Os campos de `Vec2` são
+públicos. O espaço de nomes continua plano: importar `prelude.ae` e `cmp.ae`
+juntos dá `duplicate function` (`sign`).
+
 ## Ficheiros importáveis
 
 ```
@@ -64,5 +75,6 @@ objetivo: o `main` vem do programa que o inclui.
 pontuação e combo, sem engine por baixo.
 
 Embedding em Rust: `aether::host::eval` / `profile_source`;
-`aether::driver::compile_files` / `compile_sources` para vários ficheiros e
+`aether::driver::compile_files` / `compile_sources` (aplicam `pub`) /
+`compile_sources_public` (tudo público, usado pelo REPL) para vários ficheiros e
 `run_compiled_with(&mut c, VmOptions { max_steps, .. })` para limites.

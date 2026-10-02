@@ -2,9 +2,9 @@
 
 use aether::ast::Item;
 use aether::driver::{
-    compile_file, compile_files, compile_source, compile_sources, default_includes, dump_ast,
+    compile_file, compile_files, compile_source, compile_sources_public, default_includes, dump_ast,
     dump_bc, dump_ir_text, dump_tokens, ir_inst_count, run_compiled, run_compiled_with,
-    CompileOptions, Compiled,
+    CompileOptions, Compiled, LliStatus,
 };
 use aether::span::{FileId, Session};
 use aether::vm::VmOptions;
@@ -58,6 +58,8 @@ OPTIONS:
     --max-steps <n>       VM instruction budget (run/profile/digest/bench; default 50000000)
     --max-depth <n>       VM call-depth limit (run/profile/digest/bench; default 10000)
     --backend vm|llvm     `run` on the bytecode VM (default) or through LLVM `lli`
+    --color, --no-color   force or suppress ANSI colour in diagnostics (default: only
+                          when stderr is a terminal and NO_COLOR is unset)
     --timings             per-stage timings on stderr (run)
     --stats               exit value, VM steps and opt report on stderr (run)
     --unopt               dump the IR before optimization (dump-ir)
@@ -108,7 +110,7 @@ fn parse_args() -> Result<Args, String> {
         emit: "bytecode".into(),
         output: None,
         n: None,
-        color: true,
+        color: false,
         iters: 200,
         seed: 0xA37E400,
         kind: "all".into(),
@@ -117,16 +119,34 @@ fn parse_args() -> Result<Args, String> {
         max_depth: None,
         backend: "vm".into(),
     };
+    let mut color_mode: Option<bool> = None;
     let mut i = 0;
+    // the operand of option `$name`, or an error naming it
+    macro_rules! operand {
+        ($name:expr) => {{
+            i += 1;
+            raw.get(i)
+                .cloned()
+                .ok_or_else(|| format!("{} needs a value", $name))?
+        }};
+    }
     while i < raw.len() {
-        let s = raw[i].as_str();
+        let s = raw[i].clone();
+        let s = s.as_str();
         if s == "-h" || s == "--help" {
             return Err(usage().into());
-        } else if s.starts_with("-O") && s.len() > 2 {
-            a.opt = s[2..].parse().unwrap_or(2);
-        } else if s == "-O" {
-            i += 1;
-            a.opt = raw.get(i).and_then(|x| x.parse().ok()).unwrap_or(2);
+        } else if s.starts_with("-O") {
+            let v = if s == "-O" {
+                operand!("-O")
+            } else {
+                s[2..].to_string()
+            };
+            a.opt = match v.as_str() {
+                "0" => 0,
+                "1" => 1,
+                "2" => 2,
+                _ => return Err(format!("invalid optimization level `{v}` (use -O0, -O1 or -O2)")),
+            };
         } else if s == "--timings" {
             a.timings = true;
         } else if s == "--stats" {
@@ -134,28 +154,33 @@ fn parse_args() -> Result<Args, String> {
         } else if s == "--unopt" {
             a.unopt = true;
         } else if s == "--color" {
-            a.color = true;
+            color_mode = Some(true);
+        } else if s == "--no-color" {
+            color_mode = Some(false);
         } else if s == "--emit" {
-            i += 1;
-            a.emit = raw.get(i).cloned().unwrap_or_else(|| "bytecode".into());
+            a.emit = operand!("--emit");
+            if !matches!(a.emit.as_str(), "ir" | "bytecode" | "llvm") {
+                return Err(format!("unknown --emit kind `{}` (use ir, bytecode or llvm)", a.emit));
+            }
         } else if s == "-o" || s == "--output" {
-            i += 1;
-            a.output = raw.get(i).cloned();
+            a.output = Some(operand!(s));
         } else if s == "--n" {
-            i += 1;
-            a.n = raw.get(i).and_then(|x| x.parse().ok());
+            let v = operand!("--n");
+            a.n = Some(
+                v.parse::<i32>()
+                    .map_err(|_| format!("--n needs an integer, found `{v}`"))?,
+            );
         } else if s == "--iters" {
-            i += 1;
-            a.iters = raw.get(i).and_then(|x| x.parse().ok()).unwrap_or(200);
+            let v = operand!("--iters");
+            a.iters = v
+                .parse()
+                .map_err(|_| format!("--iters needs a non-negative integer, found `{v}`"))?;
         } else if s == "--seed" {
-            i += 1;
-            a.seed = raw
-                .get(i)
-                .and_then(|x| parse_u64(x))
-                .unwrap_or(0xA37E400);
+            let v = operand!("--seed");
+            a.seed = parse_u64(&v)
+                .ok_or_else(|| format!("--seed needs an integer (decimal or 0x...), found `{v}`"))?;
         } else if s == "--kind" {
-            i += 1;
-            a.kind = raw.get(i).cloned().unwrap_or_else(|| "all".into());
+            a.kind = operand!("--kind");
         } else if s == "--include" || s == "-I" {
             i += 1;
             match raw.get(i) {
@@ -166,29 +191,41 @@ fn parse_args() -> Result<Args, String> {
             a.includes.push(p.to_string());
         } else if s == "--max-steps" {
             i += 1;
-            let v = raw.get(i).and_then(|x| parse_u64(x));
+            let v = raw.get(i).and_then(|x| parse_u64(x)).filter(|v| *v > 0);
             a.max_steps = Some(v.ok_or_else(|| "--max-steps needs a positive integer".to_string())?);
         } else if s == "--max-depth" {
             i += 1;
-            let v = raw.get(i).and_then(|x| x.parse::<usize>().ok());
+            let v = raw.get(i).and_then(|x| x.parse::<usize>().ok()).filter(|v| *v > 0);
             a.max_depth = Some(v.ok_or_else(|| "--max-depth needs a positive integer".to_string())?);
         } else if s == "--backend" {
-            i += 1;
-            let b = raw.get(i).cloned().unwrap_or_default();
+            let b = operand!("--backend");
             if b != "vm" && b != "llvm" {
                 return Err(format!(
                     "unknown backend `{b}` (use --backend vm or --backend llvm)"
                 ));
             }
             a.backend = b;
-        } else if s.starts_with('-') {
+        } else if s.starts_with('-') && s.len() > 1 {
             return Err(format!("unknown option {s}\n{}", usage()));
         } else if a.file.is_none() {
             a.file = Some(s.to_string());
+        } else {
+            return Err(format!(
+                "unexpected extra argument `{s}` (one file operand; use --include for more files)"
+            ));
         }
         i += 1;
     }
+    a.color = color_mode.unwrap_or_else(auto_color);
     Ok(a)
+}
+
+/// Colour diagnostics only when stderr is a terminal and `NO_COLOR` is unset
+/// or empty (<https://no-color.org>); `--color` / `--no-color` override.
+fn auto_color() -> bool {
+    use std::io::IsTerminal;
+    let no_color = env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    !no_color && io::stderr().is_terminal()
 }
 
 fn main() -> ExitCode {
@@ -292,8 +329,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             }
         }
         "run" => {
-            let mut c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let mut c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             if a.backend == "llvm" {
@@ -324,8 +361,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             }
         }
         "compile" => {
-            let c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             let text = match a.emit.as_str() {
@@ -347,31 +384,31 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         }
         "dump-ast" => {
             let c = compile_input(&a, 0, false)?;
-            if let Some(code) = check_errors(&c, true) {
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             print!("{}", dump_ast(&c));
             Ok(ExitCode::SUCCESS)
         }
         "dump-ir" => {
-            let c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             print!("{}", dump_ir_text(&c, a.unopt));
             Ok(ExitCode::SUCCESS)
         }
         "dump-bytecode" | "disassemble" => {
-            let c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             print!("{}", dump_bc(&c));
             Ok(ExitCode::SUCCESS)
         }
         "optimize" => {
-            let c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             if let Some(r) = &c.opt_report {
@@ -380,22 +417,35 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "dump-llvm" => {
-            let c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             print!("{}", c.llvm.clone().unwrap_or_default());
             Ok(ExitCode::SUCCESS)
         }
         "fmt" => {
-            // Formats the main file only: includes are not part of its text.
-            let c = compile_file(need_file(&a)?, &copts(0, false))?;
+            // Formats the main file only: the items of imported and included
+            // files are not part of its text (`use` lines are kept as written).
+            let mut c = compile_file(need_file(&a)?, &copts(0, false))?;
+            // lexical/syntax errors (E00xx/E01xx) stop formatting; type errors and
+            // unresolved imports do not, since only the syntax tree is printed
+            let syntax = |d: &aether::diagnostic::Diagnostic| {
+                d.level == aether::diagnostic::Level::Error
+                    && d.code.map_or(true, |k| k.starts_with("E00") || k.starts_with("E01"))
+            };
+            if c.diags.iter().any(syntax) {
+                c.diags.emit(&c.session, a.color);
+                return Ok(ExitCode::from(1));
+            }
+            let main_file = c.file;
+            c.program.items.retain(|it| it.span().file == main_file);
             print!("{}", aether::pretty::pretty_program(&c.program));
             Ok(ExitCode::SUCCESS)
         }
         "cfg" => {
             let c = compile_input(&a, a.opt, false)?;
-            if let Some(code) = check_errors(&c, true) {
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             let ir = c.ir.as_ref().ok_or_else(|| "no IR".to_string())?;
@@ -404,7 +454,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         }
         "dump-hir" => {
             let c = compile_input(&a, 0, false)?;
-            if let Some(code) = check_errors(&c, true) {
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             match &c.hir {
@@ -415,7 +465,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         }
         "dump-liveness" => {
             let c = compile_input(&a, a.opt, false)?;
-            if let Some(code) = check_errors(&c, true) {
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             let ir = c.ir.as_ref().ok_or_else(|| "no IR".to_string())?;
@@ -424,7 +474,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         }
         "verify" => {
             let c = compile_input(&a, a.opt, false)?;
-            if let Some(code) = check_errors(&c, true) {
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             let ir = c.ir.as_ref().ok_or_else(|| "no IR".to_string())?;
@@ -440,8 +490,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             }
         }
         "stats" => {
-            let c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             if let Some(r) = &c.opt_report {
@@ -459,8 +509,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "profile" => {
-            let mut c = compile_input(&a, a.opt, true)?;
-            if let Some(code) = check_errors(&c, true) {
+            let mut c = compile_input(&a, a.opt, a.color)?;
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             if a.max_steps.is_some() || a.max_depth.is_some() {
@@ -474,8 +524,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                     return Ok(ExitCode::from(2));
                 }
             }
-            let bc = c.bytecode.as_ref().ok_or_else(|| "no bytecode".to_string())?;
-            match aether::vm::execute_profiled(bc) {
+            let bc = c.bytecode.clone().ok_or_else(|| "no bytecode".to_string())?;
+            match aether::vm::execute_profiled(&bc) {
                 Ok((val, out, report)) => {
                     print!("{out}");
                     println!("=> {val}");
@@ -483,6 +533,12 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(e) => {
+                    // the profiling VM drops the partial output; the run is
+                    // deterministic, so replay it on the plain VM to recover it
+                    if let Err(r) = run_compiled_with(&mut c, vm_opts(&a)) {
+                        print!("{}", r.stdout);
+                        let _ = io::stdout().flush();
+                    }
                     eprintln!("runtime error: {e}");
                     Ok(ExitCode::from(2))
                 }
@@ -490,7 +546,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         }
         "digest" => {
             let mut c = compile_input(&a, a.opt, false)?;
-            if let Some(code) = check_errors(&c, true) {
+            if let Some(code) = check_errors(&c, a.color) {
                 return Ok(code);
             }
             match run_compiled_with(&mut c, vm_opts(&a)) {
@@ -519,38 +575,53 @@ fn need_file(a: &Args) -> Result<&str, String> {
 }
 
 /// `run --backend llvm`: hand the textual LLVM IR to `lli` and relay its stdout.
+/// Under `lli` the value `main` returns is the process exit status (mod 256),
+/// so it is the program's result, not a failure: like the VM backend, the
+/// command exits 0 (`--stats` prints it). A signal is a runtime error
+/// (SIGABRT: failed `assert`, division by zero, bad index; exit 2); a
+/// non-zero status together with `lli` diagnostics means `lli` rejected the
+/// module (exit 1).
 fn run_llvm(c: &Compiled, a: &Args) -> Result<ExitCode, String> {
     let ir = c
         .llvm
         .as_deref()
         .ok_or_else(|| "no LLVM IR was produced for this program".to_string())?;
-    match aether::backend::llvm::run_with_lli(ir) {
-        Ok(out) => {
-            print!("{out}");
-            let _ = io::stdout().flush();
-            if a.timings {
-                eprint!("{}", c.timings.render());
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+    let run = match aether::driver::run_llvm_ir(ir) {
+        Ok(r) => r,
         Err(e) if e.contains("not found") => {
             eprintln!(
                 "error: --backend llvm needs LLVM's `lli` (or `lli-18`) on PATH: {e}\n\
                  hint: install LLVM, or run on the bytecode VM with --backend vm"
             );
-            Ok(ExitCode::from(1))
-        }
-        Err(e) if e.trim_end() == "lli failed:" => {
-            // run_with_lli reports any non-zero process status this way; under
-            // lli the value returned by `main` *is* the process exit status.
-            eprintln!(
-                "llvm backend error: the program exited with a non-zero status \
-                 (under lli, `main`'s return value is the exit code)"
-            );
-            Ok(ExitCode::from(1))
+            return Ok(ExitCode::from(1));
         }
         Err(e) => {
-            eprintln!("llvm backend error: {}", e.trim_end());
+            eprintln!("llvm backend error: {e}");
+            return Ok(ExitCode::from(1));
+        }
+    };
+    print!("{}", run.stdout);
+    let _ = io::stdout().flush();
+    match run.status {
+        LliStatus::Exited(code) if code == 0 || run.stderr.trim().is_empty() => {
+            if a.stats {
+                eprintln!("exit = {code} (main's value, mod 256, as reported by lli)");
+            }
+            if a.timings {
+                eprint!("{}", c.timings.render());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        LliStatus::Exited(_) => {
+            eprintln!("llvm backend error: {}", run.stderr.trim_end());
+            Ok(ExitCode::from(1))
+        }
+        LliStatus::Signaled(6) => {
+            eprintln!("runtime error: program aborted (failed assert, division by zero or index out of bounds)");
+            Ok(ExitCode::from(2))
+        }
+        LliStatus::Signaled(sig) => {
+            eprintln!("llvm backend error: lli was killed by signal {sig}");
             Ok(ExitCode::from(1))
         }
     }
@@ -623,15 +694,20 @@ fn repl_files(items: &[ReplItem], skip: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The input starts with an item keyword (`fn`, `struct`, `enum`, `extern`,
+/// `pub`, `use`) rather than a statement.
+fn starts_with_item(head: &str) -> bool {
+    let word: String = head
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    matches!(word.as_str(), "fn" | "struct" | "enum" | "extern" | "pub" | "use")
+}
+
 fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
-    let opts = copts(a.opt, true);
+    let opts = copts(a.opt, a.color);
     let head = buf.trim_start();
-    if buf.contains("fn main") {
-        // A whole program: run it against the kept definitions, keep nothing.
-        let mut files = repl_files(items, &[]);
-        files.push(("<repl>".into(), buf));
-        repl_run(files, &opts, a);
-    } else if head.starts_with("fn ") || head.starts_with("struct ") || head.starts_with("extern ") {
+    if starts_with_item(head) {
         // Definitions: parse alone to learn their names, then type-check them
         // together with the kept items (replacing same-named ones). An error
         // discards only this input.
@@ -640,8 +716,19 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
         if lex_diags.has_errors() || parse_diags.has_errors() {
             let mut session = Session::new();
             session.add_file("<repl>".into(), buf);
-            lex_diags.emit(&session, true);
-            parse_diags.emit(&session, true);
+            lex_diags.emit(&session, a.color);
+            parse_diags.emit(&session, a.color);
+            return;
+        }
+        if program
+            .items
+            .iter()
+            .any(|it| matches!(it, Item::Fn(f) if f.name.name == "main"))
+        {
+            // A whole program: run it against the kept definitions, keep nothing.
+            let mut files = repl_files(items, &[]);
+            files.push(("<repl>".into(), buf));
+            repl_run(files, &opts, a);
             return;
         }
         let new_items: Vec<ReplItem> = program
@@ -675,9 +762,9 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
             "<repl:main>".into(),
             "fn main() -> i32 { return 0; }\n".into(),
         ));
-        let c = compile_sources(files, &opts);
+        let c = compile_sources_public(files, &opts);
         if c.diags.has_errors() {
-            c.diags.emit(&c.session, true);
+            c.diags.emit(&c.session, a.color);
             println!("(input discarded; previous definitions kept)");
             return;
         }
@@ -686,7 +773,24 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
         println!("defined {}", names.join(", "));
     } else {
         // Statements: wrap into a fresh `main` (same line, so line numbers match).
-        let mut files = repl_files(items, &[]);
+        let kept = repl_files(items, &[]);
+        let src = buf.trim_end();
+        if !src.ends_with(';') && !src.ends_with('}') {
+            // a bare expression: show its value if it is an i32, else just
+            // evaluate it for its effects (`print_i32(1)` without `;`)
+            for cand in [
+                format!("fn main() -> i32 {{ return ({src}); }}\n"),
+                format!("fn main() -> i32 {{ {src};\nreturn 0; }}\n"),
+            ] {
+                let mut files = kept.clone();
+                files.push(("<repl>".into(), cand));
+                if !compile_sources_public(files.clone(), &opts).diags.has_errors() {
+                    repl_run(files, &opts, a);
+                    return;
+                }
+            }
+        }
+        let mut files = kept;
         files.push((
             "<repl>".into(),
             format!("fn main() -> i32 {{ {buf}\nreturn 0; }}\n"),
@@ -696,9 +800,9 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
 }
 
 fn repl_run(files: Vec<(String, String)>, opts: &CompileOptions, a: &Args) {
-    let mut c = compile_sources(files, opts);
+    let mut c = compile_sources_public(files, opts);
     if c.diags.has_errors() {
-        c.diags.emit(&c.session, true);
+        c.diags.emit(&c.session, a.color);
         return;
     }
     match run_compiled_with(&mut c, vm_opts(a)) {
@@ -731,12 +835,16 @@ struct BenchRow {
 /// `bench FILE [--n N]`: compile at -O0 and -O2, run each N times and compare.
 fn bench(a: &Args) -> Result<ExitCode, String> {
     let file = need_file(a)?;
-    let runs = a.n.unwrap_or(5).max(1) as usize;
+    let runs = a.n.unwrap_or(5);
+    if runs < 1 {
+        return Err("bench: --n must be at least 1".to_string());
+    }
+    let runs = runs as usize;
     let incs = includes(a);
     let mut rows: Vec<BenchRow> = Vec::new();
     for level in [0u8, 2u8] {
         let mut c = compile_files(file, &incs, &copts(level, false))?;
-        if let Some(code) = check_errors(&c, true) {
+        if let Some(code) = check_errors(&c, a.color) {
             return Ok(code);
         }
         let mut times: Vec<u128> = Vec::with_capacity(runs);

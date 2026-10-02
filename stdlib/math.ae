@@ -1,21 +1,22 @@
-// Reference routines. Aether 0.2 has no `mod`/`use`; copy into the program.
+// Reference routines. Import with `use "stdlib/math.ae";` (the API is `pub`) or
+// run this file directly: it has its own `main`.
 
-fn abs(x: i32) -> i32 {
+pub fn abs(x: i32) -> i32 {
     if x < 0 { return 0 - x; }
     return x;
 }
 
-fn min(a: i32, b: i32) -> i32 {
+pub fn min(a: i32, b: i32) -> i32 {
     if a < b { return a; }
     return b;
 }
 
-fn max(a: i32, b: i32) -> i32 {
+pub fn max(a: i32, b: i32) -> i32 {
     if a > b { return a; }
     return b;
 }
 
-fn clamp(x: i32, lo: i32, hi: i32) -> i32 {
+pub fn clamp(x: i32, lo: i32, hi: i32) -> i32 {
     return max(lo, min(hi, x));
 }
 

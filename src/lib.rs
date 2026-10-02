@@ -22,7 +22,8 @@ pub mod vm;
 pub mod runtime;
 
 pub use driver::{
-    compile_file, compile_files, compile_source, compile_sources, run_compiled,
+    compile_file, compile_files, compile_source, compile_sources, compile_sources_public,
+    run_compiled,
     run_compiled_with, CompileOptions, Compiled, RunError,
 };
 pub use vm::{execute, Value, VmError, VmOptions};

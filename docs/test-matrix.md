@@ -56,8 +56,14 @@ humano devem conseguir reproduzir.
 | mir | 30 |
 | aspect | 30 |
 | agg | 30 |
+| lang | 30 |
 
-Semente de smoke no CI: `1`.
+Semente de smoke no CI: `1`. `tests/fuzz_smoke.rs` corre 30 casos por kind com seeds
+fixas (e verifica que o gerador `lang` alcança cada construção nova).
+
+Oráculos (kinds `agg`, `lang`, `diff`): -O0 == -O1 == -O2, `verify_module`,
+determinismo, `run_budget` (1, 7, 1000) == `run`, `fmt` idempotente (ver
+[fuzzing.md](fuzzing.md)), watchdog de 5 s por caso.
 
 ## Corpus
 
@@ -108,3 +114,4 @@ têm de concordar e coincidir com o stdout/valor esperado.
 | shrink a apagar helper chamado | `uses_in_expr` no sketch |
 | overflow do pretty wrap | `map_leaves` post-order |
 | `check_ir` ids após retain | existência por id, não índice |
+| A1 | `tests/audit_match.rs` | match/enum/tuplas/padrões aninhados: -O0 = -O2 = esperado |

@@ -374,7 +374,7 @@ fn enum_and_tuple_type_errors() {
     rejects("struct S { x: i32 } enum S { A } fn main() -> i32 { return 0; }", "E0201");
     rejects("enum E { A(E) } fn main() -> i32 { return 0; }", "E0205");
     rejects(
-        &format!("{SHAPE} fn main() -> i32 {{ match Shape::Empty {{ Shape::Rect(1, _) => {{ }} _ => {{ }} }} return 0; }}"),
+        &format!("{SHAPE} fn main() -> i32 {{ match Shape::Empty {{ Shape::Circle(1.5) => {{ }} _ => {{ }} }} return 0; }}"),
         "E0268",
     );
 }

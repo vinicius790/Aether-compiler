@@ -123,11 +123,12 @@ pub enum Stmt {
         init: Option<Expr>,
         span: Span,
     },
-    /// `let (a, b) = t;` — tuple destructuring; sema desugars it into a
-    /// temporary plus one `let` per element.
+    /// `let (a, (b, _)) = t;` — tuple destructuring; `pattern` is a
+    /// (possibly nested) `PatternKind::Tuple`; sema desugars it into a
+    /// temporary plus one `let` per bound name.
     LetTuple {
         mutable: bool,
-        names: Vec<Ident>,
+        pattern: Pattern,
         init: Expr,
         span: Span,
     },
@@ -207,8 +208,12 @@ impl Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    /// For `Pattern => expr` the block holds just that tail expression.
     pub body: Block,
     pub span: Span,
+    /// The catch-all arm that `if let` adds; exempt from the unreachable
+    /// arm warning.
+    pub generated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,12 +230,15 @@ pub enum PatternKind {
     Binding(Ident),
     /// `1`, `-1`, `true`, `'c'`, `"s"`
     Literal(Literal),
-    /// `Enum::Variant(p1, p2)` / `Enum::Variant`
+    /// `Enum::Variant(p1, p2)` / `Enum::Variant`; the sub-patterns are
+    /// arbitrary patterns.
     Variant {
         enum_name: Ident,
         variant: Ident,
         fields: Vec<Pattern>,
     },
+    /// `(p1, p2, ...)` with at least two elements.
+    Tuple(Vec<Pattern>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +294,12 @@ pub enum ExprKind {
         ty: TypeExpr,
     },
     Group(Box<Expr>),
+    /// `match e { Pattern => expr-or-block, ... }` in value position (also
+    /// a block's tail). At statement position it is `Stmt::Match`.
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,14 +552,16 @@ fn dump_stmt(stmt: &Stmt, n: usize, out: &mut String) {
             out.push_str(";\n");
         }
         Stmt::LetTuple {
-            mutable, names, init, ..
+            mutable,
+            pattern,
+            init,
+            ..
         } => {
-            let names: Vec<_> = names.iter().map(|n| n.name.clone()).collect();
             out.push_str(&format!(
-                "{}let {}({}) = {};\n",
+                "{}let {}{} = {};\n",
                 indent(n),
                 if *mutable { "mut " } else { "" },
-                names.join(", "),
+                pattern_str(pattern),
                 expr_str(init)
             ));
         }
@@ -621,7 +637,7 @@ fn dump_stmt(stmt: &Stmt, n: usize, out: &mut String) {
 fn expr_str(expr: &Expr) -> String {
     match &expr.kind {
         ExprKind::Literal(Literal::Int(v)) => v.to_string(),
-        ExprKind::Literal(Literal::Float(v)) => format!("{v}"),
+        ExprKind::Literal(Literal::Float(v)) => float_str(*v),
         ExprKind::Literal(Literal::Bool(v)) => v.to_string(),
         ExprKind::Literal(Literal::String(s)) => format!("{s:?}"),
         ExprKind::Literal(Literal::Char(c)) => format!("{c:?}"),
@@ -666,6 +682,16 @@ fn expr_str(expr: &Expr) -> String {
         }
         ExprKind::Cast { expr, ty } => format!("({} as {})", expr_str(expr), type_str(ty)),
         ExprKind::Group(e) => format!("({})", expr_str(e)),
+        ExprKind::Match { scrutinee, arms } => {
+            let a: Vec<_> = arms
+                .iter()
+                .map(|arm| match (arm.body.stmts.is_empty(), &arm.body.tail) {
+                    (true, Some(t)) => format!("{} => {}", pattern_str(&arm.pattern), expr_str(t)),
+                    _ => format!("{} => {{ ... }}", pattern_str(&arm.pattern)),
+                })
+                .collect();
+            format!("match {} {{ {} }}", expr_str(scrutinee), a.join(", "))
+        }
     }
 }
 
@@ -687,6 +713,10 @@ pub fn pattern_str(p: &Pattern) -> String {
                 format!("{}::{}({})", enum_name.name, variant.name, f.join(", "))
             }
         }
+        PatternKind::Tuple(elems) => {
+            let f: Vec<_> = elems.iter().map(pattern_str).collect();
+            format!("({})", f.join(", "))
+        }
     }
 }
 
@@ -694,11 +724,21 @@ pub fn pattern_str(p: &Pattern) -> String {
 pub fn literal_str(lit: &Literal) -> String {
     match lit {
         Literal::Int(v) => v.to_string(),
-        Literal::Float(v) => format!("{v}"),
+        Literal::Float(v) => float_str(*v),
         Literal::Bool(v) => v.to_string(),
         Literal::String(s) => format!("{s:?}"),
         Literal::Char(c) => format!("{c:?}"),
         Literal::Unit => "()".into(),
+    }
+}
+
+/// A float literal that lexes back as a float: always has a `.` in the
+/// mantissa (`2.0`, `1.0e300`), never a bare integer such as `2`.
+pub fn float_str(v: f64) -> String {
+    let s = format!("{v:?}");
+    match s.find('e') {
+        Some(i) if !s[..i].contains('.') => format!("{}.0{}", &s[..i], &s[i..]),
+        _ => s,
     }
 }
 

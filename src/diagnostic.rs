@@ -175,10 +175,23 @@ impl Diagnostics {
                         w,
                         "  {blue}{line_no:>width$} |{reset} {src_line}"
                     )?;
+                    // columns count characters; tabs are copied into the
+                    // padding so the carets line up under any tab width
                     let col = d.span.column.max(1) as usize;
-                    let caret_len = (d.span.len() as usize).max(1).min(src_line.len().saturating_sub(col.saturating_sub(1)).max(1));
-                    let pad = " ".repeat(col.saturating_sub(1));
-                    let carets = "^".repeat(caret_len);
+                    let pad: String = src_line
+                        .chars()
+                        .take(col - 1)
+                        .map(|c| if c == '\t' { '\t' } else { ' ' })
+                        .chain(std::iter::repeat(' ').take((col - 1).saturating_sub(src_line.chars().count())))
+                        .collect();
+                    let rest = src_line.chars().count().saturating_sub(col - 1);
+                    let span_chars = file
+                        .source
+                        .get(d.span.start.0 as usize..d.span.end.0 as usize)
+                        .unwrap_or("")
+                        .lines()
+                        .next().unwrap_or("").chars().count();
+                    let carets = "^".repeat(span_chars.max(1).min(rest.max(1)));
                     writeln!(
                         w,
                         "  {blue}{:>width$} |{reset} {pad}{lvl_col}{carets}{reset}",

@@ -29,10 +29,11 @@ pub fn analyze_function(f: &IrFunction) -> Liveness {
         live_out.insert(bb.id.0, HashSet::new());
     }
 
+    // Sets only ever grow, so this terminates; a fixed sweep cap would hand
+    // DCE an under-approximation (a live register called dead) on CFGs whose
+    // layout runs against the control flow.
     let mut changed = true;
-    let mut guard = 0;
-    while changed && guard < 64 {
-        guard += 1;
+    while changed {
         changed = false;
         for bb in f.blocks.iter().rev() {
             let mut out = HashSet::new();

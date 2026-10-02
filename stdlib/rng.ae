@@ -3,6 +3,8 @@
 //
 //     use "stdlib/rng.ae";
 //
+// The API is `pub` (see docs/stdlib.md, "Visibilidade").
+//
 // The state is a plain i32 (never 0) that the caller threads through:
 //
 //     let mut s = 2463534242 as i32;   // any non-zero seed
@@ -13,7 +15,7 @@
 // algorithm is recovered by masking the sign bits away.
 
 // Advance the generator: returns the next state (also the next value).
-fn rng_next(state: i32) -> i32 {
+pub fn rng_next(state: i32) -> i32 {
     let mut x = state;
     if x == 0 { x = 1; }
     x = x ^ (x << 13);
@@ -23,7 +25,7 @@ fn rng_next(state: i32) -> i32 {
 }
 
 // Map a state to lo..hi (hi exclusive). Returns lo when hi <= lo.
-fn rng_range(state: i32, lo: i32, hi: i32) -> i32 {
+pub fn rng_range(state: i32, lo: i32, hi: i32) -> i32 {
     if hi <= lo { return lo; }
     return lo + (state & 0x7FFFFFFF) % (hi - lo);
 }

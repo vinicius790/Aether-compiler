@@ -9,6 +9,29 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- VM/assembler/optimizer audit: DCE keeps trapping ops (div/rem by non-constant, index loads), liveness
+  to a true fixpoint, CSE soundness and O(n) data structures, 256+ field structs (u16 field index),
+  strict VM type errors instead of silent `Unit`, host extern results type-checked (`BcFunction.ret_ty`),
+  assembler validates IR (E0300), string/array size caps, inliner respects the 65535-register limit,
+  `==` on arrays, `jnz`/`jz` disassembly names
+- Fuzz: `lang` kind (enums, match, tuples, compound assignment, bit ops, built-ins, modules), shared
+  oracles (-O0/-O1/-O2, verify, determinism, run_budget equivalence, fmt fixpoint), seed mixing fix
+- Sema: array literals take the expected element type; `-(-2147483648)` wraps instead of being a literal error
+- Nested variant/literal/tuple patterns, `let (a, (b, c)) = t;`; `match` as an expression
+  (arm values, E0273, never-typed diverging arms); matrix exhaustiveness with a witness in
+  E0270; warning W0272 (unreachable arm); E0274 (name bound twice in a pattern); `==` on arrays
+- E0271 now only for identical variant patterns; E0268 only for float / refutable `let` patterns;
+  unknown string escapes (E0006) and `''` (E0003) are errors
+- Fixed: `for` bound re-read each iteration; liveness fixpoint capped at 64 rounds (DCE dropped
+  live values in deep expressions); DCE removed unused trapping ops (`5 / z`, `a[5]`) at -O1/-O2;
+  quadratic IR emission (40k-arm match 17 s → 0.6 s)
+- `pub` is enforced across files (`E0281 ... is private to FILE`); stdlib API marked `pub`;
+  `driver::compile_sources_public` for hosts such as the REPL
+- `run --backend llvm` treats `main`'s value as the result (`driver::run_llvm_ir`, `LliStatus`)
+- Colour only on a TTY (honours `NO_COLOR`, `--color` / `--no-color`); strict CLI option parsing;
+  UTF-8 BOM ignored and a clear non-UTF-8 error; diagnostic carets align with tabs and multibyte text
+- fmt fixes: main file only, keeps `let x: T`, prints `3.0` correctly, idempotent, syntax errors fail
+- REPL: `enum`/`pub`/`use` inputs, bare expressions, `main_*` is no longer mistaken for `main`
 - File modules: `use "relative/path.ae";` imports every item of another
   file (path relative to the importing file, `.ae` optional, transitive,
   each file included once, cycles allowed); `--include` / `AETHER_INCLUDE`

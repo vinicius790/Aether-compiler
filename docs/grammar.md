@@ -27,7 +27,7 @@ Type        ::= "i32" | "i64" | "f64" | "bool" | "string" | "unit" | "char"
               | TupleType
 TupleType   ::= "(" Type ("," Type)+ ","? ")"
 
-Block       ::= "{" Stmt* Expr? "}"
+Block       ::= "{" Stmt* (Expr | MatchExpr)? "}"
 
 Stmt        ::= LetStmt | LetTupleStmt | IfStmt | IfLetStmt | MatchStmt
               | WhileStmt | ForStmt
@@ -36,7 +36,9 @@ Stmt        ::= LetStmt | LetTupleStmt | IfStmt | IfLetStmt | MatchStmt
               | AssignStmt | ExprStmt
 
 LetStmt     ::= "let" "mut"? Ident (":" Type)? ("=" Expr)? ";"
-LetTupleStmt::= "let" "mut"? "(" Ident ("," Ident)+ ","? ")" "=" Expr ";"
+LetTupleStmt::= "let" "mut"? TuplePat "=" Expr ";"
+TuplePat    ::= "(" LetPat ("," LetPat)+ ","? ")"
+LetPat      ::= "_" | Ident | TuplePat
 AssignStmt  ::= Expr AssignOp Expr ";"
 AssignOp    ::= "=" | "+=" | "-=" | "*=" | "/=" | "%="
               | "&=" | "|=" | "^=" | "<<=" | ">>="
@@ -47,10 +49,15 @@ ContinueStmt::= "continue" ";"
 YieldStmt   ::= "yield" ";"
 IfStmt      ::= "if" Expr Block ("else" (IfStmt | Block))?
 IfLetStmt   ::= "if" "let" Pattern "=" Expr Block ("else" (IfStmt | Block))?
-MatchStmt   ::= "match" Expr "{" MatchArm* "}"
-MatchArm    ::= Pattern "=>" Block ","?
+MatchStmt   ::= MatchExpr
+MatchExpr   ::= "match" Expr "{" MatchArm* "}"
+MatchArm    ::= Pattern "=>" (Block ","? | Expr "," | ArmJump ",")
+              | Pattern "=>" (Expr | ArmJump) &"}"
+ArmJump     ::= "return" Expr? | "break" | "continue"
 Pattern     ::= "_" | Ident
               | Ident "::" Ident ("(" Pattern ("," Pattern)* ","? ")")?
+              | "(" Pattern "," Pattern ("," Pattern)* ","? ")"
+              | "(" Pattern ")" | "(" ")"
               | "-"? IntLit | "true" | "false" | CharLit | StringLit
 WhileStmt   ::= "while" Expr Block
 ForStmt     ::= "for" Ident "in" Expr ".." Expr Block
@@ -82,6 +89,7 @@ Primary     ::= Ident StructLit?
               | "(" Expr? ")"
               | TupleExpr
               | "[" ArgList? "]"
+              | MatchExpr
 
 TupleExpr   ::= "(" Expr ("," Expr)+ ","? ")"
 
@@ -96,9 +104,18 @@ não verificada). `UseItem` importa os itens de outro ficheiro; o caminho é
 relativo ao ficheiro corrente e `.ae` é opcional (ver language.md,
 “Módulos”).
 `t.0.1` lê-se como `(t.0).1`: o léxico produz o float `0.1`, que o parser
-divide em dois índices. Nos padrões de `match`, `_` é o identificador `_`;
-os sub-padrões de uma variante são só nomes ou `_`. `match` só é instrução
-(`Stmt`), nunca expressão.
+divide em dois índices. Nos padrões, `_` é o identificador `_`; os
+sub-padrões de uma variante e os elementos de uma tupla são padrões
+quaisquer (aninhados). `&"}"` quer dizer "seguido de `}`": um braço de
+expressão sem vírgula só é aceite como último. Os padrões de `let` são só
+nomes, `_` e tuplas (a restrição é semântica, E0268).
+
+`match` é uma instrução (`MatchStmt`) quando está em posição de instrução e
+é seguido de mais código; é a expressão final do bloco (`Block` termina em
+`MatchExpr`) quando é a última coisa antes de `}`; e é uma expressão
+(`Primary`) em qualquer outra posição. A distinção só afecta a verificação
+de tipos (ver language.md, «`match` como expressão»); um `;` a seguir a um
+`match` de instrução é aceite e ignorado.
 
 Precedência (do mais frouxo ao mais apertado): `||` 1, `&&` 2, `== !=` 3,
 `< <= > >=` 4, `|` 5, `^` 6, `&` 7, `<< >>` 8, `+ -` 9, `* / %` 10, `as` 11,
@@ -110,7 +127,9 @@ IntLit      ::= DecLit | "0x" HexDigit ("_"? HexDigit)* | "0b" BinDigit ("_"? Bi
               | "0o" OctDigit ("_"? OctDigit)*
 DecLit      ::= Digit ("_"? Digit)*
 FloatLit    ::= DecLit "." DecLit (("e"|"E") ("+"|"-")? Digit+)?
+              | DecLit ("e"|"E") ("+"|"-")? Digit+
 Escape      ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" HexDigit{1,6} "}"
+CharLit     ::= "'" (Escape | any char except "'" and "\") "'"
 ```
 
 O léxico aceita `_` em qualquer posição após o primeiro dígito (também

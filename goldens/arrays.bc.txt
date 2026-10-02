@@ -62,7 +62,7 @@ fn main #21 arity=0 regs=13
   0016  jmp 17
   0017  loadimm r1, I32(4)
   0018  lti32 r12, r11, r1
-  0019  jz r12, 21
+  0019  jnz r12, 21
   0020  jmp 28
   0021  loadidx r1, r9[r11]
   0022  addi32 r2, r10, r1

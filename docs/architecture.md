@@ -47,8 +47,12 @@ abaixamento para a VM (1 registrador IR = 1 registrador VM).
 ## Otimizador
 
 Pipeline funcional sobre `IrModule`. Cada pass devolve estatísticas.
-Nível 0: identidade. Nível 1: fold + copy-prop + DCE. Nível 2: + algébrico,
-const-prop, simplificação de CFG, segunda rodada de fold/DCE.
+Nível 0: identidade. Nível 1: fold + copy-prop + DCE. Nível 2, por ordem:
+const-fold, algebraic, cf-simplify, inline, local-cse, copy-prop,
+const-prop, cf-simplify, dce, const-fold, dce, dead-fn. A sequência repete
+até o número de instruções estabilizar (máximo 4 rondas): inlining expõe
+constantes, constantes expõem código morto, e uma função cujas chamadas
+foram todas inlinadas é removida. Ver `docs/optimizations.md`.
 
 ## Backends
 

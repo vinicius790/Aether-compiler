@@ -97,18 +97,68 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
         ]
     };
 
-    for (name, pass) in passes {
-        let before = count_insts(&module);
-        pass(&mut module);
-        let after = count_insts(&module);
-        report.passes.push(PassStats {
-            name: name.to_string(),
-            insts_before: before,
-            insts_after: after,
-        });
+    // Run the sequence to a fixpoint: a later pass often exposes work for an
+    // earlier one (inlining feeds folding feeds DCE). Bounded so a pathological
+    // module cannot spin; in practice two or three rounds suffice.
+    const MAX_ROUNDS: usize = 4;
+    for round in 0..MAX_ROUNDS {
+        let round_before = count_insts(&module);
+        for (name, pass) in &passes {
+            let before = count_insts(&module);
+            pass(&mut module);
+            let after = count_insts(&module);
+            if round == 0 || before != after {
+                report.passes.push(PassStats {
+                    name: name.to_string(),
+                    insts_before: before,
+                    insts_after: after,
+                });
+            }
+        }
+        if level >= 2 {
+            let before = count_insts(&module);
+            pass_dead_functions(&mut module);
+            let after = count_insts(&module);
+            if round == 0 || before != after {
+                report.passes.push(PassStats {
+                    name: "dead-fn".to_string(),
+                    insts_before: before,
+                    insts_after: after,
+                });
+            }
+        }
+        if count_insts(&module) == round_before {
+            break;
+        }
     }
     report.insts_after = count_insts(&module);
     (module, report)
+}
+
+/// Removes functions that `main` can never reach (typically leaves that were
+/// inlined everywhere). Extern declarations are kept: they are bound by the host.
+pub fn pass_dead_functions(module: &mut IrModule) {
+    let mut live: HashSet<String> = HashSet::new();
+    let mut stack = vec!["main".to_string()];
+    while let Some(name) = stack.pop() {
+        if !live.insert(name.clone()) {
+            continue;
+        }
+        if let Some(f) = module.function(&name) {
+            for bb in &f.blocks {
+                for inst in &bb.insts {
+                    if let Inst::Call { func, .. } = inst {
+                        if !live.contains(func) {
+                            stack.push(func.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    module
+        .functions
+        .retain(|f| f.is_extern || live.contains(&f.name));
 }
 
 /// Compare two constants of the same type the way the VM would.
@@ -696,6 +746,38 @@ mod tests {
         let bc = crate::backend::assemble(&opt);
         let (v, _, _) = crate::vm::execute_captured(&bc).expect("vm");
         assert_eq!(v, crate::vm::Value::I32(2));
+    }
+
+    #[test]
+    fn inlined_leaf_is_removed_and_fixpoint_folds_through() {
+        let src = r#"
+            fn add1(x: i32) -> i32 { return x + 1; }
+            fn twice(x: i32) -> i32 { return add1(add1(x)); }
+            fn main() -> i32 { return twice(40); }
+        "#;
+        let ir = compile_ir(src);
+        let (opt, report) = optimize(ir, 2);
+        let text = dump_ir(&opt);
+        assert!(!text.contains("fn add1"), "add1 should be dead after inlining\n{text}");
+        assert!(!text.contains("fn twice"), "twice should be dead after inlining\n{text}");
+        assert!(
+            text.contains("const 42_i32"),
+            "nested inlining should fold to 42\n{text}\n{}",
+            report.summary()
+        );
+    }
+
+    #[test]
+    fn keeps_functions_main_reaches() {
+        let src = r#"
+            fn loud(n: i32) -> i32 { print_i32(n); return n; }
+            fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+            fn main() -> i32 { return loud(fib(5)); }
+        "#;
+        let ir = compile_ir(src);
+        let (opt, _) = optimize(ir, 2);
+        assert!(opt.function("fib").is_some());
+        assert!(opt.function("loud").is_some() || dump_ir(&opt).contains("print_i32"));
     }
 
     #[test]

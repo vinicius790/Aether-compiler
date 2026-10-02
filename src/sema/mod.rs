@@ -1969,19 +1969,6 @@ fn fn_ty(params: Vec<Type>, ret: Type) -> Type {
     }
 }
 
-/// Value of a (possibly negated or parenthesised) integer literal.
-fn int_literal_value(e: &Expr) -> Option<i64> {
-    match &e.kind {
-        ExprKind::Literal(Literal::Int(v)) => Some(*v),
-        ExprKind::Group(inner) => int_literal_value(inner),
-        ExprKind::Unary {
-            op: UnOp::Neg,
-            expr,
-        } => int_literal_value(expr).map(i64::wrapping_neg),
-        _ => None,
-    }
-}
-
 /// An expression made only of integer literals, parentheses, unary minus or
 /// bitwise not, arithmetic and bitwise operators — it has no type of its own
 /// and adopts the other operand's.

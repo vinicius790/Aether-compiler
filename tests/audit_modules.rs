@@ -362,7 +362,7 @@ fn fmt_prints_only_the_main_file_and_keeps_use_lines() {
     let o = run(&["fmt", "examples/modules.ae"]);
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
-    assert!(text.starts_with("use \"../stdlib/vec2.ae\";\nuse \"../stdlib/rng.ae\";\n"), "{text}");
+    assert!(text.contains("\nuse \"../stdlib/vec2.ae\";\nuse \"../stdlib/rng.ae\";\n"), "{text}");
     assert!(!text.contains("struct Vec2"), "{text}");
     assert!(!text.contains("fn rng_next"), "{text}");
     // the formatted program, next to the original, behaves the same

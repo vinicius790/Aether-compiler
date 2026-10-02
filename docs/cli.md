@@ -97,10 +97,21 @@ Identificadores Unicode são `unexpected character` (não um *panic*).
 
 `fmt` escreve a AST do ficheiro principal (os itens importados não entram; os
 `use` ficam como estavam). Erros léxicos/sintáticos terminam com `exit 1` sem
-saída; erros de tipos não impedem a formatação. Os comentários **não** são
-preservados. `aether fmt F > G; aether run G` dá o mesmo que `run F`, e
-`fmt G` devolve `G` (idempotente): literais `f64` ficam `3.0`, as anotações
-`let x: T` mantêm-se.
+saída; erros de tipos não impedem a formatação. `aether fmt F > G; aether run G`
+dá o mesmo que `run F`, e `fmt G` devolve `G` (idempotente): literais `f64`
+ficam `3.0`, as anotações `let x: T` mantêm-se.
+
+Os comentários (`// ...` e `/* ... */`, também os de várias linhas) são todos
+preservados, uma vez cada, com o texto inalterado (só muda o fim de linha: o
+`\r` de CRLF sai). Ficam presos ao elemento seguinte — item, instrução,
+expressão final de um bloco, braço de `match`, campo de `struct` ou variante
+de `enum` — numa linha própria antes dele; um comentário na mesma linha
+depois de código (`let x = 1; // porquê`) ou depois de `{` fica nessa linha;
+os que estão antes de `}` ficam dentro do bloco e os do fim do ficheiro ficam
+no fim. Um comentário dentro de algo que não tem linha própria (expressão,
+padrão, tipo, parâmetros, entre `}` e `else {`) passa para antes do elemento
+que o contém. Linhas em branco entre elementos ou comentários são mantidas
+(no máximo uma).
 
 ```bash
 aether run game.ae --include stdlib/prelude.ae

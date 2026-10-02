@@ -440,7 +440,8 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
             }
             let main_file = c.file;
             c.program.items.retain(|it| it.span().file == main_file);
-            print!("{}", aether::pretty::pretty_program(&c.program));
+            let src = c.session.file(main_file).map_or("", |f| f.source.as_str());
+            print!("{}", aether::comments::format_program(&c.program, main_file, src));
             Ok(ExitCode::SUCCESS)
         }
         "cfg" => {

@@ -5,6 +5,7 @@
 
 pub mod ast;
 pub mod backend;
+pub mod comments;
 pub mod diagnostic;
 pub mod driver;
 pub mod fuzz;

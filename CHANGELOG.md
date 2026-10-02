@@ -9,6 +9,7 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- `aether fmt` preserves comments (leading, trailing, inside blocks, end of file; never dropped or duplicated)
 - VM/assembler/optimizer audit: DCE keeps trapping ops (div/rem by non-constant, index loads), liveness
   to a true fixpoint, CSE soundness and O(n) data structures, 256+ field structs (u16 field index),
   strict VM type errors instead of silent `Unit`, host extern results type-checked (`BcFunction.ret_ty`),

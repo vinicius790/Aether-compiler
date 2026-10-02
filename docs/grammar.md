@@ -24,7 +24,7 @@ Type        ::= "i32" | "i64" | "f64" | "bool" | "string" | "unit" | "char"
 Block       ::= "{" Stmt* Expr? "}"
 
 Stmt        ::= LetStmt | IfStmt | WhileStmt | ForStmt
-              | ReturnStmt | BreakStmt | ContinueStmt
+              | ReturnStmt | BreakStmt | ContinueStmt | YieldStmt
               | Block
               | AssignStmt | ExprStmt
 
@@ -36,6 +36,7 @@ ExprStmt    ::= Expr ";"
 ReturnStmt  ::= "return" Expr? ";"
 BreakStmt   ::= "break" ";"
 ContinueStmt::= "continue" ";"
+YieldStmt   ::= "yield" ";"
 IfStmt      ::= "if" Expr Block ("else" (IfStmt | Block))?
 WhileStmt   ::= "while" Expr Block
 ForStmt     ::= "for" Ident "in" Expr ".." Expr Block

@@ -128,6 +128,7 @@ fn pretty_stmt(st: &Stmt, indent: usize) -> String {
         ),
         Stmt::Break { .. } => "break;".into(),
         Stmt::Continue { .. } => "continue;".into(),
+        Stmt::Yield { .. } => "yield;".into(),
         Stmt::Block { block, .. } => pretty_block(block, indent),
     }
 }

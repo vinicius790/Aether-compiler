@@ -91,6 +91,15 @@ Alvos de jump são índices no `Vec<Op>` da **mesma** função.
 Arrays e structs têm semântica de valor: copiá-los para outro registrador
 faz cópia profunda.
 
+## Bits, `yield`
+
+`BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`/`NotInt` operam em `i32` ou `i64`
+conforme o valor do registrador esquerdo; o deslocamento é mascarado
+(`& 31` / `& 63`) e `Shr` é aritmético. `Yield` suspende `Vm::run_budget`
+(devolve `Step::Yielded`) e é ignorado por `run()`. Natives 8..=20 estão
+listados em `src/runtime/mod.rs`; os índices de funções do utilizador no
+módulo começam depois da tabela de natives.
+
 ## Natives
 
 Ver `src/runtime/mod.rs`. Ids estáveis só dentro da mesma versão. Chamar

@@ -321,6 +321,7 @@ impl Parser {
                 | TokenKind::Return
                 | TokenKind::Break
                 | TokenKind::Continue
+                | TokenKind::Yield
                 | TokenKind::LBrace
         )
     }
@@ -332,7 +333,7 @@ impl Parser {
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
-            TokenKind::Break | TokenKind::Continue => self.parse_jump(),
+            TokenKind::Break | TokenKind::Continue | TokenKind::Yield => self.parse_jump(),
             TokenKind::LBrace => self.parse_block_stmt(),
             _ => self.parse_expr_stmt(),
         }
@@ -356,10 +357,10 @@ impl Parser {
         let tok = self.bump();
         self.expect(TokenKind::Semicolon)?;
         let span = tok.span.merge(self.prev_span());
-        Some(if tok.kind == TokenKind::Break {
-            Stmt::Break { span }
-        } else {
-            Stmt::Continue { span }
+        Some(match tok.kind {
+            TokenKind::Break => Stmt::Break { span },
+            TokenKind::Yield => Stmt::Yield { span },
+            _ => Stmt::Continue { span },
         })
     }
 

@@ -420,7 +420,7 @@ fn apply(f: &mut IrFunction, map: &[u32], count: u32) {
                     m(base);
                     m(value);
                 }
-                Inst::Nop => {}
+                Inst::Yield | Inst::Nop => {}
             }
         }
         match &mut bb.term {

@@ -9,6 +9,21 @@ explicitly unstable.
 ## [0.2.2] — 2026-10-02
 
 ### Added
+- Compound assignment (`+= -= *= /= %= &= |= ^= <<= >>=`), bitwise `& | ^ << >>`
+  and integer `!`, literals `0x`/`0b`/`0o`/`1_000`, `\u{...}` escapes
+- Built-ins `print_char`, `to_string`, `i64_to_string`, `f64_to_string`,
+  `char_to_string`, `abs`, `min`, `max`, `clamp`, `sqrt`, `floor`, `ceil`,
+  `pow_i32`; `len` accepts arrays; a user `fn` shadows a built-in
+- `yield;` statement, `Vm::run_budget` / `Step` for per-frame execution
+  budgets, `Op::Yield`
+- Host-bindable `extern fn` (`host::Host::register`, `Vm::with_host_fn`)
+- CLI: `--include FILE` / `AETHER_INCLUDE` multi-file programs and
+  `stdlib/prelude.ae`, `--max-steps`, `--max-depth`, `run --backend llvm`,
+  `bench <file> [--n N]`, REPL that keeps definitions (`:items`, `:reset`)
+- Optimizer: fixpoint driver, `dead-fn` (unreachable functions removed),
+  `regalloc` register compaction (type-aware), bitwise identities
+- Golden tests for example IR/bytecode (`UPDATE_GOLDENS=1`), suites
+  `language_ops`, `cli_features`, `host_api`, `yield_stmt`
 - Fuzz kind `agg` (alias `aggregate`, part of `all`): well-typed programs with
   structs, nested arrays, `i64`/`f64`/`char`/`string`, casts, `&&`/`||`
   guards, nested assignment and tail-expression functions, checked by the

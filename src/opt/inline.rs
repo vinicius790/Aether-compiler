@@ -119,6 +119,7 @@ fn remap_inst(inst: &Inst, base: u32) -> Inst {
             len,
         },
         Inst::AllocStruct { dest, ty } => Inst::AllocStruct { dest: m(dest), ty },
+        Inst::Yield => Inst::Yield,
         Inst::Nop => Inst::Nop,
     }
 }

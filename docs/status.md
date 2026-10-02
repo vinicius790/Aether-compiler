@@ -75,5 +75,11 @@ Feito em 0.2.2: stack slots (`alloca`) no LLVM prontos para `mem2reg`;
 inlining de folhas no otimizador próprio; gerador estendido a structs,
 arrays e strings (`--kind agg`).
 
+Também em 0.2.2: operadores compostos e bitwise, literais hex/bin/oct,
+`\u{...}`, 13 built-ins novos, `len` em arrays, `yield` + `Vm::run_budget`,
+natives do host (`Host::register`), `--include`/prelúdio, `bench`, REPL com
+estado, compactação de registradores, otimizador em ponto fixo com remoção
+de funções mortas.
+
 1. Módulos simples (`mod` / `use`).
 2. Relatórios de cobertura LLVM / `cargo-fuzz` sobre a IR (o greybox da VM já existe).

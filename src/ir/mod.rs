@@ -141,6 +141,8 @@ pub enum Inst {
         dest: Reg,
         ty: Type,
     },
+    /// Suspends a budgeted VM run; never removed (it is an effect).
+    Yield,
     /// Marker used by DCE: instruction has no effect.
     Nop,
 }
@@ -158,13 +160,17 @@ impl Inst {
             | Inst::AllocArray { dest, .. }
             | Inst::AllocStruct { dest, .. } => Some(*dest),
             Inst::Call { dest, .. } => *dest,
-            Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Nop => None,
+            Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Yield | Inst::Nop => None,
         }
     }
 
     pub fn uses(&self) -> Vec<Reg> {
         match self {
-            Inst::LoadConst { .. } | Inst::AllocArray { .. } | Inst::AllocStruct { .. } | Inst::Nop => {
+            Inst::LoadConst { .. }
+            | Inst::AllocArray { .. }
+            | Inst::AllocStruct { .. }
+            | Inst::Yield
+            | Inst::Nop => {
                 Vec::new()
             }
             Inst::Move { src, .. } | Inst::Un { src, .. } | Inst::Cast { src, .. } => vec![*src],
@@ -183,7 +189,8 @@ impl Inst {
         match self {
             Inst::Call { .. }
             | Inst::IndexStore { .. }
-            | Inst::FieldStore { .. } => false,
+            | Inst::FieldStore { .. }
+            | Inst::Yield => false,
             Inst::Nop => true,
             _ => true,
         }
@@ -551,6 +558,7 @@ fn lower_stmt(
                 b.switch(dead);
             }
         }
+        HirStmt::Yield(_) => b.emit(Inst::Yield),
         HirStmt::Continue(_) => {
             if let Some(t) = continue_bb {
                 b.set_term(Terminator::Jump { target: t });
@@ -850,6 +858,7 @@ impl fmt::Display for Inst {
                 write!(f, "  {dest} = alloc [{elem}; {len}]")
             }
             Inst::AllocStruct { dest, ty } => write!(f, "  {dest} = alloc {ty}"),
+            Inst::Yield => write!(f, "  yield"),
             Inst::Nop => write!(f, "  nop"),
         }
     }

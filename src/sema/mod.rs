@@ -77,6 +77,7 @@ pub enum HirStmt {
     },
     Break(Span),
     Continue(Span),
+    Yield(Span),
     Block(HirBlock),
 }
 
@@ -666,6 +667,7 @@ impl<'a> Analyzer<'a> {
                 }
                 HirStmt::Break(*span)
             }
+            Stmt::Yield { span } => HirStmt::Yield(*span),
             Stmt::Continue { span } => {
                 if self.loop_depth == 0 {
                     self.err("`continue` outside of a loop", *span, "E0240");

@@ -621,6 +621,7 @@ fn emit_inst(
                 fields: n,
             });
         }
+        Inst::Yield => code.push(Op::Yield),
         Inst::Nop => code.push(Op::Nop),
     }
     Ok(())

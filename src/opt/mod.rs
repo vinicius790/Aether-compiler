@@ -681,7 +681,7 @@ pub fn pass_dce(module: &mut IrModule) {
                 let inst = &bb.insts[i];
                 let effect = matches!(
                     inst,
-                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. }
+                    Inst::Call { .. } | Inst::IndexStore { .. } | Inst::FieldStore { .. } | Inst::Yield
                 );
                 let dest_live = inst
                     .dest_reg()

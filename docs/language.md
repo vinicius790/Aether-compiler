@@ -184,6 +184,9 @@ Chamar uma `extern fn` que a VM não implementa é erro de runtime.
   `mut i32` e só existe no corpo do laço
 - `break` / `continue` apenas dentro de laço
 - `return [expr];`
+- `yield;` — suspende uma execução com orçamento (`Vm::run_budget`); sob
+  `aether run` não faz nada. Pensado para scripts que atravessam frames de
+  um jogo (ver `docs/scripting.md`).
 
 ## Structs
 

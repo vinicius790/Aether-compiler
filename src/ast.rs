@@ -125,6 +125,10 @@ pub enum Stmt {
     Continue {
         span: Span,
     },
+    /// Suspends a budgeted VM run (`Vm::run_budget`); a no-op otherwise.
+    Yield {
+        span: Span,
+    },
     Block {
         block: Block,
         span: Span,
@@ -143,6 +147,7 @@ impl Stmt {
             | Stmt::For { span, .. }
             | Stmt::Break { span }
             | Stmt::Continue { span }
+            | Stmt::Yield { span }
             | Stmt::Block { span, .. } => *span,
         }
     }
@@ -483,6 +488,7 @@ fn dump_stmt(stmt: &Stmt, n: usize, out: &mut String) {
         }
         Stmt::Break { .. } => out.push_str(&format!("{}break;\n", indent(n))),
         Stmt::Continue { .. } => out.push_str(&format!("{}continue;\n", indent(n))),
+        Stmt::Yield { .. } => out.push_str(&format!("{}yield;\n", indent(n))),
         Stmt::Block { block, .. } => {
             out.push_str(&indent(n));
             dump_block(block, n, out);

@@ -442,6 +442,7 @@ fn infer_regs(f: &IrFunction, cx: &ModuleCtx) -> RegInfo {
                     Inst::Call { dest: None, .. }
                     | Inst::IndexStore { .. }
                     | Inst::FieldStore { .. }
+                    | Inst::Yield
                     | Inst::Nop => continue,
                 };
                 let slot = &mut info.types[dest.0 as usize];
@@ -734,6 +735,7 @@ fn emit_inst(fx: &mut FnCtx, inst: &Inst) {
             fx.line(&format!("{t} = alloca {}", llvm_ty(ty)));
             fx.store(*dest, &t);
         }
+        Inst::Yield => fx.line("; yield (no-op outside the VM)"),
         Inst::Nop => {}
     }
 }

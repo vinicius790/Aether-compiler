@@ -127,7 +127,8 @@ impl<'r> Gen<'r> {
     }
 
     fn word(&mut self) -> &'static str {
-        self.rng.choose(WORDS)
+        // explicit deref: rustc 1.75 otherwise infers `T = str` from the return type
+        *self.rng.choose(WORDS)
     }
 
     fn letter(&mut self) -> char {

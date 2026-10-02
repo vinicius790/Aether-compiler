@@ -757,7 +757,7 @@ impl<'a> Analyzer<'a> {
                 // Arithmetic inherits the expected numeric type; a bare integer
                 // literal on either side adopts the type of the other operand.
                 let hint = expected.filter(|t| t.is_numeric() && !op.is_cmp() && !op.is_logical());
-                let (l, r) = if int_literal_value(lhs).is_some() && int_literal_value(rhs).is_none() {
+                let (l, r) = if is_int_literal_expr(lhs) && !is_int_literal_expr(rhs) {
                     let r = self.check_expr(rhs, hint);
                     let l = self.check_expr(lhs, Some(&r.ty));
                     (l, r)
@@ -1129,6 +1129,23 @@ fn int_literal_value(e: &Expr) -> Option<i64> {
             expr,
         } => int_literal_value(expr).map(i64::wrapping_neg),
         _ => None,
+    }
+}
+
+/// An expression made only of integer literals, parentheses, unary minus and
+/// arithmetic — it has no type of its own and adopts the other operand's.
+fn is_int_literal_expr(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Literal(Literal::Int(_)) => true,
+        ExprKind::Group(inner) => is_int_literal_expr(inner),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => is_int_literal_expr(expr),
+        ExprKind::Binary { op, lhs, rhs } if !op.is_cmp() && !op.is_logical() => {
+            is_int_literal_expr(lhs) && is_int_literal_expr(rhs)
+        }
+        _ => false,
     }
 }
 

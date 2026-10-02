@@ -316,7 +316,8 @@ Opções comuns:
 
 | Opção | Efeito |
 |-------|--------|
-| `-O0` `-O1` `-O2` ou `-O n` | nível do otimizador (omissão: 2) |
+| `-O0` `-O1` `-O2` ou `-O n` | nível do otimizador (omissão: 2; outro valor é erro) |
+| `--color` / `--no-color` | força ou suprime cores ANSI nos diagnósticos (omissão: só com stderr num terminal e `NO_COLOR` por definir) |
 | `--unopt` | dump da IR antes dos passes |
 | `--timings` | tempos por fase |
 | `--stats` | estatísticas |
@@ -335,6 +336,11 @@ Códigos de saída: `0` ok, `1` erro de compilação / fuzz failure, `2` erro de
 runtime (incluindo `--max-steps` / `--max-depth` excedidos). Num erro de
 runtime a CLI imprime primeiro o stdout produzido até ali e depois
 `runtime error: ...`.
+
+Opções mal formadas (`-O9`, `--max-steps 0`, `--n x`, valor em falta, um segundo
+ficheiro) são erros com `exit 1`, nunca omissões silenciosas. Ficheiros acima de
+8 MiB, que não sejam UTF-8 válido, diretórios e ficheiros em falta dão uma
+única linha `cannot read ...`; um BOM UTF-8 inicial é ignorado.
 
 Todos os comandos correm numa thread com 64 MiB de pilha, para que programas
 muito aninhados nunca rebentem a pilha da thread principal.
@@ -357,14 +363,20 @@ aether run examples/hello.ae --backend llvm
 Com `--backend llvm` a CLI emite o LLVM IR textual e executa-o com `lli`
 (`lli-18` ou `lli` no `PATH`), imprimindo o stdout. Sem `lli`: erro claro e
 `exit 1`. Sob `lli` o valor devolvido por `main` é o código de saída do
-processo, por isso um `main` que devolve ≠ 0 é reportado como falha.
+processo (módulo 256): é o *resultado* do programa, não uma falha, e o comando
+sai com `0` como na VM (`--stats` mostra `exit = N`). Um sinal (`abort()` de um
+`assert` falhado) é um erro de runtime (`exit 2`); um estado ≠ 0 com mensagens
+do `lli` no stderr é `exit 1`.
 
-### Vários ficheiros: `--include`
+### Vários ficheiros: `use` e `--include`
 
-Não há `mod`/`use`, mas o driver compila vários ficheiros como um programa:
-cada ficheiro tem o seu `FileId` e é lexado em separado (os diagnósticos
-apontam para o ficheiro certo), os tokens são concatenados e analisados uma
-vez. Nomes repetidos entre ficheiros dão `duplicate function`.
+O driver compila vários ficheiros como um programa (`use "ficheiro.ae";` ou
+`--include`): cada ficheiro tem o seu `FileId` e é lexado e analisado em
+separado (os diagnósticos apontam para o ficheiro certo) e os itens são juntos
+num espaço de nomes plano. Um item definido noutro ficheiro só é acessível se
+for `pub`; caso contrário `E0281` ("`NOME` is private to `FICHEIRO`", com
+`help: mark it `pub` in FICHEIRO`). Nomes repetidos entre ficheiros dão
+`duplicate function`, mesmo para itens privados.
 `stdlib/prelude.ae` (`lerp`, `sign`, `is_even`, `gcd`, `clamp_f64`,
 `wrap_index`, `sum_to`; sem `main`) existe para ser incluído assim.
 
@@ -396,10 +408,12 @@ mensurável de que o otimizador faz alguma coisa (não inventar speedups).
 ### `repl`
 
 Linhas até uma linha vazia = uma entrada. Entradas que começam por `fn`,
-`struct` ou `extern` são definições e ficam guardadas para as seguintes
+`struct`, `enum`, `extern`, `pub` ou `use` são definições e ficam guardadas para as seguintes
 (redefinir substitui; um erro descarta só a entrada nova). Qualquer outra
 entrada é embrulhada num `main` novo e executada contra as definições
-guardadas (`=> valor`). `:items` lista os nomes, `:reset` esquece-os,
+guardadas (`=> valor`); uma expressão sem `;` (`dbl(3)`) mostra o seu valor
+`i32`. Os itens do REPL vivem em pseudo-ficheiros separados mas são todos
+públicos entre si (sem `E0281`). `:items` lista os nomes, `:reset` esquece-os,
 `:quit` sai. Detalhe em `docs/cli.md`.
 
 ### `bench`

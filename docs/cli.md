@@ -35,7 +35,8 @@ aether <comando> [opções] [arquivo]
 
 | Opção | Comandos | Efeito |
 |-------|----------|--------|
-| `-On` / `-O n` | todos os que compilam | nível do otimizador (omissão: 2) |
+| `-On` / `-O n` | todos os que compilam | nível do otimizador 0, 1 ou 2 (omissão: 2; outro valor é erro) |
+| `--color` / `--no-color` | todos | cores ANSI nos diagnósticos; omissão: só se o stderr for um terminal e `NO_COLOR` não estiver definido |
 | `--include FILE` (repetível) | check, run, compile, dump-*, optimize, verify, cfg, stats, profile, digest, bench | compila `FILE` junto com o ficheiro principal (ver abaixo) |
 | `--max-steps N` | run, profile, digest, bench | orçamento de instruções da VM (omissão: 50 000 000) |
 | `--max-depth N` | run, profile, digest, bench | profundidade máxima de chamadas (omissão: 10 000) |
@@ -45,6 +46,10 @@ aether <comando> [opções] [arquivo]
 | `--emit`, `-o` | compile | artefacto e ficheiro de saída |
 | `--n N` | bench (omissão 5), benchmark (omissão 20) | repetições / argumento de `fib` |
 | `--iters`, `--seed`, `--kind` | fuzz | configuração do fuzzer |
+
+Opções mal formadas são erros (`exit 1`): nível `-O` fora de 0..2, valor em
+falta (`--emit`, `-o`, `--n`, `--backend`...), `--max-steps 0`/`--max-depth 0`,
+`--n 0` em `bench`, um segundo ficheiro operando (usar `--include`).
 
 Códigos de saída: `0` ok, `1` erro de compilação, `2` erro de runtime.
 Num erro de runtime a CLI imprime o stdout produzido até ali antes de
@@ -61,8 +66,41 @@ apontam para o ficheiro certo), as importações são seguidas
 transitivamente, cada ficheiro entra uma vez (caminho canónico) e os itens
 de todos são juntos num único programa. `--include` / `AETHER_INCLUDE` são
 `use`s implícitos do ficheiro principal. Nomes repetidos entre ficheiros
-dão o erro habitual `duplicate function`; uma importação que não existe é
-`E0280 unresolved import` (exit 1).
+dão o erro habitual `duplicate function`; uma importação que não existe, que
+é um diretório ou que não é UTF-8 é `E0280 unresolved import` (exit 1).
+
+### Visibilidade (`pub`)
+
+O espaço de nomes é plano, mas um item definido num ficheiro **diferente** do
+que o usa (via `use` ou `--include`) só é acessível se for `pub`; senão
+`E0281` ("`NOME` is private to `FICHEIRO`", com a ajuda "mark it `pub` in
+FICHEIRO"). Os itens do mesmo ficheiro são sempre acessíveis; os itens
+privados do ficheiro principal não são acessíveis a ficheiros incluídos.
+Aplica-se a funções, `extern fn` e `struct` (o tipo, o literal `S { .. }` e as
+anotações de tipo); os campos de uma `pub struct` são públicos e os `enum` não
+têm visibilidade. As importações são transitivas e planas: `a` vê os itens
+`pub` de `b` e de tudo o que `b` importa. Nomes privados iguais em dois
+ficheiros continuam a colidir (`duplicate function`).
+
+### Ficheiros e entradas estranhas
+
+Um ficheiro vazio ou só com comentários dá `E0210` (falta `fn main`); um BOM
+UTF-8 no início é ignorado; `\r\n` é aceite e as linhas dos diagnósticos
+perdem o `\r`; as colunas contam caracteres (não bytes) e a linha de `^` copia
+os tabs, por isso alinha com qualquer largura de tab. Ficheiros acima de
+8 MiB (por ficheiro, incluindo `use` e `--include`), com bytes que não são
+UTF-8 (`file is not valid UTF-8 (first bad byte at offset N)`),
+diretórios e ficheiros em falta dão um erro `cannot read ...` numa linha.
+Identificadores Unicode são `unexpected character` (não um *panic*).
+
+### `fmt`
+
+`fmt` escreve a AST do ficheiro principal (os itens importados não entram; os
+`use` ficam como estavam). Erros léxicos/sintáticos terminam com `exit 1` sem
+saída; erros de tipos não impedem a formatação. Os comentários **não** são
+preservados. `aether fmt F > G; aether run G` dá o mesmo que `run F`, e
+`fmt G` devolve `G` (idempotente): literais `f64` ficam `3.0`, as anotações
+`let x: T` mantêm-se.
 
 ```bash
 aether run game.ae --include stdlib/prelude.ae
@@ -79,8 +117,14 @@ existe para ser incluído desta forma ([`stdlib.md`](stdlib.md)).
 Emite o LLVM IR textual (o mesmo de `dump-llvm`) e executa-o com
 `opt`/`lli` (`lli-18` ou `lli` no `PATH`), imprimindo o stdout do programa.
 Sem `lli` a CLI imprime um erro claro e sai com `1`. Sob `lli` o valor
-devolvido por `main` é o código de saída do processo, por isso um `main`
-que devolve ≠ 0 é reportado como falha (`exit 1`).
+devolvido por `main` é o código de saída do processo (módulo 256): é o
+resultado do programa, não uma falha, e `run` sai com `0` como na VM
+(`--stats` imprime `exit = N`). Um sinal (`abort()` de um `assert` falhado)
+é um erro de runtime (`exit 2`); um estado ≠ 0 acompanhado de mensagens do
+`lli` no stderr (módulo rejeitado) é `exit 1`. `--max-steps`/`--max-depth`
+não se aplicam a este motor. A API é `aether::driver::run_llvm_ir`, que
+devolve stdout, stderr e o estado (`LliStatus::Exited(n)` / `Signaled(sig)`)
+em separado.
 
 ## `bench`
 
@@ -110,13 +154,17 @@ aether>
 ```
 
 - Uma entrada termina numa linha vazia.
-- Entradas que começam por `fn`, `struct` ou `extern` são **definições**:
+- Entradas que começam por `fn`, `struct`, `enum`, `extern`, `pub` ou `use`
+  são **definições** (as que definem `fn main` correm como programa completo):
   ficam guardadas para as entradas seguintes (redefinir um nome substitui a
   versão anterior). Um erro numa definição nova descarta só essa entrada —
   as anteriores mantêm-se.
 - Qualquer outra entrada é um bloco de instruções embrulhado num `main`
   novo e executado contra as definições guardadas; a CLI imprime o stdout e
-  `=> valor`.
+  `=> valor`. Uma expressão sem `;` (`dbl(3)`) mostra o seu valor `i32`, ou é
+  só avaliada pelos efeitos (`print_i32(5)`).
+- Cada definição vive num pseudo-ficheiro próprio (`<repl:nome>`), mas no REPL
+  todos os itens são públicos entre si: `E0281` não se aplica.
 - Uma entrada com `fn main` corre como programa completo (nada é guardado).
 - `:items` lista os nomes guardados, `:reset` esquece-os, `:help` ajuda,
   `:quit` (ou `:exit`) sai. `-On` e `--max-steps`/`--max-depth` aplicam-se

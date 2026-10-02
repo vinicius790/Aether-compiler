@@ -34,7 +34,7 @@ fn path_has(tool: &str) -> bool {
         .unwrap_or(false)
 }
 
-const LIB: &str = "fn twice(x: i32) -> i32 { return x * 2; }\n";
+const LIB: &str = "pub fn twice(x: i32) -> i32 { return x * 2; }\n";
 const MAIN: &str = "fn main() -> i32 { print_i32(twice(21)); return 0; }\n";
 
 #[test]

@@ -6,7 +6,9 @@ use crate::span::Span;
 use crate::ty::{binop_result, parse_named_type, unop_result, Type};
 
 mod scope;
+mod visibility;
 pub use scope::{DefKind, ScopeStack, Symbol};
+use visibility::{VisKind, Visibility};
 
 #[derive(Debug, Clone)]
 pub struct HirProgram {
@@ -177,6 +179,8 @@ pub struct Analyzer<'a> {
     /// Counter for compiler-generated locals (`$tN`), which cannot clash
     /// with source identifiers.
     temp_counter: usize,
+    /// `pub` rules across files (E0281).
+    vis: Visibility,
 }
 
 impl<'a> Analyzer<'a> {
@@ -191,6 +195,20 @@ impl<'a> Analyzer<'a> {
             loop_depth: 0,
             resolving: Vec::new(),
             temp_counter: 0,
+            vis: Visibility::new(program),
+        }
+    }
+
+    /// Display names of the session's files (indexed by `FileId`), used by
+    /// the E0281 message.
+    pub fn with_file_names(mut self, names: Vec<String>) -> Self {
+        self.vis = self.vis.with_file_names(names);
+        self
+    }
+
+    fn check_vis(&mut self, kind: VisKind, name: &str, at: Span) {
+        if let Some(d) = self.vis.check(kind, name, at) {
+            self.diags.push(d);
         }
     }
 
@@ -1394,6 +1412,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn check_struct_lit(&mut self, name: &Ident, fields: &[(Ident, Expr)], span: Span) -> HirExpr {
+        self.check_vis(VisKind::Struct, &name.name, name.span);
         let (sname, decl_fields) = match self.lookup_struct(&name.name) {
             Some(Type::Struct { name, fields }) => (name, fields),
             _ => {
@@ -1589,6 +1608,7 @@ impl<'a> Analyzer<'a> {
         if name == "len" && self.is_builtin("len") {
             return self.check_len_call(args, span);
         }
+        self.check_vis(VisKind::Fn, &name, callee.span);
         let fty = self
             .functions
             .iter()
@@ -1666,6 +1686,7 @@ impl<'a> Analyzer<'a> {
                 if let Some(t) = parse_named_type(n) {
                     t
                 } else if let Some(t) = self.resolve_aggregate(n) {
+                    self.check_vis(VisKind::Struct, n, te.span);
                     t
                 } else if self.resolving.iter().any(|r| r == n) {
                     self.err(
@@ -1774,6 +1795,15 @@ fn stmt_always_returns(stmt: &HirStmt) -> bool {
 
 pub fn analyze(program: &Program) -> (Option<HirProgram>, Diagnostics) {
     Analyzer::new(program).analyze()
+}
+
+/// [`analyze`] with the session's file names, so E0281 can name the file an
+/// item is private to.
+pub fn analyze_with_files(
+    program: &Program,
+    file_names: Vec<String>,
+) -> (Option<HirProgram>, Diagnostics) {
+    Analyzer::new(program).with_file_names(file_names).analyze()
 }
 
 #[cfg(test)]

@@ -1,11 +1,17 @@
 //! Source pretty-printer from the AST.
 
-use crate::ast::{literal_str, pattern_str, variant_str, Block, Expr, ExprKind, Item, Program, Stmt};
+use crate::ast::{
+    literal_str, pattern_str, variant_str, Block, Expr, ExprKind, Item, Literal, Program, Stmt,
+};
 
 pub fn pretty_program(p: &Program) -> String {
     let mut s = String::new();
     for (i, item) in p.items.iter().enumerate() {
-        if i > 0 {
+        // consecutive `use` lines stay together; other items are separated
+        let uses = matches!(item, Item::Use(_))
+            && i > 0
+            && matches!(p.items[i - 1], Item::Use(_));
+        if i > 0 && !uses {
             s.push('\n');
         }
         s.push_str(&pretty_item(item));
@@ -107,6 +113,7 @@ fn pretty_stmt(st: &Stmt, indent: usize) -> String {
         Stmt::Let {
             mutable,
             name,
+            ty,
             init,
             ..
         } => {
@@ -115,6 +122,10 @@ fn pretty_stmt(st: &Stmt, indent: usize) -> String {
                 s.push_str("mut ");
             }
             s.push_str(&name.name);
+            if let Some(t) = ty {
+                s.push_str(": ");
+                s.push_str(&type_str(t));
+            }
             if let Some(e) = init {
                 s.push_str(" = ");
                 s.push_str(&pretty_expr(e));
@@ -190,6 +201,7 @@ fn pretty_stmt(st: &Stmt, indent: usize) -> String {
 
 fn pretty_expr(e: &Expr) -> String {
     match &e.kind {
+        ExprKind::Literal(Literal::Float(v)) => float_src(*v),
         ExprKind::Literal(l) => literal_str(l),
         ExprKind::Ident(n) => n.name.clone(),
         ExprKind::Binary { op, lhs, rhs } => {
@@ -232,7 +244,28 @@ fn pretty_expr(e: &Expr) -> String {
                 format!("{}::{}({})", enum_name.name, variant.name, a.join(", "))
             }
         }
+        // binary, unary and cast already print their own parentheses: a
+        // written group around one must not add a second pair (idempotence)
+        ExprKind::Group(inner)
+            if matches!(
+                inner.kind,
+                ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Cast { .. }
+            ) =>
+        {
+            pretty_expr(inner)
+        }
         ExprKind::Group(inner) => format!("({})", pretty_expr(inner)),
+    }
+}
+
+/// A float literal that lexes back as a float: `3.0`, `1e300`, `0.0025`
+/// (`{:?}` always keeps a `.` or an exponent; `inf` has no spelling, so it
+/// becomes the overflowing literal `1e999`).
+fn float_src(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:?}")
+    } else {
+        "1e999".into()
     }
 }
 

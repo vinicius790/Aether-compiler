@@ -1,6 +1,7 @@
 // File modules: `use` pulls another file's items into this program.
 // Paths are relative to the importing file, so from examples/ the stdlib
-// lives one directory up. Try: aether run examples/modules.ae
+// lives one directory up. Only `pub` items of the imported files are visible
+// here (a private one is error E0281). Try: aether run examples/modules.ae
 
 use "../stdlib/vec2.ae";
 use "../stdlib/rng.ae";

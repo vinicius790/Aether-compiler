@@ -81,8 +81,8 @@ fn chained_imports_with_a_cycle_compile_each_file_once() {
         "a.ae",
         "use \"b\";\nfn main() -> i32 { print_i32(b() + c()); return 0; }\n",
     );
-    write(&dir, "b.ae", "use \"c.ae\";\nfn b() -> i32 { return 20; }\n");
-    write(&dir, "c.ae", "use \"a.ae\";\nfn c() -> i32 { return 22; }\n");
+    write(&dir, "b.ae", "use \"c.ae\";\npub fn b() -> i32 { return 20; }\n");
+    write(&dir, "c.ae", "use \"a.ae\";\npub fn c() -> i32 { return 22; }\n");
     let o = run(&["run", &a]);
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(stdout(&o).trim(), "42");

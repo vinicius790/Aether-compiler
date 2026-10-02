@@ -9,6 +9,13 @@ explicitly unstable.
 ## [0.3.0] — 2026-10-02
 
 ### Added
+- `pub` is enforced across files (`E0281 ... is private to FILE`); stdlib API marked `pub`;
+  `driver::compile_sources_public` for hosts such as the REPL
+- `run --backend llvm` treats `main`'s value as the result (`driver::run_llvm_ir`, `LliStatus`)
+- Colour only on a TTY (honours `NO_COLOR`, `--color` / `--no-color`); strict CLI option parsing;
+  UTF-8 BOM ignored and a clear non-UTF-8 error; diagnostic carets align with tabs and multibyte text
+- fmt fixes: main file only, keeps `let x: T`, prints `3.0` correctly, idempotent, syntax errors fail
+- REPL: `enum`/`pub`/`use` inputs, bare expressions, `main_*` is no longer mistaken for `main`
 - File modules: `use "relative/path.ae";` imports every item of another
   file (path relative to the importing file, `.ae` optional, transitive,
   each file included once, cycles allowed); `--include` / `AETHER_INCLUDE`

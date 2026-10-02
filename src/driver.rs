@@ -7,7 +7,7 @@ use crate::ir::{dump_ir, emit_ir, IrModule};
 use crate::lexer::tokenize;
 use crate::opt::{optimize, OptReport};
 use crate::parser::parse;
-use crate::sema::{analyze, HirProgram};
+use crate::sema::{analyze_with_files, HirProgram};
 use crate::span::{FileId, Session, Span};
 use crate::token::{Token, TokenKind};
 use crate::vm::{Value, Vm, VmError, VmOptions};
@@ -130,7 +130,22 @@ pub fn compile_sources(files: Vec<(String, String)>, opts: &CompileOptions) -> C
             Unit { name, source, dir }
         })
         .collect();
-    compile_units(units, HashSet::new(), opts)
+    compile_units(units, HashSet::new(), opts, false)
+}
+
+/// Like [`compile_sources`], but every item of every file counts as `pub`
+/// (no E0281). For hosts that stitch independent snippets into one program,
+/// such as the REPL, where each definition lives in its own pseudo-file.
+pub fn compile_sources_public(files: Vec<(String, String)>, opts: &CompileOptions) -> Compiled {
+    let units = files
+        .into_iter()
+        .map(|(name, source)| Unit {
+            name,
+            source,
+            dir: None,
+        })
+        .collect();
+    compile_units(units, HashSet::new(), opts, true)
 }
 
 /// One source file waiting to be compiled: display name, text and the
@@ -144,7 +159,12 @@ struct Unit {
 /// Lex and parse every unit, pulling in the files their `use` items name
 /// (depth-first, each file once), then run the rest of the pipeline on
 /// the merged item list.
-fn compile_units(units: Vec<Unit>, mut seen: HashSet<PathBuf>, opts: &CompileOptions) -> Compiled {
+fn compile_units(
+    units: Vec<Unit>,
+    mut seen: HashSet<PathBuf>,
+    opts: &CompileOptions,
+    all_public: bool,
+) -> Compiled {
     let mut queue: VecDeque<Unit> = units.into();
     if queue.is_empty() {
         queue.push_back(Unit {
@@ -212,6 +232,17 @@ fn compile_units(units: Vec<Unit>, mut seen: HashSet<PathBuf>, opts: &CompileOpt
         if program.span.is_dummy() {
             program.span = parsed.span;
         }
+        let mut parsed = parsed;
+        if all_public {
+            for item in &mut parsed.items {
+                match item {
+                    Item::Fn(f) => f.is_pub = true,
+                    Item::Struct(s) => s.is_pub = true,
+                    Item::Extern(e) => e.is_pub = true,
+                    Item::Enum(_) | Item::Use(_) => {}
+                }
+            }
+        }
         program.items.extend(parsed.items);
     }
     tokens.extend(last_eof);
@@ -234,7 +265,8 @@ fn compile_units(units: Vec<Unit>, mut seen: HashSet<PathBuf>, opts: &CompileOpt
     }
 
     let t2 = Instant::now();
-    let (hir, sema_diags) = analyze(&program);
+    let file_names: Vec<String> = session.files().iter().map(|f| f.name.clone()).collect();
+    let (hir, sema_diags) = analyze_with_files(&program, file_names);
     timings.sema_us = t2.elapsed().as_micros();
     diags.extend(sema_diags);
 
@@ -333,6 +365,9 @@ fn load_import(
     path: &str,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<Option<Unit>, String> {
+    if path.trim().is_empty() {
+        return Err("empty import path".to_string());
+    }
     let full = resolve_import_path(from_dir, path);
     let name = full.display().to_string();
     let canonical = std::fs::canonicalize(&full).map_err(|e| format!("cannot read {name}: {e}"))?;
@@ -391,15 +426,36 @@ pub fn compile_files(
             dir: Path::new(path).parent().map(Path::to_path_buf),
         });
     }
-    Ok(compile_units(units, seen, opts))
+    Ok(compile_units(units, seen, opts, false))
 }
 
 fn read_source(path: &str) -> Result<String, String> {
-    let source = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    if source.len() > MAX_FILE_BYTES {
-        return Err(format!(
-            "refusing to compile {path}: file is larger than 8 MiB"
-        ));
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let too_big = || format!("refusing to compile {path}: file is larger than 8 MiB");
+    if let Ok(meta) = file.metadata() {
+        if meta.len() > MAX_FILE_BYTES as u64 {
+            return Err(too_big());
+        }
+    }
+    // never buffer more than the limit, whatever the file claims to be
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(too_big());
+    }
+    let mut source = String::from_utf8(bytes).map_err(|e| {
+        format!(
+            "cannot read {path}: file is not valid UTF-8 (first bad byte at offset {})",
+            e.utf8_error().valid_up_to()
+        )
+    })?;
+    // a UTF-8 byte order mark is not part of the program
+    if source.starts_with('\u{feff}') {
+        source.drain(..'\u{feff}'.len_utf8());
     }
     Ok(source)
 }
@@ -469,6 +525,95 @@ pub fn run_compiled_with(
             steps,
         }),
     }
+}
+
+/// How the `lli` process that ran a program ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LliStatus {
+    /// Exit status of the process. Under `lli` this is the value `main`
+    /// returned, truncated to 8 bits by the operating system.
+    Exited(i32),
+    /// Killed by a signal (`abort()` from a failed `assert`, a division by
+    /// zero or an out-of-bounds index raises SIGABRT = 6).
+    Signaled(i32),
+}
+
+/// What `lli` printed and how it ended.
+#[derive(Debug, Clone)]
+pub struct LliRun {
+    pub stdout: String,
+    pub stderr: String,
+    pub status: LliStatus,
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Feed `input` to `cmd` on stdin (from a thread, so a large module cannot
+/// deadlock against a full output pipe) and collect its output.
+fn pipe_through(
+    mut cmd: std::process::Command,
+    input: &str,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
+    let data = input.as_bytes().to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&data);
+    });
+    let out = child.wait_with_output().map_err(|e| e.to_string());
+    let _ = writer.join();
+    out
+}
+
+/// Run textual LLVM IR through `opt -O2` (when installed) and `lli`.
+///
+/// Unlike [`crate::backend::llvm::run_with_lli`] this keeps the program's
+/// stdout and its exit status apart: under `lli` the value returned by `main`
+/// is the process exit status, so a non-zero status is a result, not a
+/// failure. `Err` means the toolchain itself failed (no `lli`, or `opt`
+/// rejecting the module, with its message).
+pub fn run_llvm_ir(ir: &str) -> Result<LliRun, String> {
+    let tool = |names: &[&str]| names.iter().find_map(|n| find_on_path(n));
+    let lli = tool(&["lli-18", "lli"]).ok_or_else(|| "lli not found on PATH".to_string())?;
+    let processed = match tool(&["opt-18", "opt"]) {
+        Some(opt) => {
+            let mut cmd = std::process::Command::new(opt);
+            cmd.args(["-S", "-O2"]);
+            let out = pipe_through(cmd, ir)?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim_end().to_string());
+            }
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+        None => ir.to_string(),
+    };
+    let out = pipe_through(std::process::Command::new(lli), &processed)?;
+    let status = match out.status.code() {
+        Some(c) => LliStatus::Exited(c),
+        None => {
+            #[cfg(unix)]
+            let sig = std::os::unix::process::ExitStatusExt::signal(&out.status).unwrap_or(0);
+            #[cfg(not(unix))]
+            let sig = 0;
+            LliStatus::Signaled(sig)
+        }
+    };
+    Ok(LliRun {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        status,
+    })
 }
 
 /// Number of IR instructions in the optimized module (0 without IR).
@@ -556,7 +701,7 @@ mod tests {
             ),
             (
                 "lib.ae".to_string(),
-                "fn twice(x: i32) -> i32 { return x * 2; }".to_string(),
+                "pub fn twice(x: i32) -> i32 { return x * 2; }".to_string(),
             ),
         ];
         let mut c = compile_sources(files, &CompileOptions::default());
@@ -598,6 +743,44 @@ mod tests {
         let text = c.diags.render(&c.session, false);
         assert!(text.contains("duplicate function `f`"), "{text}");
         assert!(text.contains("b.ae"), "{text}");
+    }
+
+    #[test]
+    fn private_items_of_another_file_are_e0281_unless_public_mode() {
+        let files = || {
+            vec![
+                (
+                    "main.ae".to_string(),
+                    "fn main() -> i32 { print_i32(twice(21)); return 0; }".to_string(),
+                ),
+                (
+                    "lib.ae".to_string(),
+                    "fn twice(x: i32) -> i32 { return x * 2; }".to_string(),
+                ),
+            ]
+        };
+        let c = compile_sources(files(), &CompileOptions::default());
+        let d = c.diags.iter().find(|d| d.code == Some("E0281")).expect("E0281");
+        assert_eq!(d.message, "`twice` is private to `lib.ae`");
+        assert_eq!(d.help.as_deref(), Some("mark it `pub` in lib.ae"));
+        assert_eq!(d.span.file, FileId(0));
+        let mut c = compile_sources_public(files(), &CompileOptions::default());
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        assert_eq!(run_compiled(&mut c).unwrap().1, "42\n");
+    }
+
+    #[test]
+    fn bom_and_invalid_utf8_are_handled_when_reading() {
+        let dir = scratch("bom");
+        let bom = dir.join("bom.ae");
+        std::fs::write(&bom, b"\xef\xbb\xbffn main() -> i32 { return 0; }").unwrap();
+        let c = compile_file(bom.to_str().unwrap(), &CompileOptions::default()).unwrap();
+        assert!(c.ok(), "{}", c.diags.render(&c.session, false));
+        let bad = dir.join("bad.ae");
+        std::fs::write(&bad, b"ab\xff").unwrap();
+        let e = compile_file(bad.to_str().unwrap(), &CompileOptions::default()).err().unwrap();
+        assert!(e.contains("not valid UTF-8") && e.contains("offset 2"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -680,7 +863,7 @@ mod tests {
     #[test]
     fn use_imports_items_from_another_file() {
         let dir = scratch("use");
-        write(&dir, "lib.ae", "fn twice(x: i32) -> i32 { return x * 2; }");
+        write(&dir, "lib.ae", "pub fn twice(x: i32) -> i32 { return x * 2; }");
         let main = write(
             &dir,
             "main.ae",
@@ -698,9 +881,9 @@ mod tests {
     #[test]
     fn use_dedupes_and_tolerates_cycles() {
         let dir = scratch("cycle");
-        write(&dir, "a.ae", "use \"b.ae\";\nuse \"c.ae\";\nfn a() -> i32 { return 1; }");
-        write(&dir, "b.ae", "use \"c.ae\";\nuse \"a.ae\";\nfn b() -> i32 { return 2; }");
-        write(&dir, "c.ae", "use \"./a.ae\";\nfn c() -> i32 { return 3; }");
+        write(&dir, "a.ae", "use \"b.ae\";\nuse \"c.ae\";\npub fn a() -> i32 { return 1; }");
+        write(&dir, "b.ae", "use \"c.ae\";\nuse \"a.ae\";\npub fn b() -> i32 { return 2; }");
+        write(&dir, "c.ae", "use \"./a.ae\";\npub fn c() -> i32 { return 3; }");
         let main = write(
             &dir,
             "main.ae",
@@ -718,7 +901,7 @@ mod tests {
     #[test]
     fn include_and_use_of_the_same_file_compile_it_once() {
         let dir = scratch("inc");
-        let lib = write(&dir, "lib.ae", "fn one() -> i32 { return 1; }");
+        let lib = write(&dir, "lib.ae", "pub fn one() -> i32 { return 1; }");
         let main = write(&dir, "main.ae", "use \"lib.ae\";\nfn main() -> i32 { return one(); }");
         let c = compile_files(&main, &[lib.clone(), lib], &CompileOptions::default()).unwrap();
         assert!(c.ok(), "{}", c.diags.render(&c.session, false));
@@ -750,8 +933,8 @@ mod tests {
     #[test]
     fn imports_resolve_relative_to_the_importing_file() {
         let dir = scratch("nested");
-        write(&dir, "lib/util.ae", "use \"../lib/deep/inner.ae\";\nfn util() -> i32 { return inner() + 1; }");
-        write(&dir, "lib/deep/inner.ae", "fn inner() -> i32 { return 41; }");
+        write(&dir, "lib/util.ae", "use \"../lib/deep/inner.ae\";\npub fn util() -> i32 { return inner() + 1; }");
+        write(&dir, "lib/deep/inner.ae", "pub fn inner() -> i32 { return 41; }");
         let main = write(
             &dir,
             "app/main.ae",

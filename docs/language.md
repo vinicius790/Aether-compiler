@@ -53,9 +53,7 @@ para o programa. Semântica (0.3):
   importar o mesmo ficheiro duas vezes, por caminhos diferentes, ou em
   ciclo (`a` → `b` → `a`) é inofensivo. `--include` / `AETHER_INCLUDE` são
   `use`s implícitos do ficheiro principal e seguem a mesma regra.
-- **Sem visibilidade.** `pub` é aceite antes de `fn`, `struct` e `extern fn`
-  e registado na AST (`is_pub`), mas **não é verificado**: tudo o que um
-  ficheiro define é visível em quem o importa. `pub use` não existe.
+- **Visibilidade (`pub`).** Um item definido num ficheiro diferente do que o usa (via `use` ou `--include`) só é acessível se for `pub` (`pub fn`, `pub struct`, `pub extern fn`); senão é o erro `E0281` "`NOME` is private to `FICHEIRO`", com `help: mark it `pub` in FICHEIRO`. Os itens do mesmo ficheiro são sempre acessíveis; os itens do ficheiro principal só são acessíveis a ele próprio. `pub struct` expõe o tipo; os campos são sempre públicos. Os `enum` não têm visibilidade (`pub enum` é aceite e ignorado). O espaço de nomes continua plano e as importações transitivas; dois itens privados com o mesmo nome em ficheiros diferentes continuam a dar `duplicate function`. `pub use` não existe.
 - Um ficheiro só com `use` e definições (sem `main`) é uma biblioteca; o
   `main` tem de existir exatamente uma vez no programa inteiro.
 - Importação que não se consegue ler é o erro `E0280 unresolved import`,

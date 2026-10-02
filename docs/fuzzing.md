@@ -58,9 +58,10 @@ caso terminar; o relatório diz "minimized from N to M bytes"). Programas
 multi-ficheiro são escritos num directório temporário e compilados com
 `compile_files`; o relatório mostra todos os ficheiros.
 
-`AETHER_FUZZ_NO_FMT=1` desliga o oráculo de `fmt` (ver "Achados conhecidos").
-`ALLOW_MATCH_EXPR` (`src/fuzz/lang.rs`, `false` por omissão) liga a geração de `match`
-como expressão quando existir.
+`AETHER_FUZZ_NO_FMT=1` desliga o oráculo de `fmt` (útil para isolar uma falha do
+pretty-printer de uma falha do compilador).
+`ALLOW_MATCH_EXPR` (`src/fuzz/lang.rs`, `true`) liga a geração de `match` como
+expressão dentro de outras expressões (`(match (e) & 3 { 0 => a, 1 => b, _ => c })`).
 
 As propriedades de lixo (lexer/parser/pipeline), de formato e de mutação
 compilam também em `-O2`, não só em `-O0`. A entrada de lixo inclui sopa de
@@ -119,16 +120,14 @@ De propósito, para manter os casos termináveis e bem tipados:
 Ampliar o gerador é bem-vindo, desde que as propriedades diferenciais
 continuem válidas.
 
-## Achados conhecidos (campanhas 0.3)
+## Achados das campanhas 0.3 (todos corrigidos)
 
-* **Pretty-printer** (`aether fmt`): `let x: i64 = 1;` perde a anotação de tipo
-  (muda o tipo de literais), um literal `f64` inteiro (`3.0`) sai como `3` (muda o
-  tipo), e cada passagem acrescenta parênteses (`((-13))`, `(((p) as i64))`), logo
-  `fmt(fmt(p)) != fmt(p)`; `pub enum` perde o `pub`. O teste
-  `smoke_fmt_roundtrip` (tests/fuzz_smoke.rs) está `#[ignore]` até isto estar corrigido.
-* `-(-2147483648)` é rejeitado com E0263 (o menos unário funde-se com o literal), mas
-  `let a = -2147483648; -a` é válido: inconsistente com o resto do wrap de `i32`.
-* Literais de array não propagam o tipo esperado do elemento:
-  `let a: [i64; 2] = [1, 2];` dá E0230 (o gerador contorna com `(x as i64)`).
-* Igualdade `==` não existe para arrays (E0300), nem para enum/struct/tupla que os
-  contenham.
+* Pretty-printer (`aether fmt`): perdia a anotação de `let x: i64 = 1;`, escrevia
+  `3.0` como `3`, acrescentava parênteses a cada passagem e perdia o `pub` de
+  `pub enum`. Corrigido; `smoke_fmt_roundtrip` (`tests/fuzz_smoke.rs`) corre o
+  oráculo de `fmt` sobre `lang`, `agg` e `diff` em todos os `cargo test`.
+* `-(-2147483648)` era E0263; agora dá o wrap de `i32` como `let a = -2147483648; -a`.
+* `let a: [i64; 2] = [1, 2];` era E0230; os literais de array recebem o tipo
+  esperado do elemento.
+* `==` em arrays (e em enum/struct/tupla que os contenham) era E0300; agora
+  compara elemento a elemento.

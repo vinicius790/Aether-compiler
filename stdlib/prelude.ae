@@ -22,17 +22,19 @@ pub fn is_even(x: i32) -> bool {
     return x % 2 == 0;
 }
 
-// Greatest common divisor (Euclid); never negative.
+// Greatest common divisor (Euclid); never negative, except when the answer
+// is 2^31 (gcd(i32::MIN, 0), gcd(i32::MIN, i32::MIN)), which wraps to i32::MIN.
 pub fn gcd(a: i32, b: i32) -> i32 {
+    // Euclid on the signed values, the sign dropped at the end: negating an
+    // operand first would turn i32::MIN into itself and give a negative gcd
     let mut x = a;
     let mut y = b;
-    if x < 0 { x = 0 - x; }
-    if y < 0 { y = 0 - y; }
     while y != 0 {
         let t = x % y;
         x = y;
         y = t;
     }
+    if x < 0 { x = 0 - x; }
     return x;
 }
 

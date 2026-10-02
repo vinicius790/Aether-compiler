@@ -57,8 +57,9 @@ Limites de desenho (não são bugs):
 - A IR não é SSA; o emissor LLVM usa um `alloca` por registrador (pronto para
   `mem2reg`). A VM é o backend de execução de referência; o LLVM é verificado
   contra ela por `tests/audit_llvm.rs` (casos de borda, exemplos, stdlib e
-  programas gerados) mas não é um gerador de produção (sem limites de passos
-  nem de profundidade de pilha; `--backend llvm` tem `--timeout`).
+  programas gerados) mas não é um gerador de produção (sem limite de passos:
+  `--backend llvm` tem `--timeout`; a profundidade de chamadas segue o limite
+  por omissão da VM).
 - Não há GC: arrays, structs e strings são valores copy-on-write (`Rc`).
 - Inlining só de funções folha de um bloco.
 - Bytecode e ISA instáveis entre versões.
@@ -91,5 +92,6 @@ de funções mortas.
 
 Feito em 0.3.0: módulos de ficheiro (`use "path";`).
 
-1. Visibilidade (`pub` verificado) e nomes qualificados nos módulos.
+1. Nomes qualificados nos módulos (`a::f`); a visibilidade `pub` já é verificada
+   entre ficheiros desde 0.3.0 (`E0281`).
 2. Relatórios de cobertura LLVM / `cargo-fuzz` sobre a IR (o greybox da VM já existe).

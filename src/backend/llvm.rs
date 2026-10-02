@@ -5,7 +5,9 @@
 //! deliberately avoided so the compiler stays portable. The bytecode VM is
 //! the reference semantics: for every program the frontend accepts, the
 //! emitted module prints the same bytes and fails with the same runtime
-//! errors (see `docs/llvm.md` for the contract and the documented limits).
+//! errors, including the VM's call-depth limit ("call stack overflow"); see
+//! `docs/cli.md` (`run --backend llvm`) for the contract and the documented
+//! limits (no instruction budget: `--timeout` stops runaway loops).
 //!
 //! Aether IR is not SSA: a virtual register may be assigned any number of
 //! times. We therefore emit the classic mem2reg-ready form: every register
@@ -37,8 +39,7 @@
 //!
 //! The runtime (string helpers, Rust-`Display` float formatting, runtime
 //! errors, the natives of `crate::runtime`) is a fixed block of IR appended
-//! to every module ([`RUNTIME_IR`], compiled from the C source in
-//! `docs/llvm.md`). Its helpers are `internal` and named `ae.*`, so they
+//! to every module ([`RUNTIME_IR`], compiled from C with clang). Its helpers are `internal` and named `ae.*`, so they
 //! never clash with user functions; user functions that would clash with a
 //! libc symbol the runtime uses are renamed `<name>.ae`.
 
@@ -160,26 +161,65 @@ pub fn emit_llvm_ir(module: &IrModule) -> String {
             emit_function(&mut body, f, &mut cx);
         }
     }
-    // Entry point: lli / the C runtime call `i32 main()`.
+    // Entry point: lli / the C runtime call `i32 main()`. The program runs
+    // on a thread with a large stack (`MAIN_STACK_BYTES`): the VM keeps its
+    // frames on the heap, so deep recursion with big aggregate locals that
+    // the VM runs must not overflow the 8 MiB main-thread stack here. If
+    // the thread cannot be created, `main` runs on the current stack.
     if let Some(m) = module.functions.iter().find(|f| f.name == "main" && !f.is_extern) {
         let sym = cx.symbol(m);
-        body.push_str("define i32 @main() {\nentry:\n");
+        body.push_str("define internal ptr @ae.main_thread(ptr %arg) {\nentry:\n");
         match &m.return_ty {
             Type::I32 => {
-                let _ = writeln!(body, "  %v = call i32 {sym}()\n  ret i32 %v");
+                let _ = writeln!(
+                    body,
+                    "  %v = call i32 {sym}()\n  %w = sext i32 %v to i64\n  %p = inttoptr i64 %w to ptr\n  ret ptr %p"
+                );
             }
             t if is_agg(t) => {
                 let _ = writeln!(
                     body,
-                    "  %v = alloca {}\n  call void {sym}(ptr %v)\n  ret i32 0",
+                    "  %v = alloca {}\n  call void {sym}(ptr %v)\n  ret ptr null",
                     mem_ty(t)
                 );
             }
             t => {
-                let _ = writeln!(body, "  call {} {sym}()\n  ret i32 0", ret_ty(t));
+                let _ = writeln!(body, "  call {} {sym}()\n  ret ptr null", ret_ty(t));
             }
         }
         body.push_str("}\n\n");
+        let _ = writeln!(
+            body,
+            "define i32 @main() {{
+entry:
+  %attr = alloca [64 x i8], align 16
+  %tid = alloca i64, align 8
+  %res = alloca ptr, align 8
+  %a = call i32 @pthread_attr_init(ptr %attr)
+  %b = call i32 @pthread_attr_setstacksize(ptr %attr, i64 {MAIN_STACK_BYTES})
+  %c = call i32 @pthread_create(ptr %tid, ptr %attr, ptr @ae.main_thread, ptr null)
+  %started = icmp eq i32 %c, 0
+  br i1 %started, label %join, label %direct
+join:
+  %t = load i64, ptr %tid, align 8
+  %j = call i32 @pthread_join(i64 %t, ptr %res)
+  %r = load ptr, ptr %res, align 8
+  %ri = ptrtoint ptr %r to i64
+  %rv = trunc i64 %ri to i32
+  ret i32 %rv
+direct:
+  %d = call ptr @ae.main_thread(ptr null)
+  %di = ptrtoint ptr %d to i64
+  %dv = trunc i64 %di to i32
+  ret i32 %dv
+}}
+
+declare i32 @pthread_attr_init(ptr)
+declare i32 @pthread_attr_setstacksize(ptr, i64)
+declare i32 @pthread_create(ptr, ptr, ptr, ptr)
+declare i32 @pthread_join(i64, ptr)
+"
+        );
     }
     // Equality helpers (generating one may request more).
     let mut done = 0;
@@ -251,6 +291,8 @@ pub fn emit_llvm_ir(module: &IrModule) -> String {
             llvm_string_bytes(s)
         );
     }
+    // Live user frames, the VM's call depth (see `emit_function`).
+    out.push_str("@ae.depth = internal global i32 0\n");
     for decl in [
         "declare i32 @llvm.fptosi.sat.i32.f64(double)",
         "declare i64 @llvm.fptosi.sat.i64.f64(double)",
@@ -268,10 +310,17 @@ pub fn emit_llvm_ir(module: &IrModule) -> String {
     out
 }
 
-/// Symbols the runtime block declares (libc) or defines; `main` included.
+/// Stack of the thread `main` runs on (1 GiB of address space, committed
+/// only as it is touched).
+const MAIN_STACK_BYTES: u64 = 1 << 30;
+
+/// Symbols the runtime block declares (libc) or defines; `main` and the
+/// thread functions the entry point uses included.
 fn runtime_symbols() -> BTreeSet<String> {
     let mut set = BTreeSet::new();
-    set.insert("main".to_string());
+    for s in ["main", "pthread_attr_init", "pthread_attr_setstacksize", "pthread_create", "pthread_join"] {
+        set.insert(s.to_string());
+    }
     for line in RUNTIME_IR.lines() {
         let line = line.trim_start();
         if let Some(rest) = line.strip_prefix('@') {
@@ -846,6 +895,22 @@ fn emit_function(out: &mut String, f: &IrFunction, cx: &mut ModuleCtx<'_>) {
         }
     }
 
+    // The VM's call-depth limit: every user function counts one frame
+    // (`main` included) while it runs, and entering one that would make
+    // more than `max_call_depth` frames is "call stack overflow", exactly
+    // where the VM stops (both run the same optimized IR, so inlined calls
+    // count the same). `emit_return` gives the frame back.
+    let limit = i32::try_from(crate::vm::VmOptions::default().max_call_depth).unwrap_or(i32::MAX);
+    let d = fx.tmp();
+    let d1 = fx.tmp();
+    let ok = fx.tmp();
+    fx.line(&format!("{d} = load i32, ptr @ae.depth"));
+    fx.line(&format!("{d1} = add i32 {d}, 1"));
+    fx.line(&format!("store i32 {d1}, ptr @ae.depth"));
+    fx.line(&format!("{ok} = icmp sle i32 {d1}, {limit}"));
+    let m = fx.cx.message(&crate::vm::VmError::StackOverflow.to_string());
+    fx.guard(&ok, &format!("call void @ae.rt_error(ptr {m})"));
+
     // Parameters are copied into the callee's own registers: aggregates by
     // value, so a callee never mutates its caller's storage.
     for (i, (_, t, r)) in f.params.iter().enumerate() {
@@ -1376,6 +1441,12 @@ fn emit_cast(fx: &mut FnCtx, v: &str, from: &Type, to: &Type) -> String {
 }
 
 fn emit_return(fx: &mut FnCtx, value: Option<Reg>, ret: &Type) {
+    // leave the frame counted by the prologue of `emit_function`
+    let d = fx.tmp();
+    let d1 = fx.tmp();
+    fx.line(&format!("{d} = load i32, ptr @ae.depth"));
+    fx.line(&format!("{d1} = sub i32 {d}, 1"));
+    fx.line(&format!("store i32 {d1}, ptr @ae.depth"));
     if is_unit(ret) {
         fx.line("ret void");
         return;
@@ -1604,8 +1675,7 @@ fn find_tool(name: &str) -> Option<String> {
 // Runtime
 // ---------------------------------------------------------------------------
 
-/// The runtime appended to every module: generated from the C source in
-/// `docs/llvm.md` (clang -O1, attributes and metadata stripped, `ae_` renamed
+/// The runtime appended to every module: generated from C (clang -O1, attributes and metadata stripped, `ae_` renamed
 /// to `ae.`, every definition `internal`). Runtime errors print
 /// `runtime error: <the VM's message>` on stderr after flushing stdout and
 /// `abort()`.

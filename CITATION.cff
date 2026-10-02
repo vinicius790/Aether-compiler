@@ -5,8 +5,8 @@ type: software
 authors:
   - name: Aether Contributors
 license: MIT
-version: 0.2.2
-date-released: "2026-09-19"
+version: 0.3.0
+date-released: "2026-10-02"
 abstract: >
   Aether is a small statically typed imperative language with a complete
   compiler pipeline, a register virtual machine, a textual LLVM backend,

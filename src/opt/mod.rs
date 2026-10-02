@@ -153,6 +153,17 @@ pub fn optimize(module: IrModule, level: u8) -> (IrModule, OptReport) {
             insts_before: before,
             insts_after: count_insts(&module),
         });
+    } else {
+        // -O1 does not compact registers, but like -O0 it must not hand the
+        // assembler a function past the VM's 16-bit register limit (E0300)
+        let regs_before = regalloc::reg_total(&module);
+        if regalloc::pass_regalloc_oversized(&mut module, crate::backend::bytecode::MAX_REGS) {
+            report.passes.push(PassStats {
+                name: format!("regalloc (regs {}→{})", regs_before, regalloc::reg_total(&module)),
+                insts_before: count_insts(&module),
+                insts_after: count_insts(&module),
+            });
+        }
     }
     report.insts_after = count_insts(&module);
     (module, report)

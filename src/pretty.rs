@@ -1,7 +1,7 @@
 //! Source pretty-printer from the AST.
 
 use crate::ast::{
-    literal_str, pattern_str, variant_str, Block, Expr, ExprKind, Item, Literal, MatchArm, Program,
+    literal_str, BinOp, pattern_str, variant_str, Block, Expr, ExprKind, Item, Literal, MatchArm, Program,
     Stmt,
 };
 use crate::comments::Comments;
@@ -223,6 +223,10 @@ impl Printer<'_> {
                 }
             }
             Stmt::LetTuple { init, .. } => self.expr_regions(init, &mut r),
+            Stmt::Match { arms, .. } if is_if_let(arms) => {
+                block(&arms[0].body, &mut r);
+                self.else_regions(&arms[1].body, &mut r);
+            }
             Stmt::Match { scrutinee, span, .. } => self.match_regions(scrutinee, *span, &mut r),
             Stmt::Assign { target, value, .. } => {
                 self.expr_regions(target, &mut r);
@@ -243,7 +247,7 @@ impl Printer<'_> {
                 self.expr_regions(cond, &mut r);
                 block(then_block, &mut r);
                 if let Some(b) = else_block {
-                    block(b, &mut r);
+                    self.else_regions(b, &mut r);
                 }
             }
             Stmt::While { cond, body, .. } => {
@@ -271,12 +275,18 @@ impl Printer<'_> {
         }
         match (&arm.body.stmts.as_slice(), &arm.body.tail) {
             ([], Some(t)) => self.expr_regions(t, &mut r),
-            ([Stmt::Match { scrutinee, span, .. }], None) => {
-                self.match_regions(scrutinee, *span, &mut r)
-            }
             _ => r.push((arm.body.span.start.0, arm.body.span.end.0)),
         }
         r
+    }
+
+    /// The `else` part of an `if` / `if let`: an `else if` continues the
+    /// chain on the same line, so its condition's comments lead the chain.
+    fn else_regions(&self, b: &Block, r: &mut Regions) {
+        match else_if(b) {
+            Some(st) => r.extend(self.stmt_regions(st)),
+            None => r.push((b.span.start.0, b.span.end.0)),
+        }
     }
 
     // ---- printing ------------------------------------------------------
@@ -289,13 +299,13 @@ impl Printer<'_> {
                     .iter()
                     .map(|p| format!("{}: {}", p.name.name, type_str(&p.ty)))
                     .collect();
-                let ret = type_str(&f.return_ty);
+                let ret = ret_str(&f.return_ty);
                 let body = match &f.body {
                     Some(b) => self.block(b, 0),
                     None => ";".into(),
                 };
                 format!(
-                    "{}fn {}({}) -> {ret} {body}",
+                    "{}fn {}({}){ret} {body}",
                     vis(f.is_pub),
                     f.name.name,
                     params.join(", ")
@@ -340,11 +350,11 @@ impl Printer<'_> {
                     .map(|p| format!("{}: {}", p.name.name, type_str(&p.ty)))
                     .collect();
                 format!(
-                    "{}extern fn {}({}) -> {};",
+                    "{}extern fn {}({}){};",
                     vis(e.is_pub),
                     e.name.name,
                     params.join(", "),
-                    type_str(&e.return_ty)
+                    ret_str(&e.return_ty)
                 )
             }
             Item::Use(u) => format!("use {:?};", u.path),
@@ -361,12 +371,21 @@ impl Printer<'_> {
         };
         self.open(&mut s, brace);
         s.push('\n');
-        for st in &b.stmts {
+        for (i, st) in b.stmts.iter().enumerate() {
             let r = self.stmt_regions(st);
             self.lead(&mut s, &inn, st.span(), &r);
             s.push_str(&inn);
             let text = self.stmt(st, indent + 1);
             s.push_str(&text);
+            // a `match` last in a block would re-parse as the block's tail
+            // expression (its value); `;` keeps it a statement
+            if i + 1 == b.stmts.len() && b.tail.is_none() {
+                if let Stmt::Match { arms, .. } = st {
+                    if !is_if_let(arms) {
+                        s.push(';');
+                    }
+                }
+            }
             self.trail(&mut s, st.span().end.0);
             s.push('\n');
         }
@@ -425,13 +444,34 @@ impl Printer<'_> {
                 self.expr(init, indent)
             ),
             Stmt::Match {
+                scrutinee, arms, ..
+            } if is_if_let(arms) => {
+                let mut s = format!(
+                    "if let {} = {} ",
+                    pattern_str(&arms[0].pattern),
+                    self.head(scrutinee, indent)
+                );
+                let text = self.block(&arms[0].body, indent);
+                s.push_str(&text);
+                // without `else` the generated arm's empty body has the
+                // `then` block's span
+                if arms[1].body.span != arms[0].body.span {
+                    let text = self.else_part(&arms[1].body, indent);
+                    s.push_str(&text);
+                }
+                s
+            }
+            Stmt::Match {
                 scrutinee,
                 arms,
                 span,
             } => self.match_(scrutinee, arms, *span, indent),
             Stmt::Assign { target, value, .. } => {
                 let t = self.expr(target, indent);
-                format!("{} = {};", t, self.expr(value, indent))
+                match compound_rhs(target, value) {
+                    Some((op, rhs)) => format!("{t} {op}= {};", self.expr(rhs, indent)),
+                    None => format!("{} = {};", t, self.expr(value, indent)),
+                }
             }
             Stmt::Expr { expr, .. } => format!("{};", self.expr(expr, indent)),
             Stmt::Return { value, .. } => match value {
@@ -444,24 +484,23 @@ impl Printer<'_> {
                 else_block,
                 ..
             } => {
-                let c = self.expr(cond, indent);
+                let c = self.head(cond, indent);
                 let mut s = format!("if {} {}", c, self.block(then_block, indent));
                 if let Some(e) = else_block {
-                    s.push_str(" else ");
-                    let text = self.block(e, indent);
+                    let text = self.else_part(e, indent);
                     s.push_str(&text);
                 }
                 s
             }
             Stmt::While { cond, body, .. } => {
-                let c = self.expr(cond, indent);
+                let c = self.head(cond, indent);
                 format!("while {} {}", c, self.block(body, indent))
             }
             Stmt::For {
                 var, start, end, body, ..
             } => {
-                let a = self.expr(start, indent);
-                let b = self.expr(end, indent);
+                let a = self.head(start, indent);
+                let b = self.head(end, indent);
                 format!("for {} in {}..{} {}", var.name, a, b, self.block(body, indent))
             }
             Stmt::Break { .. } => "break;".into(),
@@ -471,13 +510,23 @@ impl Printer<'_> {
         }
     }
 
+    /// ` else { .. }`, or ` else if ..` for the one-statement block the
+    /// parser wraps an `else if` / `else if let` in (printing it as a
+    /// block would add a nesting level per link of the chain).
+    fn else_part(&mut self, b: &Block, indent: usize) -> String {
+        match else_if(b) {
+            Some(st) => format!(" else {}", self.stmt(st, indent)),
+            None => format!(" else {}", self.block(b, indent)),
+        }
+    }
+
     /// `match` with one arm per line: `Pattern => expr,` when the body is a
     /// bare expression, `Pattern => { ... }` otherwise. `if let`'s generated
     /// catch-all arm is printed like any other (the source form is a `match`).
     fn match_(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span, indent: usize) -> String {
         let pad = "    ".repeat(indent);
         let inn = "    ".repeat(indent + 1);
-        let mut s = format!("match {} {{", self.expr(scrutinee, indent));
+        let mut s = format!("match {} {{", self.head(scrutinee, indent));
         let b = self.lbrace_after(scrutinee.span.end.0);
         self.open(&mut s, b);
         s.push('\n');
@@ -490,17 +539,6 @@ impl Printer<'_> {
             match (&arm.body.stmts.as_slice(), &arm.body.tail) {
                 ([], Some(t)) => {
                     let text = self.expr(t, indent + 1);
-                    s.push_str(&text);
-                    s.push(',');
-                }
-                // `{ match .. }` re-parses as an expression arm (the match becomes
-                // the block's tail), so print it that way to stay a fixpoint
-                ([Stmt::Match {
-                    scrutinee,
-                    arms: inner,
-                    span,
-                }], None) => {
-                    let text = self.match_(scrutinee, inner, *span, indent + 1);
                     s.push_str(&text);
                     s.push(',');
                 }
@@ -520,23 +558,45 @@ impl Printer<'_> {
     }
 
     fn expr(&mut self, e: &Expr, indent: usize) -> String {
-        match &e.kind {
+        self.expr_at(e, indent, 0)
+    }
+
+    /// `e` as an operand that must bind at least as tightly as `min` (a
+    /// level of [`prec`]). Parentheses are printed only where the grammar
+    /// needs them: every pair costs one level of the parser's nesting
+    /// limit (E0101), so a fully parenthesised rendering of a program near
+    /// the limit would no longer compile.
+    fn expr_at(&mut self, e: &Expr, indent: usize, min: u8) -> String {
+        let text = match &e.kind {
             ExprKind::Literal(Literal::Float(v)) => float_src(*v),
             ExprKind::Literal(l) => literal_str(l),
             ExprKind::Ident(n) => n.name.clone(),
             ExprKind::Binary { op, lhs, rhs } => {
-                format!("({} {} {})", self.expr(lhs, indent), op, self.expr(rhs, indent))
+                let p = binop_prec(*op);
+                let l = self.lhs_operand(lhs, indent, p);
+                let r = self.expr_at(rhs, indent, p + 1);
+                format!("{l} {op} {r}")
             }
-            ExprKind::Unary { op, expr } => format!("({}{})", op.as_str(), self.expr(expr, indent)),
+            // `-` `-` stays two tokens (there is no `--` operator), and a
+            // negated literal stays a direct negation (one literal)
+            ExprKind::Unary { op, expr } => {
+                format!("{}{}", op.as_str(), self.expr_at(expr, indent, PREC_UNARY))
+            }
             ExprKind::Call { callee, args } => {
+                let c = self.postfix_base(callee, indent);
                 let a: Vec<String> = args.iter().map(|x| self.expr(x, indent)).collect();
-                format!("{}({})", self.expr(callee, indent), a.join(", "))
+                format!("{c}({})", a.join(", "))
             }
             ExprKind::Index { base, index } => {
-                format!("{}[{}]", self.expr(base, indent), self.expr(index, indent))
+                let b = self.postfix_base(base, indent);
+                format!("{b}[{}]", self.expr(index, indent))
             }
-            ExprKind::Field { base, field } => format!("{}.{}", self.expr(base, indent), field.name),
-            ExprKind::Cast { expr, ty } => format!("({} as {})", self.expr(expr, indent), type_str(ty)),
+            ExprKind::Field { base, field } => {
+                format!("{}.{}", self.postfix_base(base, indent), field.name)
+            }
+            ExprKind::Cast { expr, ty } => {
+                format!("{} as {}", self.lhs_operand(expr, indent, PREC_CAST), type_str(ty))
+            }
             ExprKind::Array { elements } => {
                 let a: Vec<String> = elements.iter().map(|x| self.expr(x, indent)).collect();
                 format!("[{}]", a.join(", "))
@@ -547,7 +607,11 @@ impl Printer<'_> {
                     .iter()
                     .map(|(n, e)| format!("{}: {}", n.name, self.expr(e, indent)))
                     .collect();
-                format!("{} {{ {} }}", name.name, fs.join(", "))
+                if fs.is_empty() {
+                    format!("{} {{}}", name.name)
+                } else {
+                    format!("{} {{ {} }}", name.name, fs.join(", "))
+                }
             }
             ExprKind::Tuple { elements } => {
                 let e: Vec<String> = elements.iter().map(|x| self.expr(x, indent)).collect();
@@ -565,22 +629,161 @@ impl Printer<'_> {
                     format!("{}::{}({})", enum_name.name, variant.name, a.join(", "))
                 }
             }
-            // binary / unary / cast operands print their own parentheses; adding
-            // another pair would grow on every `fmt` round trip
-            ExprKind::Group(inner)
-                if matches!(
-                    inner.kind,
-                    ExprKind::Binary { .. }
-                        | ExprKind::Unary { .. }
-                        | ExprKind::Cast { .. }
-                        | ExprKind::Group(_)
-                ) =>
-            {
-                self.expr(inner, indent)
-            }
-            ExprKind::Group(inner) => format!("({})", self.expr(inner, indent)),
+            // Parentheses around a literal are meaningful (`-(2147483648)`
+            // is not the literal `-2147483648`) and `(match ..)` is an
+            // expression where a bare `match` would be a statement; any
+            // other group is reprinted with exactly the parentheses its
+            // position needs.
+            ExprKind::Group(inner) => match &inner.kind {
+                ExprKind::Literal(_) | ExprKind::Match { .. } => {
+                    format!("({})", self.expr(inner, indent))
+                }
+                _ => return self.expr_at(inner, indent, min),
+            },
             ExprKind::Match { scrutinee, arms } => self.match_(scrutinee, arms, e.span, indent),
+        };
+        if prec(e) < min {
+            format!("({text})")
+        } else {
+            text
         }
+    }
+
+    /// The head of an `if` / `while` / `for` / `match`: parenthesised when a
+    /// struct literal without fields would end it (`if (u == U {}) {`).
+    fn head(&mut self, e: &Expr, indent: usize) -> String {
+        if ends_in_empty_lit(e) {
+            format!("({})", self.expr(e, indent))
+        } else {
+            self.expr(e, indent)
+        }
+    }
+
+    /// The left operand of a binary operator or `as`: a `match` there is
+    /// parenthesised (at the start of a statement it would be a `match`
+    /// statement, ending before the operator).
+    fn lhs_operand(&mut self, e: &Expr, indent: usize, min: u8) -> String {
+        if is_bare(e) {
+            format!("({})", self.expr(e, indent))
+        } else {
+            self.expr_at(e, indent, min)
+        }
+    }
+
+    /// The base of a call, index or field access: `match` takes no
+    /// postfix operator, so it is parenthesised.
+    fn postfix_base(&mut self, e: &Expr, indent: usize) -> String {
+        if is_bare(e) {
+            format!("({})", self.expr(e, indent))
+        } else {
+            self.expr_at(e, indent, PREC_POSTFIX)
+        }
+    }
+}
+
+const PREC_CAST: u8 = 11;
+const PREC_UNARY: u8 = 12;
+const PREC_POSTFIX: u8 = 13;
+
+/// Binary operator precedence, the parser's table (`docs/language.md`).
+fn binop_prec(op: BinOp) -> u8 {
+    match op {
+        BinOp::Or => 1,
+        BinOp::And => 2,
+        BinOp::Eq | BinOp::Ne => 3,
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 4,
+        BinOp::BitOr => 5,
+        BinOp::BitXor => 6,
+        BinOp::BitAnd => 7,
+        BinOp::Shl | BinOp::Shr => 8,
+        BinOp::Add | BinOp::Sub => 9,
+        BinOp::Mul | BinOp::Div | BinOp::Rem => 10,
+    }
+}
+
+/// How tightly the printed form of `e` binds. A literal `i64::MIN` prints
+/// with its `-` and so binds like a prefix operator.
+fn prec(e: &Expr) -> u8 {
+    match &e.kind {
+        ExprKind::Binary { op, .. } => binop_prec(*op),
+        ExprKind::Cast { .. } => PREC_CAST,
+        ExprKind::Unary { .. } => PREC_UNARY,
+        ExprKind::Literal(Literal::Int(v)) if *v < 0 => PREC_UNARY,
+        ExprKind::Group(inner) if !matches!(inner.kind, ExprKind::Literal(_) | ExprKind::Match { .. }) => {
+            prec(inner)
+        }
+        _ => PREC_POSTFIX,
+    }
+}
+
+/// `e` prints as a bare `match`, looking through the groups the printer
+/// drops: the parser takes no postfix or infix operator after a `match`
+/// that starts a statement.
+fn is_bare(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Match { .. } => true,
+        ExprKind::Group(inner) if !matches!(inner.kind, ExprKind::Literal(_) | ExprKind::Match { .. }) => {
+            is_bare(inner)
+        }
+        _ => false,
+    }
+}
+
+/// `e` prints with a struct literal without fields outside any brackets
+/// (the parser reads `U {}` there as `U` and a block when in a head).
+fn ends_in_empty_lit(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::StructLit { fields, .. } => fields.is_empty(),
+        ExprKind::Binary { lhs, rhs, .. } => ends_in_empty_lit(lhs) || ends_in_empty_lit(rhs),
+        ExprKind::Unary { expr, .. } | ExprKind::Cast { expr, .. } => ends_in_empty_lit(expr),
+        ExprKind::Field { base, .. } | ExprKind::Index { base, .. } => ends_in_empty_lit(base),
+        ExprKind::Call { callee, .. } => ends_in_empty_lit(callee),
+        ExprKind::Group(inner) => ends_in_empty_lit(inner),
+        _ => false,
+    }
+}
+
+/// `target = target op rhs` as written by `target op= rhs` (the parser's
+/// desugaring), so `fmt` prints the compound form back: it is shorter and
+/// one nesting level shallower. The two `target`s are compared as printed
+/// (`x = (x) * 2` is `x *= 2` too, or a second `fmt` would change it).
+fn compound_rhs<'e>(target: &Expr, value: &'e Expr) -> Option<(BinOp, &'e Expr)> {
+    let mut v = value;
+    while let ExprKind::Group(inner) = &v.kind {
+        v = inner;
+    }
+    match &v.kind {
+        ExprKind::Binary { op, lhs, rhs }
+            if !op.is_cmp() && !op.is_logical() && plain(lhs) == plain(target) =>
+        {
+            Some((*op, rhs))
+        }
+        _ => None,
+    }
+}
+
+/// `e` printed without comments.
+fn plain(e: &Expr) -> String {
+    Printer {
+        c: None,
+        force_blank: false,
+    }
+    .expr(e, 0)
+}
+
+/// The `match` an `if let` is parsed into: its second arm is the generated
+/// catch-all holding the `else` block.
+fn is_if_let(arms: &[MatchArm]) -> bool {
+    arms.len() == 2 && !arms[0].generated && arms[1].generated
+}
+
+/// The `if` / `if let` of an `else if`: the parser wraps it in a block with
+/// the statement's own span (a written `{ .. }` also spans its braces).
+fn else_if(b: &Block) -> Option<&Stmt> {
+    match (b.stmts.as_slice(), &b.tail) {
+        ([st @ Stmt::If { .. }], None) if st.span() == b.span => Some(st),
+        ([st @ Stmt::Match { arms, .. }], None) if st.span() == b.span && is_if_let(arms) => Some(st),
+        _ => None,
     }
 }
 
@@ -606,6 +809,14 @@ fn float_src(v: f64) -> String {
         }
     } else {
         "1e999".into()
+    }
+}
+
+/// ` -> T`, or nothing for `unit` (`fn main() {`, as usually written).
+fn ret_str(t: &crate::ast::TypeExpr) -> String {
+    match t.kind {
+        crate::ast::TypeExprKind::Unit => String::new(),
+        _ => format!(" -> {}", type_str(t)),
     }
 }
 
@@ -645,8 +856,9 @@ mod tests {
         let (prog, diags) = parse(toks);
         assert!(!diags.has_errors());
         let out = pretty_program(&prog);
-        assert!(out.contains("x = (x << 2);"), "{out}");
-        assert!(out.contains("x = (x ^ (((!x) & 3) | (4 >> 1)));"), "{out}");
+        // the compound form comes back, with only the parentheses needed
+        assert!(out.contains("x <<= 2;"), "{out}");
+        assert!(out.contains("x ^= !x & 3 | 4 >> 1;"), "{out}");
         let dumped = crate::ast::dump_program(&prog);
         assert!(dumped.contains("x = (x << 2);"), "{dumped}");
     }
@@ -680,7 +892,7 @@ mod tests {
         let once = fmt(src);
         let twice = fmt(&once);
         assert_eq!(once, twice, "not idempotent:\n{once}");
-        assert!(once.contains("(E::A(1), x) => (x + a),"), "{once}");
+        assert!(once.contains("(E::A(1), x) => x + a,"), "{once}");
         assert!(once.contains("let (a, (b, _)) = (1, (2, 3));"), "{once}");
     }
 }

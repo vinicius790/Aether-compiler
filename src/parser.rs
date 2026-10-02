@@ -14,6 +14,12 @@ use crate::token::{Token, TokenKind};
 /// bound a few hundred thousand `(` would overflow the host stack.
 pub const MAX_NESTING: usize = 256;
 
+/// Most operators (`+`, `as`, ...) in one left-associative chain such as
+/// `a + b + c + ...`. The parser reads a chain in a loop, but the tree it
+/// builds is as deep as the chain is long and every later pass (and `Drop`)
+/// recurses down it: 100000 terms overflowed even the CLI's 64 MiB stack.
+pub const MAX_CHAIN: usize = 10_000;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -23,6 +29,11 @@ pub struct Parser {
     /// The last syntax error, so unwinding out of nested constructs at the
     /// end of the file reports "expected `}`, found end of file" once.
     last_error: Option<(String, Span)>,
+    /// Parsing the head of `if` / `while` / `for` / `match`, outside any
+    /// `( [ {`: there `U {}` is `U` followed by a block, not a literal.
+    in_head: bool,
+    /// `in_head` outside each open delimiter.
+    head_stack: Vec<bool>,
 }
 
 impl Parser {
@@ -34,6 +45,8 @@ impl Parser {
             depth: 0,
             depth_reported: false,
             last_error: None,
+            in_head: false,
+            head_stack: Vec::new(),
         }
     }
 
@@ -549,22 +562,19 @@ impl Parser {
 
     fn parse_match_inner(&mut self) -> Option<Expr> {
         let start = self.expect(TokenKind::Match)?.span;
-        let scrutinee = self.parse_expr()?;
+        let scrutinee = self.parse_head()?;
         self.expect(TokenKind::LBrace)?;
         let mut arms = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_eof() {
-            let pattern = self.parse_pattern()?;
-            self.expect(TokenKind::FatArrow)?;
-            let (body, braced) = self.parse_arm_body()?;
-            let span = pattern.span.merge(body.span);
-            arms.push(MatchArm {
-                pattern,
-                body,
-                span,
-                generated: false,
-            });
-            if !self.eat(TokenKind::Comma) && !braced && !self.check(TokenKind::RBrace) {
-                self.expect(TokenKind::Comma)?;
+            match self.parse_arm() {
+                Some(arm) => arms.push(arm),
+                None => {
+                    // Skip the rest of the arms so the match's own `}` does
+                    // not close the enclosing block (a stray `}` later
+                    // would be reported as "expected item").
+                    self.skip_past_close_brace();
+                    return None;
+                }
             }
         }
         let end = self.expect(TokenKind::RBrace)?.span;
@@ -575,6 +585,58 @@ impl Parser {
             },
             span: start.merge(end),
         })
+    }
+
+    /// `Pattern => body` and the `,` after it (optional after a block and
+    /// before the closing `}`).
+    fn parse_arm(&mut self) -> Option<MatchArm> {
+        let pattern = self.parse_pattern()?;
+        let help = match self.peek_kind() {
+            TokenKind::Pipe => Some("or-patterns are not supported: write one arm per pattern"),
+            TokenKind::If => Some("match guards are not supported: test the condition inside the arm"),
+            _ => None,
+        };
+        if let Some(help) = help {
+            let tok = self.peek().clone();
+            self.error_at(format!("expected `=>`, found {}", found(&tok)), tok.span, Some(help));
+            return None;
+        }
+        self.expect(TokenKind::FatArrow)?;
+        let (body, braced) = self.parse_arm_body()?;
+        let span = pattern.span.merge(body.span);
+        if !braced && (self.check(TokenKind::Eq) || compound_assign_op(self.peek_kind()).is_some()) {
+            // `P => x += 1,`: an assignment is a statement, not an arm body
+            let tok = self.peek().clone();
+            self.error_at(
+                format!("expected `,`, found {}", found(&tok)),
+                tok.span,
+                Some("an assignment is a statement: put it in a block arm, `P => { x = v; }`"),
+            );
+            return None;
+        }
+        if !self.eat(TokenKind::Comma) && !braced && !self.check(TokenKind::RBrace) {
+            self.expect(TokenKind::Comma)?;
+        }
+        Some(MatchArm {
+            pattern,
+            body,
+            span,
+            generated: false,
+        })
+    }
+
+    /// Error recovery inside `{ ... }` whose `{` is already consumed: skip
+    /// to the matching `}` (balancing nested braces) and consume it.
+    fn skip_past_close_brace(&mut self) {
+        let mut depth = 0usize;
+        while !self.is_eof() {
+            match self.bump().kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace if depth == 0 => return,
+                TokenKind::RBrace => depth -= 1,
+                _ => {}
+            }
+        }
     }
 
     /// The body of a match arm and whether it was a `{ ... }` block (whose
@@ -773,7 +835,7 @@ impl Parser {
         if self.check(TokenKind::Let) {
             return self.parse_if_let(start);
         }
-        let cond = self.parse_expr()?;
+        let cond = self.parse_head()?;
         let then_block = self.parse_block()?;
         let else_block = self.parse_else()?;
         let end = else_block
@@ -811,7 +873,7 @@ impl Parser {
         self.expect(TokenKind::Let)?;
         let pattern = self.parse_pattern()?;
         self.expect(TokenKind::Eq)?;
-        let scrutinee = self.parse_expr()?;
+        let scrutinee = self.parse_head()?;
         let then_block = self.parse_block()?;
         let else_block = self.parse_else()?;
         let end = else_block
@@ -849,7 +911,7 @@ impl Parser {
 
     fn parse_while(&mut self) -> Option<Stmt> {
         let start = self.expect(TokenKind::While)?.span;
-        let cond = self.parse_expr()?;
+        let cond = self.parse_head()?;
         let body = self.parse_block()?;
         let span = start.merge(body.span);
         Some(Stmt::While { cond, body, span })
@@ -859,9 +921,9 @@ impl Parser {
         let start = self.expect(TokenKind::For)?.span;
         let var = self.parse_ident()?;
         self.expect(TokenKind::In)?;
-        let start_e = self.parse_expr()?;
+        let start_e = self.parse_head()?;
         self.expect(TokenKind::DotDot)?;
-        let end_e = self.parse_expr()?;
+        let end_e = self.parse_head()?;
         let body = self.parse_block()?;
         let span = start.merge(body.span);
         Some(Stmt::For {
@@ -892,27 +954,49 @@ impl Parser {
     }
 
     fn parse_infix(&mut self, mut lhs: Expr, min_prec: u8) -> Option<Expr> {
+        let mut chain = 0usize;
         loop {
             let kind = self.peek_kind();
+            let applies = match infix_info(kind) {
+                Some((prec, ..)) => prec >= min_prec,
+                None => kind == TokenKind::As && min_prec <= PREC_CAST,
+            };
+            if !applies {
+                break;
+            }
+            if chain == MAX_CHAIN {
+                self.chain_too_long();
+                return None;
+            }
+            chain += 1;
             if kind == TokenKind::As {
-                if min_prec > PREC_CAST {
-                    break;
-                }
                 lhs = self.parse_cast(lhs)?;
                 continue;
             }
             if let Some((prec, right_assoc, op)) = infix_info(kind) {
-                if prec < min_prec {
-                    break;
-                }
                 self.bump();
                 let next_min = if right_assoc { prec } else { prec + 1 };
                 lhs = self.parse_binary_rhs(lhs, op, next_min)?;
-                continue;
             }
-            break;
         }
         Some(lhs)
+    }
+
+    /// E0101 for a chain longer than [`MAX_CHAIN`] (once, like the nesting
+    /// limit).
+    fn chain_too_long(&mut self) {
+        if !self.depth_reported {
+            self.depth_reported = true;
+            let span = self.peek_span();
+            self.diags.push(
+                Diagnostic::error(
+                    format!("operator chain too long (limit {MAX_CHAIN} operators)"),
+                    span,
+                )
+                .with_code("E0101")
+                .with_help("split the expression, e.g. into several `let`s"),
+            );
+        }
     }
 
     fn parse_cast(&mut self, lhs: Expr) -> Option<Expr> {
@@ -948,11 +1032,20 @@ impl Parser {
             | TokenKind::True
             | TokenKind::False
             | TokenKind::String
-            | TokenKind::Char => self.parse_literal(),
+            | TokenKind::Char => {
+                // `"abc"[1]`, like any other primary expression
+                let lit = self.parse_literal()?;
+                self.parse_postfix(lit)
+            }
             TokenKind::Ident => self.parse_ident_expr(),
             TokenKind::LParen => self.parse_paren(),
             TokenKind::LBracket => self.parse_array_lit(),
-            TokenKind::Match => self.parse_match_expr(),
+            // `match x { .. }.1` in expression position (a statement
+            // `match` ends at its `}`)
+            TokenKind::Match => {
+                let m = self.parse_match_expr()?;
+                self.parse_postfix(m)
+            }
             TokenKind::Minus => self.parse_unary(UnOp::Neg),
             TokenKind::Bang => self.parse_unary(UnOp::Not),
             _ => self.parse_prefix_error(),
@@ -1024,7 +1117,9 @@ impl Parser {
             // struct literal when the next token after `{` looks like
             // `ident :`.
             if self.looks_like_struct_lit() {
-                return self.finish_struct_lit(id);
+                // `S { a: 1 }.a`, like any other primary expression
+                let lit = self.finish_struct_lit(id)?;
+                return self.parse_postfix(lit);
             }
         }
         let expr = Expr {
@@ -1246,13 +1341,15 @@ impl Parser {
     }
 
     fn looks_like_struct_lit(&self) -> bool {
-        // `{` then `ident` then `:`
+        // `{` then `ident` then `:`, or `{}` (a struct without fields)
+        // except in a head, where `if x == U {}` ends with an empty block
         if self.pos + 2 >= self.tokens.len() {
             return false;
         }
         self.tokens[self.pos].kind == TokenKind::LBrace
-            && self.tokens[self.pos + 1].kind == TokenKind::Ident
-            && self.tokens[self.pos + 2].kind == TokenKind::Colon
+            && ((self.tokens[self.pos + 1].kind == TokenKind::Ident
+                && self.tokens[self.pos + 2].kind == TokenKind::Colon)
+                || (!self.in_head && self.tokens[self.pos + 1].kind == TokenKind::RBrace))
     }
 
     fn finish_struct_lit(&mut self, name: Ident) -> Option<Expr> {
@@ -1463,7 +1560,29 @@ impl Parser {
         if self.pos < self.tokens.len() && self.tokens[self.pos].kind != TokenKind::Eof {
             self.pos += 1;
         }
+        match tok.kind {
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                self.head_stack.push(self.in_head);
+                self.in_head = false;
+            }
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                if let Some(h) = self.head_stack.pop() {
+                    self.in_head = h;
+                }
+            }
+            _ => {}
+        }
         tok
+    }
+
+    /// The expression after `if`, `while`, `match` or in a `for` range.
+    fn parse_head(&mut self) -> Option<Expr> {
+        let (saved, open) = (self.in_head, self.head_stack.len());
+        self.in_head = true;
+        let e = self.parse_expr();
+        self.head_stack.truncate(open);
+        self.in_head = saved;
+        e
     }
 
     fn is_eof(&self) -> bool {

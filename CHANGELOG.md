@@ -6,14 +6,66 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for the **source language and library API**. Bytecode and LLVM text are
 explicitly unstable.
 
+## [Unreleased]
+
+### Changed
+- `aether` with no command prints the usage on stderr and exits 1; `-h` / `--help`
+  after any command prints it on stdout and exits 0
+- `version`, `repl`, `benchmark` and `fuzz` reject a file operand instead of
+  ignoring it; `--include=` with an empty path is a usage error
+- `benchmark` honours `--max-steps` / `--max-depth`; exceeding them is a runtime
+  error (exit 2) instead of exit 1
+- `dump-tokens` reports lexical errors (E00xx, exit 1) after the token dump
+- `run --backend llvm` relays the runtime's own message (`runtime error: array
+  index 5 out of bounds`) instead of a generic "program aborted", and names a
+  native stack overflow (SIGSEGV) as such
+- REPL: `:help` describes the real rules; an unknown `:command` is reported instead
+  of being compiled as code; `let x = 2; x * 3` shows `=> 6`; a failing bare
+  expression reports its real error instead of a bogus "expected `;`" at the
+  synthetic wrapper
+- Diagnostics: control characters in the quoted source line (a stray `\r`, an ESC
+  in a string literal) are shown as U+FFFD instead of being sent to the terminal,
+  and escaped (`\u{1b}`) in messages, notes, help and file names (a stray ESC or
+  NUL is `unexpected character`, whose message quotes it); carets account for
+  wide (CJK, emoji) characters
+- `compile -o PATH` names the path when it cannot be written
+- Fuzz kind `lang` now also generates `match` expressions
+- `docs/diagnostics.md` (every error/warning code with a minimal program, checked
+  by `tests/audit_a3.rs`) and `docs/llvm.md` (the LLVM backend contract and limits)
+- `CITATION.cff`, `SECURITY.md` and the bug template name 0.3.0 (they said 0.2.x);
+  `Cargo.toml` declares the MSRV (`rust-version = "1.75"`)
+
+### Fixed
+- Literals, struct literals and `match` expressions take postfixes
+  (`"ab"[1]`, `S { a: 9 }.a`, `match k { .. }.1`); `struct U {}` can be built
+- Duplicate struct-literal field (E0275), duplicate parameter (E0274), `i64`
+  index (E0246) are compile errors; operator chains over 10 000 are E0101
+- Type checking of long `a + b + ...` chains is linear (was quadratic)
+- `fmt`: minimal parentheses, compound assignment, `else if`/`if let` chains
+  kept, no `-> ()`
+- LLVM backend: same call-depth limit as the VM, 1 GiB main stack, the
+  runtime's own error message relayed
+- `-O1` failed with E0300 on a function past the VM's 65535-register limit
+  (`-O0` and `-O2` already compacted registers)
+- a `match` whose arms are all integer literals did not adopt the other operand's
+  type like a literal (`(match k { 0 => 1, _ => 2 }) < y` with `y: i64` was E0244)
+- `compile_sources` read and compiled a main file twice when a `use` cycle led back
+  to it
+- `stdlib/prelude.ae`: `gcd(i32::MIN, 6)` returned -2 (the operand was negated
+  before Euclid); now 2
+- docs: `docs/cli.md` said enums have no visibility and same-named private items
+  in two files clash; `README.md` / `MANUAL.md` still described the LLVM backend
+  as aliasing aggregates without bounds checks; `docs/fuzzing.md` listed fixed
+  findings as open and `smoke_fmt_roundtrip` was still `#[ignore]`d; `docs/stdlib.md`
+  said a function named like a built-in is an error (it shadows it)
+- `SourceFile::snippet` panicked on a reversed span or one cutting a UTF-8 character
+
 ## [0.3.0] — 2026-10-02
 
 ### Added
 - `tests/audit_llvm.rs`: differential VM vs LLVM (`lli`) test — hand-written edge cases, all examples/stdlib,
   and (ignored, `AETHER_LLVM_DIFF_N`) generated agg/lang programs; 1200 generated programs verified identical
 - LLVM backend closer to the VM; VM/opt runtime fixes (broken pipe exits cleanly, instruction-level register allocation)
-- Uninitialised arrays/structs/tuples zero-filled (`let e: E;` is E0232); `[expr; N]`; `[]`/`[T; 0]`; `i64::MIN` literal;
-  `t.01` rejected; EOF diagnostics; `pub enum` follows E0281; private items are file-scoped
 - Uninitialised arrays/structs/tuples are zero-filled recursively (`let e: E;` is E0232); array repeat `[expr; N]`;
   `[]` / `[T; 0]` wherever the context gives the type; `i64::MIN` literal; `t.01` rejected; EOF diagnostics say
   "found end of file"; `pub enum` follows E0281; private items are file-scoped (same-named private items in

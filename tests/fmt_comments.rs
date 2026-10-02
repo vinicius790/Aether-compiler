@@ -228,7 +228,7 @@ fn comments_stay_where_they_were() {
     // a comment inside an expression goes before its statement
     assert_eq!(
         fmt("fn main() -> i32 { return 1 + /* one */ 2; }"),
-        "fn main() -> i32 {\n    /* one */\n    return (1 + 2);\n}\n"
+        "fn main() -> i32 {\n    /* one */\n    return 1 + 2;\n}\n"
     );
     // between `else` and `{`: before the `if`
     assert_eq!(

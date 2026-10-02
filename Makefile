@@ -23,7 +23,7 @@ verify:
 	cargo run --quiet -- verify examples/opt_demo.ae -O2
 
 release:
-	cargo build --release
+	cargo build --release --offline
 
 # -O0 vs -O2 on every benchmark program (release build for meaningful µs).
 bench:

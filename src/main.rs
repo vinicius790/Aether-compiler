@@ -3,7 +3,7 @@
 use aether::ast::Item;
 use aether::driver::{
     compile_file, compile_files, compile_source, compile_sources_public, default_includes, dump_ast,
-    dump_bc, dump_ir_text, dump_tokens, ir_inst_count, run_compiled, run_compiled_with,
+    dump_bc, dump_ir_text, dump_tokens, ir_inst_count, run_compiled_with,
     CompileOptions, Compiled, LliStatus,
 };
 use aether::span::{FileId, Session};
@@ -76,20 +76,22 @@ COMMANDS:
     profile <file> [-O<n>]        call counts + execution digest
     digest <file> [-O<n>]         deterministic stdout+value fingerprint
     bench <file> [--n <runs>]     -O0 vs -O2: exec time, VM steps, IR size, speedup
-    repl [-O<n>]                  stateful REPL (:items, :reset, :quit)
+    repl [-O<n>]                  stateful REPL (:items, :reset, :help, :quit)
     benchmark [--n <int>]         built-in fib(n) -O0 vs -O2
-    fuzz [--iters N] [--seed N] [--kind all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox|format|agg]
-    help
-    version
+    fuzz [--iters N] [--seed N] [--kind all|lexer|parser|pipeline|gen|diff|agg|lang|mut|struct|aspect|mir|greybox|format]
+    help                          this text (also -h / --help after any command)
+    version                       print the version (also --version, -V)
 
 OPTIONS:
     -O<n>, -O <n>         optimizer level 0..2 (default 2)
-    --include <file>      compile <file> together with the main file; repeatable
+    --include <file>, -I <file>, --include=<file>
+                          compile <file> together with the main file; repeatable
                           (check/run/compile/dump-*/optimize/verify/cfg/stats/
                           profile/digest/bench). AETHER_INCLUDE=a.ae:b.ae adds
                           default includes.
-    --max-steps <n>       VM instruction budget (run/profile/digest/bench; default 50000000)
-    --max-depth <n>       VM call-depth limit (run/profile/digest/bench; default 10000)
+    --max-steps <n>       VM instruction budget (run/profile/digest/bench/benchmark/repl;
+                          default 50000000)
+    --max-depth <n>       VM call-depth limit (same commands; default 10000)
     --backend vm|llvm     `run` on the bytecode VM (default) or through LLVM `lli`
     --timeout <s>         wall-clock limit for `run` in seconds (default: none on the
                           VM, 10 with --backend llvm, where --max-steps cannot apply)
@@ -98,14 +100,14 @@ OPTIONS:
     --timings             per-stage timings on stderr (run)
     --stats               exit value, VM steps and opt report on stderr (run)
     --unopt               dump the IR before optimization (dump-ir)
-    --emit ir|bytecode|llvm, -o <path>
+    --emit ir|bytecode|llvm, -o <path> (or --output <path>)
                           artifact kind and output file (compile)
     --n <int>             runs per level (bench, default 5); fib argument (benchmark, default 20)
     --iters N, --seed N, --kind K
                           fuzz configuration (seed accepts 0x...)
 
 EXIT CODES:
-    0 ok, 1 compile error (or fuzz failure), 2 runtime error
+    0 ok, 1 compile error, bad usage or fuzz failure, 2 runtime error
     (a closed stdout pipe, as in `aether run f.ae | head -1`, ends quietly with 0)
 "
 }
@@ -135,7 +137,8 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut raw: Vec<String> = env::args().skip(1).collect();
     if raw.is_empty() {
-        return Err(usage().into());
+        // no command at all: a usage error (help text on stderr, exit 1)
+        return Err(format!("missing command\n{}", usage()));
     }
     let cmd = raw.remove(0);
     let mut a = Args {
@@ -173,7 +176,8 @@ fn parse_args() -> Result<Args, String> {
         let s = raw[i].clone();
         let s = s.as_str();
         if s == "-h" || s == "--help" {
-            return Err(usage().into());
+            // `aether <cmd> --help` asks for help: the dispatcher prints it
+            a.cmd = "help".into();
         } else if s.starts_with("-O") {
             let v = if s == "-O" {
                 operand!("-O")
@@ -227,6 +231,9 @@ fn parse_args() -> Result<Args, String> {
                 _ => return Err(format!("{s} needs a file operand")),
             }
         } else if let Some(p) = s.strip_prefix("--include=") {
+            if p.is_empty() {
+                return Err("--include needs a file operand".to_string());
+            }
             a.includes.push(p.to_string());
         } else if s == "--max-steps" {
             i += 1;
@@ -261,6 +268,16 @@ fn parse_args() -> Result<Args, String> {
             ));
         }
         i += 1;
+    }
+    if a.cmd != "help" {
+        if let Some(f) = &a.file {
+            if matches!(
+                a.cmd.as_str(),
+                "version" | "--version" | "-V" | "repl" | "benchmark" | "fuzz"
+            ) {
+                return Err(format!("`{}` takes no file operand (found `{f}`)", a.cmd));
+            }
+        }
     }
     a.color = color_mode.unwrap_or_else(auto_color);
     Ok(a)
@@ -310,11 +327,7 @@ fn real_main() -> ExitCode {
             if !e.ends_with('\n') {
                 eprintln!();
             }
-            if e.starts_with("Aether compiler") {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            ExitCode::from(1)
         }
     }
 }
@@ -413,7 +426,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
                 _ => dump_bc(&c),
             };
             if let Some(out) = a.output {
-                std::fs::write(&out, text).map_err(|e| e.to_string())?;
+                std::fs::write(&out, text).map_err(|e| format!("cannot write {out}: {e}"))?;
             } else {
                 outp!("{text}");
             }
@@ -422,6 +435,20 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         "dump-tokens" => {
             let c = compile_input(&a, 0, false)?;
             outp!("{}", dump_tokens(&c));
+            // the tokens are dumped even when the lexer rejected part of the
+            // input, but its errors (E00xx) are reported and fail the command
+            let lexical = |d: &aether::diagnostic::Diagnostic| {
+                d.level == aether::diagnostic::Level::Error
+                    && d.code.map_or(false, |k| k.starts_with("E00"))
+            };
+            if c.diags.iter().any(lexical) {
+                let mut lex = aether::diagnostic::Diagnostics::new();
+                for d in c.diags.iter().filter(|d| lexical(d)) {
+                    lex.push(d.clone());
+                }
+                lex.emit(&c.session, a.color);
+                return Ok(ExitCode::from(1));
+            }
             Ok(ExitCode::SUCCESS)
         }
         "dump-ast" => {
@@ -592,7 +619,7 @@ fn dispatch(a: Args) -> Result<ExitCode, String> {
         }
         "bench" => bench(&a),
         "repl" => repl(&a),
-        "benchmark" => benchmark(a.n.unwrap_or(20)),
+        "benchmark" => benchmark(a.n.unwrap_or(20), &a),
         "fuzz" => run_fuzz_cmd(a.iters, a.seed, &a.kind),
         other => Err(format!("unknown command `{other}`\n{}", usage())),
     }
@@ -711,7 +738,24 @@ fn run_llvm(c: &Compiled, a: &Args) -> Result<ExitCode, String> {
             Ok(ExitCode::from(1))
         }
         LliStatus::Signaled(6) => {
-            eprintln!("runtime error: program aborted (failed assert, division by zero or index out of bounds)");
+            // the runtime prints the VM's message before `abort()`; relay it
+            // (lli's own crash report after it is noise)
+            match run.stderr.lines().find(|l| l.starts_with("runtime error: ")) {
+                Some(line) => eprintln!("{line}"),
+                None => eprintln!(
+                    "runtime error: program aborted (failed assert, division by zero, index out of bounds \
+                     or an `extern fn` without an implementation)"
+                ),
+            }
+            Ok(ExitCode::from(2))
+        }
+        LliStatus::Signaled(11) => {
+            // SIGSEGV: the program ran off the native stack (frames larger
+            // than the 1 GiB main stack allows before the depth limit trips)
+            eprintln!(
+                "runtime error: the program crashed under lli (SIGSEGV; most likely a native \
+                 stack overflow from deep recursion, which the VM reports as `call stack overflow`)"
+            );
             Ok(ExitCode::from(2))
         }
         LliStatus::Signaled(sig) => {
@@ -765,10 +809,16 @@ fn repl(a: &Args) -> Result<ExitCode, String> {
                     }
                 }
                 ":help" => outln!(
-                    "statements run inside a fresh `main`; `fn`/`struct`/`extern fn` inputs are kept.\n\
-                     :items  list kept definitions\n:reset  forget them\n:quit   exit"
+                    "an input ends at a blank line. Inputs starting with fn/struct/enum/extern/pub/use\n\
+                     are definitions and are kept (one defining `fn main` runs as a whole program);\n\
+                     anything else runs inside a fresh `main` (a final expression without `;` shows\n\
+                     its i32 value).\n\
+                     :items  list kept definitions\n:reset  forget them\n:help   this text\n:quit   exit (also :exit, :q)"
                 ),
                 "" => break,
+                cmd if cmd.starts_with(':') => {
+                    eprintln!("unknown REPL command `{cmd}` (try :help)");
+                }
                 _ => buf.push_str(&line),
             }
         }
@@ -873,12 +923,19 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
         let kept = repl_files(items, &[]);
         let src = buf.trim_end();
         if !src.ends_with(';') && !src.ends_with('}') {
-            // a bare expression: show its value if it is an i32, else just
-            // evaluate it for its effects (`print_i32(1)` without `;`)
-            for cand in [
-                format!("fn main() -> i32 {{ return ({src}); }}\n"),
-                format!("fn main() -> i32 {{ {src};\nreturn 0; }}\n"),
-            ] {
+            // a final expression without `;`: show its value if it is an
+            // i32 (`dbl(3)`, `let x = 2; x * 3`), else just evaluate it for
+            // its effects (`print_i32(1)` without `;`)
+            let mut cands = vec![format!("fn main() -> i32 {{ return ({src}); }}\n")];
+            if let Some(cut) = src.rfind(|c| c == ';' || c == '}') {
+                let (head, tail) = src.split_at(cut + 1);
+                if !tail.trim().is_empty() {
+                    cands.push(format!("fn main() -> i32 {{ {head}\nreturn ({}); }}\n", tail.trim()));
+                }
+            }
+            let stmt = format!("fn main() -> i32 {{ {src};\nreturn 0; }}\n");
+            cands.push(stmt.clone());
+            for cand in cands {
                 let mut files = kept.clone();
                 files.push(("<repl>".into(), cand));
                 if !compile_sources_public(files.clone(), &opts).diags.has_errors() {
@@ -886,6 +943,13 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
                     return;
                 }
             }
+            // none compiles: report the errors of the plain statement form
+            // (wrapping it as `{src}\nreturn 0;` would only add a bogus
+            // "expected `;`" at the synthetic `return`)
+            let mut files = kept;
+            files.push(("<repl>".into(), stmt));
+            repl_run(files, &opts, a);
+            return;
         }
         let mut files = kept;
         files.push((
@@ -909,7 +973,7 @@ fn repl_run(files: Vec<(String, String)>, opts: &CompileOptions, a: &Args) {
         }
         Err(e) => {
             outp!("{}", e.stdout);
-                eprintln!("runtime error: {e}");
+            eprintln!("runtime error: {e}");
         }
     }
 }
@@ -999,14 +1063,26 @@ fn bench(a: &Args) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn benchmark(n: i32) -> Result<ExitCode, String> {
+fn benchmark(n: i32, a: &Args) -> Result<ExitCode, String> {
     let src = format!(
         "fn fib(n: i32) -> i32 {{\n    if n < 2 {{ return n; }}\n    return fib(n - 1) + fib(n - 2);\n}}\nfn main() -> i32 {{ return fib({n}); }}\n"
     );
     let mut unopt = compile_source("bench.ae", &src, &copts(0, false));
     let mut optc = compile_source("bench.ae", &src, &copts(2, false));
-    let (v0, _, s0) = run_compiled(&mut unopt).map_err(|e| e.to_string())?;
-    let (v1, _, s1) = run_compiled(&mut optc).map_err(|e| e.to_string())?;
+    // like `run`: --max-steps / --max-depth apply, and exceeding them is a
+    // runtime error (exit 2)
+    let mut results = Vec::with_capacity(2);
+    for (level, c) in [(0, &mut unopt), (2, &mut optc)] {
+        match run_compiled_with(c, vm_opts(a)) {
+            Ok((v, _, s)) => results.push((v, s)),
+            Err(e) => {
+                eprintln!("runtime error at -O{level}: {e} (fib({n}); raise --max-steps / --max-depth)");
+                return Ok(ExitCode::from(2));
+            }
+        }
+    }
+    let (v1, s1) = results.pop().expect("two runs");
+    let (v0, s0) = results.pop().expect("two runs");
     outln!("fib({n})");
     outln!(
         "  result -O0 = {v0}   steps = {s0}   exec_us = {}",
@@ -1034,7 +1110,7 @@ fn parse_u64(s: &str) -> Option<u64> {
 fn run_fuzz_cmd(iters: u32, seed: u64, kind: &str) -> Result<ExitCode, String> {
     use aether::fuzz::{run_fuzz, FuzzConfig, FuzzKind};
     let kind = FuzzKind::parse(kind).ok_or_else(|| {
-        format!("unknown fuzz kind `{kind}` (use all|lexer|parser|pipeline|gen|diff|mut|struct|aspect|mir|greybox|format|agg)")
+        format!("unknown fuzz kind `{kind}` (use all|lexer|parser|pipeline|gen|diff|agg|lang|mut|struct|aspect|mir|greybox|format)")
     })?;
     outln!("aether fuzz  iters={iters} seed={seed:#x} kind={kind:?}");
     let report = run_fuzz(&FuzzConfig { iters, seed, kind });

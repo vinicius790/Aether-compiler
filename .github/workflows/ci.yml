@@ -13,6 +13,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.75.0
       - name: test
         run: cargo test --all
+        env:
+          RUSTFLAGS: -D warnings
       - name: examples
         run: |
           cargo run --quiet -- run examples/hello.ae
@@ -24,6 +26,8 @@ jobs:
           cargo run --quiet -- run stdlib/cmp.ae
           cargo run --quiet -- optimize examples/opt_demo.ae
           cargo run --quiet -- verify examples/fib.ae
+          cargo run --quiet -- fmt examples/hello.ae
+          cargo run --quiet -- fmt examples/modules.ae
       - name: fuzz smoke
         run: |
           cargo run --quiet -- fuzz --iters 40 --kind all --seed 1

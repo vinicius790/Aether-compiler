@@ -144,7 +144,8 @@ impl SourceFile {
         if start >= len {
             return "";
         }
-        &self.source[start..end.min(len)]
+        // a span that is reversed or cuts a character yields "" (no panic)
+        self.source.get(start..end.min(len)).unwrap_or("")
     }
 }
 

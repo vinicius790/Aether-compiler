@@ -106,7 +106,10 @@ Identificadores Unicode são `unexpected character` (não um *panic*).
 `use` ficam como estavam). Erros léxicos/sintáticos terminam com `exit 1` sem
 saída; erros de tipos não impedem a formatação. `aether fmt F > G; aether run G`
 dá o mesmo que `run F`, e `fmt G` devolve `G` (idempotente): literais `f64`
-ficam `3.0`, as anotações `let x: T` mantêm-se.
+ficam `3.0`, as anotações `let x: T` mantêm-se. Só saem os parênteses que a
+gramática exige (e os de `(U {})` em cabeças de `if`/`while`/`match`/`for`),
+`x op= e` mantém-se composto, cadeias `else if` e `if let` saem como foram
+escritas e um retorno `unit` não ganha `-> ()`.
 
 Os comentários (`// ...` e `/* ... */`, também os de várias linhas) são todos
 preservados, uma vez cada, com o texto inalterado (só muda o fim de linha: o

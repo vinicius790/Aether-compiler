@@ -202,6 +202,10 @@ pub struct Analyzer<'a> {
     temp_counter: usize,
     /// `pub` rules across files (E0281).
     vis: Visibility,
+    /// [`is_int_literal_expr`] of each binary operand already asked about,
+    /// by address in `program` (asking afresh at every operator of a long
+    /// `a + b + c + ...` chain was quadratic).
+    int_literal_memo: std::collections::HashMap<*const Expr, bool>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -217,6 +221,7 @@ impl<'a> Analyzer<'a> {
             resolving: Vec::new(),
             temp_counter: 0,
             vis: Visibility::new(program),
+            int_literal_memo: std::collections::HashMap::new(),
         }
     }
 
@@ -541,6 +546,15 @@ impl<'a> Analyzer<'a> {
     }
 
     fn check_fn(&mut self, f: &FnDecl, is_extern: bool, internal: String) -> Option<HirFn> {
+        for (i, p) in f.params.iter().enumerate() {
+            if f.params[..i].iter().any(|q| q.name.name == p.name.name) {
+                self.err(
+                    format!("`{}` is bound more than once in the parameter list", p.name.name),
+                    p.name.span,
+                    "E0274",
+                );
+            }
+        }
         let params: Vec<(String, Type)> = f
             .params
             .iter()
@@ -708,8 +722,10 @@ impl<'a> Analyzer<'a> {
         match &pat.kind {
             PatternKind::Wildcard => {}
             PatternKind::Binding(id) => {
-                self.note_binding(id, bound);
-                self.define_local(id, ty.clone(), mutable);
+                // a repeated name is E0274, not also a shadowing warning
+                if self.note_binding(id, bound) {
+                    self.define_local(id, ty.clone(), mutable);
+                }
                 out.push(HirStmt::Let {
                     name: id.name.clone(),
                     ty: ty.clone(),
@@ -753,15 +769,18 @@ impl<'a> Analyzer<'a> {
     }
 
     /// One name bound twice in the same pattern is an error (E0274).
-    fn note_binding(&mut self, id: &Ident, bound: &mut Vec<String>) {
+    /// Returns whether `id` is new to the pattern.
+    fn note_binding(&mut self, id: &Ident, bound: &mut Vec<String>) -> bool {
         if bound.contains(&id.name) {
             self.err(
                 format!("`{}` is bound more than once in the same pattern", id.name),
                 id.span,
                 "E0274",
             );
+            false
         } else {
             bound.push(id.name.clone());
+            true
         }
     }
 
@@ -974,8 +993,10 @@ impl<'a> Analyzer<'a> {
         match &pat.kind {
             PatternKind::Wildcard => HirPattern::Wildcard,
             PatternKind::Binding(id) => {
-                self.note_binding(id, bound);
-                self.define_local(id, sty.clone(), false);
+                // a repeated name is E0274, not also a shadowing warning
+                if self.note_binding(id, bound) {
+                    self.define_local(id, sty.clone(), false);
+                }
                 HirPattern::Binding {
                     name: id.name.clone(),
                     ty: sty.clone(),
@@ -1122,224 +1143,19 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// A thin dispatcher (like `check_expr`): each large statement kind is
+    /// its own function, so one level of statement nesting (an `if` in an
+    /// `else` block, ...) costs a small frame and a nesting-limit-deep
+    /// program checks on a default 2 MiB thread even in a debug build.
     fn check_stmt(&mut self, stmt: &Stmt) -> HirStmt {
         match stmt {
-            Stmt::Let {
-                mutable,
-                name,
-                ty,
-                init,
-                span,
-            } => {
-                let hint = ty.as_ref().map(|t| self.resolve_type(t));
-                let init_e = init.as_ref().map(|e| self.check_expr(e, hint.as_ref()));
-                let inferred = init_e
-                    .as_ref()
-                    .map(|e| e.ty.clone())
-                    .or_else(|| hint.clone());
-                let final_ty = match (hint, inferred) {
-                    (Some(t), Some(i)) => {
-                        if !t.assignable_from(&i) {
-                            self.err(
-                                format!("cannot assign `{i}` to variable of type `{t}`"),
-                                *span,
-                                "E0230",
-                            );
-                            Type::Error
-                        } else {
-                            t
-                        }
-                    }
-                    (Some(t), None) => t,
-                    (None, Some(i)) => i,
-                    (None, None) => {
-                        self.err(
-                            format!("variable `{}` needs a type annotation or initializer", name.name),
-                            name.span,
-                            "E0231",
-                        );
-                        Type::Error
-                    }
-                };
-                if init.is_none() {
-                    // no initializer: zero-filled, which an enum cannot be
-                    let t = &final_ty;
-                    if let Some(e) = t.enum_without_default() {
-                        let msg = if t == e {
-                            format!("enum variable `{}` needs an initializer", name.name)
-                        } else {
-                            format!(
-                                "variable `{}` needs an initializer: its type `{t}` contains the enum `{e}`",
-                                name.name
-                            )
-                        };
-                        self.diags.push(
-                            Diagnostic::error(msg, name.span)
-                                .with_code("E0232")
-                                .with_help("enums have no default value; write `let x: E = E::Variant;`"),
-                        );
-                    }
-                }
-                if self.scopes.define(
-                    name.name.clone(),
-                    Symbol {
-                        name: name.name.clone(),
-                        ty: final_ty.clone(),
-                        mutable: *mutable,
-                        kind: DefKind::Local,
-                        span: name.span,
-                    },
-                ) == false
-                {
-                    self.diags.push(
-                        Diagnostic::warning(
-                            format!("shadows existing binding `{}`", name.name),
-                            name.span,
-                        )
-                        .with_code("W0232"),
-                    );
-                }
-                HirStmt::Let {
-                    name: name.name.clone(),
-                    ty: final_ty,
-                    mutable: *mutable,
-                    init: init_e,
-                    span: *span,
-                }
-            }
-            Stmt::Assign {
-                target,
-                value,
-                span,
-            } => {
-                let t = self.check_expr(target, None);
-                self.check_lvalue(&t);
-                let v = self.check_expr(value, Some(&t.ty));
-                if !t.ty.assignable_from(&v.ty) {
-                    self.err(
-                        format!("cannot assign `{}` to `{}`", v.ty, t.ty),
-                        *span,
-                        "E0233",
-                    );
-                }
-                HirStmt::Assign {
-                    target: t,
-                    value: v,
-                    span: *span,
-                }
-            }
+            Stmt::Let { .. } => self.check_let_stmt(stmt),
+            Stmt::Assign { .. } => self.check_assign_stmt(stmt),
             Stmt::Expr { expr, .. } => HirStmt::Expr(self.check_expr(expr, None)),
-            Stmt::Return { value, span } => {
-                let expected = self.current_return.clone();
-                let v = value.as_ref().map(|e| self.check_expr(e, Some(&expected)));
-                match (&v, &self.current_return) {
-                    (None, Type::Unit) => {}
-                    (None, t) => {
-                        self.err(
-                            format!("missing return value (expected `{t}`)"),
-                            *span,
-                            "E0234",
-                        );
-                    }
-                    (Some(e), t) => {
-                        if !t.assignable_from(&e.ty) {
-                            self.err(
-                                format!("returning `{}` from function of type `{t}`", e.ty),
-                                *span,
-                                "E0235",
-                            );
-                        }
-                    }
-                }
-                HirStmt::Return { value: v, span: *span }
-            }
-            Stmt::If {
-                cond,
-                then_block,
-                else_block,
-                span,
-            } => {
-                let c = self.check_expr(cond, Some(&Type::Bool));
-                if c.ty != Type::Bool && !c.ty.is_error() {
-                    self.err(
-                        format!("condition has type `{}`, expected `bool`", c.ty),
-                        cond.span,
-                        "E0236",
-                    );
-                }
-                let then_b = self.check_block(then_block);
-                let else_b = else_block.as_ref().map(|b| self.check_block(b));
-                HirStmt::If {
-                    cond: c,
-                    then_block: then_b,
-                    else_block: else_b,
-                    span: *span,
-                }
-            }
-            Stmt::While { cond, body, span } => {
-                let c = self.check_expr(cond, Some(&Type::Bool));
-                if c.ty != Type::Bool && !c.ty.is_error() {
-                    self.err(
-                        format!("while-condition has type `{}`, expected `bool`", c.ty),
-                        cond.span,
-                        "E0237",
-                    );
-                }
-                self.loop_depth += 1;
-                let body = self.check_block(body);
-                self.loop_depth -= 1;
-                HirStmt::While {
-                    cond: c,
-                    body,
-                    span: *span,
-                }
-            }
-            Stmt::For {
-                var,
-                start,
-                end,
-                body,
-                span,
-            } => {
-                let s = self.check_expr(start, Some(&Type::I32));
-                let e = self.check_expr(end, Some(&Type::I32));
-                if s.ty != Type::I32 && !s.ty.is_error() {
-                    self.err(
-                        format!("for-range start must be `i32`, found `{}`", s.ty),
-                        start.span,
-                        "E0238",
-                    );
-                }
-                if e.ty != Type::I32 && !e.ty.is_error() {
-                    self.err(
-                        format!("for-range end must be `i32`, found `{}`", e.ty),
-                        end.span,
-                        "E0238",
-                    );
-                }
-                self.scopes.push();
-                self.scopes.define(
-                    var.name.clone(),
-                    Symbol {
-                        name: var.name.clone(),
-                        ty: Type::I32,
-                        mutable: true,
-                        kind: DefKind::Local,
-                        span: var.span,
-                    },
-                );
-                self.loop_depth += 1;
-                let body = self.check_block(body);
-                self.loop_depth -= 1;
-                self.scopes.pop();
-                HirStmt::For {
-                    var: var.name.clone(),
-                    start: s,
-                    end: e,
-                    body,
-                    span: *span,
-                }
-            }
+            Stmt::Return { .. } => self.check_return_stmt(stmt),
+            Stmt::If { .. } => self.check_if_stmt(stmt),
+            Stmt::While { .. } => self.check_while_stmt(stmt),
+            Stmt::For { .. } => self.check_for_stmt(stmt),
             Stmt::Break { span } => {
                 if self.loop_depth == 0 {
                     self.err("`break` outside of a loop", *span, "E0239");
@@ -1375,6 +1191,251 @@ impl<'a> Analyzer<'a> {
                     span: *span,
                 })
             }
+        }
+    }
+
+    #[inline(never)]
+    fn check_let_stmt(&mut self, stmt: &Stmt) -> HirStmt {
+        let Stmt::Let {
+            mutable,
+            name,
+            ty,
+            init,
+            span,
+        } = stmt else {
+            unreachable!()
+        };
+        let hint = ty.as_ref().map(|t| self.resolve_type(t));
+        let init_e = init.as_ref().map(|e| self.check_expr(e, hint.as_ref()));
+        let inferred = init_e
+            .as_ref()
+            .map(|e| e.ty.clone())
+            .or_else(|| hint.clone());
+        let final_ty = match (hint, inferred) {
+            (Some(t), Some(i)) => {
+                if !t.assignable_from(&i) {
+                    self.err(
+                        format!("cannot assign `{i}` to variable of type `{t}`"),
+                        *span,
+                        "E0230",
+                    );
+                    Type::Error
+                } else {
+                    t
+                }
+            }
+            (Some(t), None) => t,
+            (None, Some(i)) => i,
+            (None, None) => {
+                self.err(
+                    format!("variable `{}` needs a type annotation or initializer", name.name),
+                    name.span,
+                    "E0231",
+                );
+                Type::Error
+            }
+        };
+        if init.is_none() {
+            // no initializer: zero-filled, which an enum cannot be
+            let t = &final_ty;
+            if let Some(e) = t.enum_without_default() {
+                let msg = if t == e {
+                    format!("enum variable `{}` needs an initializer", name.name)
+                } else {
+                    format!(
+                        "variable `{}` needs an initializer: its type `{t}` contains the enum `{e}`",
+                        name.name
+                    )
+                };
+                self.diags.push(
+                    Diagnostic::error(msg, name.span)
+                        .with_code("E0232")
+                        .with_help("enums have no default value; write `let x: E = E::Variant;`"),
+                );
+            }
+        }
+        if self.scopes.define(
+            name.name.clone(),
+            Symbol {
+                name: name.name.clone(),
+                ty: final_ty.clone(),
+                mutable: *mutable,
+                kind: DefKind::Local,
+                span: name.span,
+            },
+        ) == false
+        {
+            self.diags.push(
+                Diagnostic::warning(
+                    format!("shadows existing binding `{}`", name.name),
+                    name.span,
+                )
+                .with_code("W0232"),
+            );
+        }
+        HirStmt::Let {
+            name: name.name.clone(),
+            ty: final_ty,
+            mutable: *mutable,
+            init: init_e,
+            span: *span,
+        }
+    }
+
+    #[inline(never)]
+    fn check_assign_stmt(&mut self, stmt: &Stmt) -> HirStmt {
+        let Stmt::Assign {
+            target,
+            value,
+            span,
+        } = stmt else {
+            unreachable!()
+        };
+        let t = self.check_expr(target, None);
+        self.check_lvalue(&t);
+        let v = self.check_expr(value, Some(&t.ty));
+        if !t.ty.assignable_from(&v.ty) {
+            self.err(
+                format!("cannot assign `{}` to `{}`", v.ty, t.ty),
+                *span,
+                "E0233",
+            );
+        }
+        HirStmt::Assign {
+            target: t,
+            value: v,
+            span: *span,
+        }
+    }
+
+    #[inline(never)]
+    fn check_return_stmt(&mut self, stmt: &Stmt) -> HirStmt {
+        let Stmt::Return { value, span } = stmt else {
+            unreachable!()
+        };
+        let expected = self.current_return.clone();
+        let v = value.as_ref().map(|e| self.check_expr(e, Some(&expected)));
+        match (&v, &self.current_return) {
+            (None, Type::Unit) => {}
+            (None, t) => {
+                self.err(
+                    format!("missing return value (expected `{t}`)"),
+                    *span,
+                    "E0234",
+                );
+            }
+            (Some(e), t) => {
+                if !t.assignable_from(&e.ty) {
+                    self.err(
+                        format!("returning `{}` from function of type `{t}`", e.ty),
+                        *span,
+                        "E0235",
+                    );
+                }
+            }
+        }
+        HirStmt::Return { value: v, span: *span }
+    }
+
+    #[inline(never)]
+    fn check_if_stmt(&mut self, stmt: &Stmt) -> HirStmt {
+        let Stmt::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } = stmt else {
+            unreachable!()
+        };
+        let c = self.check_expr(cond, Some(&Type::Bool));
+        if c.ty != Type::Bool && !c.ty.is_error() {
+            self.err(
+                format!("condition has type `{}`, expected `bool`", c.ty),
+                cond.span,
+                "E0236",
+            );
+        }
+        let then_b = self.check_block(then_block);
+        let else_b = else_block.as_ref().map(|b| self.check_block(b));
+        HirStmt::If {
+            cond: c,
+            then_block: then_b,
+            else_block: else_b,
+            span: *span,
+        }
+    }
+
+    #[inline(never)]
+    fn check_while_stmt(&mut self, stmt: &Stmt) -> HirStmt {
+        let Stmt::While { cond, body, span } = stmt else {
+            unreachable!()
+        };
+        let c = self.check_expr(cond, Some(&Type::Bool));
+        if c.ty != Type::Bool && !c.ty.is_error() {
+            self.err(
+                format!("while-condition has type `{}`, expected `bool`", c.ty),
+                cond.span,
+                "E0237",
+            );
+        }
+        self.loop_depth += 1;
+        let body = self.check_block(body);
+        self.loop_depth -= 1;
+        HirStmt::While {
+            cond: c,
+            body,
+            span: *span,
+        }
+    }
+
+    #[inline(never)]
+    fn check_for_stmt(&mut self, stmt: &Stmt) -> HirStmt {
+        let Stmt::For {
+            var,
+            start,
+            end,
+            body,
+            span,
+        } = stmt else {
+            unreachable!()
+        };
+        let s = self.check_expr(start, Some(&Type::I32));
+        let e = self.check_expr(end, Some(&Type::I32));
+        if s.ty != Type::I32 && !s.ty.is_error() {
+            self.err(
+                format!("for-range start must be `i32`, found `{}`", s.ty),
+                start.span,
+                "E0238",
+            );
+        }
+        if e.ty != Type::I32 && !e.ty.is_error() {
+            self.err(
+                format!("for-range end must be `i32`, found `{}`", e.ty),
+                end.span,
+                "E0238",
+            );
+        }
+        self.scopes.push();
+        self.scopes.define(
+            var.name.clone(),
+            Symbol {
+                name: var.name.clone(),
+                ty: Type::I32,
+                mutable: true,
+                kind: DefKind::Local,
+                span: var.span,
+            },
+        );
+        self.loop_depth += 1;
+        let body = self.check_block(body);
+        self.loop_depth -= 1;
+        self.scopes.pop();
+        HirStmt::For {
+            var: var.name.clone(),
+            start: s,
+            end: e,
+            body,
+            span: *span,
         }
     }
 
@@ -1515,11 +1576,22 @@ impl<'a> Analyzer<'a> {
                     "E0264",
                 );
             } else {
-                self.err(
+                let mut d = Diagnostic::error(
                     format!("cannot find value `{0}` in this scope", id.name),
                     id.span,
-                    "E0243",
-                );
+                )
+                .with_code("E0243");
+                let fieldless = self.program.items.iter().any(|it| {
+                    matches!(it, Item::Struct(st) if st.name.name == id.name && st.fields.is_empty())
+                });
+                if fieldless {
+                    // `if u == U {} { .. }`: `U` then an empty block
+                    d = d.with_help(format!(
+                        "in the head of `if` / `while` / `match` / `for`, write the literal in parentheses: `({} {{}})`",
+                        id.name
+                    ));
+                }
+                self.diags.push(d);
             }
             Type::Error
         };
@@ -1541,7 +1613,7 @@ impl<'a> Analyzer<'a> {
         // Arithmetic inherits the expected numeric type; a bare integer
         // literal on either side adopts the type of the other operand.
         let hint = expected.filter(|t| t.is_numeric() && !op.is_cmp() && !op.is_logical());
-        let (l, r) = if is_untyped_int_operand(lhs) && !is_untyped_int_operand(rhs) {
+        let (l, r) = if self.int_literal_operand(lhs) && !self.int_literal_operand(rhs) {
             let r = self.check_expr(rhs, hint);
             let l = self.check_expr(lhs, Some(&r.ty));
             (l, r)
@@ -1570,6 +1642,28 @@ impl<'a> Analyzer<'a> {
             ty,
             span,
         }
+    }
+
+    /// Whether an operand is an untyped integer (a literal, or arithmetic /
+    /// a `match` whose arms are all bare integer literals), memoised for
+    /// the operands of `check_binary`.
+    fn int_literal_operand(&mut self, e: &Expr) -> bool {
+        let key = e as *const Expr;
+        if let Some(&known) = self.int_literal_memo.get(&key) {
+            return known;
+        }
+        let v = match &e.kind {
+            ExprKind::Literal(Literal::Int(_)) => true,
+            ExprKind::Group(inner) => self.int_literal_operand(inner),
+            ExprKind::Unary { expr, .. } => self.int_literal_operand(expr),
+            ExprKind::Binary { op, lhs, rhs } if !op.is_cmp() && !op.is_logical() => {
+                self.int_literal_operand(lhs) && self.int_literal_operand(rhs)
+            }
+            ExprKind::Match { arms, .. } => !arms.is_empty() && arms.iter().all(is_simple_literal_arm),
+            _ => false,
+        };
+        self.int_literal_memo.insert(key, v);
+        v
     }
 
     fn check_unary(&mut self, op: UnOp, inner: &Expr, expected: Option<&Type>, span: Span) -> HirExpr {
@@ -1619,8 +1713,14 @@ impl<'a> Analyzer<'a> {
     fn check_index(&mut self, base: &Expr, index: &Expr, span: Span) -> HirExpr {
         let b = self.check_expr(base, None);
         let i = self.check_expr(index, Some(&Type::I32));
-        if !i.ty.is_integer() && !i.ty.is_error() {
-            self.err("array index must be an integer", index.span, "E0246");
+        // every backend indexes with an `i32` (like `len`); an `i64` index
+        // used to pass here and fail at runtime
+        if i.ty != Type::I32 && !i.ty.is_error() {
+            self.err(
+                format!("index must be `i32`, found `{}`", i.ty),
+                index.span,
+                "E0246",
+            );
         }
         let ty = match &b.ty {
             Type::Array { elem, .. } => *elem.clone(),
@@ -1754,7 +1854,19 @@ impl<'a> Analyzer<'a> {
             }
         };
         let mut out_fields = Vec::new();
-        for (fname, fexpr) in fields {
+        for (i, (fname, fexpr)) in fields.iter().enumerate() {
+            if fields[..i].iter().any(|(prev, _)| prev.name == fname.name) {
+                self.err(
+                    format!(
+                        "field `{}` is specified more than once in `{}` literal",
+                        fname.name,
+                        source_name(&sname)
+                    ),
+                    fname.span,
+                    "E0275",
+                );
+                continue;
+            }
             match decl_fields.iter().find(|(n, _)| n == &fname.name) {
                 Some((_, fty)) => {
                     let e = self.check_expr(fexpr, Some(fty));
@@ -2067,20 +2179,6 @@ fn is_int_literal_expr(e: &Expr) -> bool {
             is_int_literal_expr(lhs) && is_int_literal_expr(rhs)
         }
         _ => false,
-    }
-}
-
-/// [`is_int_literal_expr`], but a `match` whose arms are all bare integer
-/// literals (`match k { 0 => 1, _ => 2 }`) also counts: as a binary operand
-/// it adopts the other operand's type like a literal would.
-fn is_untyped_int_operand(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Match { arms, .. } => !arms.is_empty() && arms.iter().all(is_simple_literal_arm),
-        ExprKind::Group(inner) | ExprKind::Unary { expr: inner, .. } => is_untyped_int_operand(inner),
-        ExprKind::Binary { op, lhs, rhs } if !op.is_cmp() && !op.is_logical() => {
-            is_untyped_int_operand(lhs) && is_untyped_int_operand(rhs)
-        }
-        _ => is_int_literal_expr(e),
     }
 }
 

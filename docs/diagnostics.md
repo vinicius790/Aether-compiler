@@ -40,7 +40,7 @@ sintaxe passarem.
 | Código | Mensagem | Exemplo |
 |--------|----------|---------|
 | `E0100` | expected expression, found `;` | `fn main() -> i32 { return 1 +; }` |
-| `E0101` | nesting too deep (limit 256) | `return` com 300 parênteses aninhados |
+| `E0101` | nesting too deep (limit 256) | `return` com 300 parênteses aninhados (também: cadeia de mais de 10 000 operadores binários) |
 
 ## Semântica (`E02xx`)
 
@@ -73,7 +73,7 @@ sintaxe passarem.
 | `E0243` | cannot find value `y` in this scope | `fn main() -> i32 { return y; }` |
 | `E0244` | operator `+` is not defined for `i32` and `bool` | `fn main() -> i32 { return 1 + true; }` |
 | `E0245` | unary `-` is not defined for `bool` | `fn main() -> i32 { let b = -true; return 0; }` |
-| `E0246` | array index must be an integer | `fn main() -> i32 { let a = [1]; return a[true]; }` |
+| `E0246` | index must be `i32`, found `bool` | `fn main() -> i32 { let a = [1]; return a[true]; }` |
 | `E0247` | cannot index into `i32` | `fn main() -> i32 { let a = 1; return a[0]; }` |
 | `E0248` | no field `y` on type `S` | `struct S { x: i32 } fn main() -> i32 { let s = S { x: 1 }; return s.y; }` |
 | `E0249` | array element has type `bool`, expected `i32` | `fn main() -> i32 { let a = [1, true]; return 0; }` |
@@ -100,6 +100,7 @@ sintaxe passarem.
 | `E0271` | duplicate match arm: an earlier arm has the same pattern | `enum E { A, B } fn main() -> i32 { match E::A { E::A => {} E::A => {} _ => {} } return 0; }` |
 | `E0273` | match arms have incompatible types: expected `bool`, found `i32` | `fn main() -> i32 { let x = match 1 { 1 => 2, _ => true }; return 0; }` |
 | `E0274` | `a` is bound more than once in the same pattern | `fn main() -> i32 { match (1, 2) { (a, a) => {} } return 0; }` |
+| `E0275` | field `a` is specified more than once in `S` literal | `struct S { a: i32 } fn main() -> i32 { let s = S { a: 1, a: 2 }; return 0; }` |
 
 `E0259` (`` `x` is not a function ``) existe no código mas não é alcançável:
 chamar um nome que não é uma função (uma variável, por exemplo) dá `E0260`.

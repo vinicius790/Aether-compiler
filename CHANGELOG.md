@@ -36,6 +36,15 @@ explicitly unstable.
   `Cargo.toml` declares the MSRV (`rust-version = "1.75"`)
 
 ### Fixed
+- Literals, struct literals and `match` expressions take postfixes
+  (`"ab"[1]`, `S { a: 9 }.a`, `match k { .. }.1`); `struct U {}` can be built
+- Duplicate struct-literal field (E0275), duplicate parameter (E0274), `i64`
+  index (E0246) are compile errors; operator chains over 10 000 are E0101
+- Type checking of long `a + b + ...` chains is linear (was quadratic)
+- `fmt`: minimal parentheses, compound assignment, `else if`/`if let` chains
+  kept, no `-> ()`
+- LLVM backend: same call-depth limit as the VM, 1 GiB main stack, the
+  runtime's own error message relayed
 - `-O1` failed with E0300 on a function past the VM's 65535-register limit
   (`-O0` and `-O2` already compacted registers)
 - a `match` whose arms are all integer literals did not adopt the other operand's

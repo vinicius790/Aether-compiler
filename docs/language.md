@@ -203,7 +203,9 @@ Funções não são valores: usar o nome de uma função fora de uma chamada é
 erro (E0264).
 
 Expressões e blocos aninhados mais fundo que 256 níveis são diagnosticados
-pelo parser (E0101).
+pelo parser (E0101), assim como uma cadeia de mais de 10000 operadores
+binários / `as` ao mesmo nível (`a + b + c + ...`: a árvore é tão funda
+quanto a cadeia é longa).
 
 ## Declarações
 
@@ -233,7 +235,8 @@ fn nome(p1: T1, p2: T2) -> R { ... }
 extern fn nome(p1: T1) -> R;
 ```
 
-Argumentos são passados por valor. Structs e arrays têm semântica de valor:
+Os nomes dos parâmetros são distintos (repetir um é E0274). Argumentos
+são passados por valor. Structs e arrays têm semântica de valor:
 `let b = a;` copia, e na VM a cópia é profunda (arrays aninhados e structs
 dentro de structs também). Toda função com tipo de retorno ≠ `unit` deve
 retornar em todos os caminhos.
@@ -252,7 +255,10 @@ Chamar uma `extern fn` que a VM não implementa é erro de runtime.
   em `i32` (os limites têm de ser `i32`, E0238), ambos avaliados **uma só
   vez** antes do laço (reatribuir a variável usada como limite dentro do
   corpo não muda o número de iterações); a variável de iteração é
-  `mut i32` e só existe no corpo do laço
+  `mut i32` e só existe no corpo do laço. O laço é `i = início; while i <
+  fim { corpo; i += 1 }`: atribuir à própria variável no corpo afecta as
+  iterações seguintes (`for i in 0..5 { print_i32(i); i += 2; }` imprime
+  `0` e `3`)
 - `break` / `continue` apenas dentro de laço
 - `return [expr];`
 - `yield;` — suspende uma execução com orçamento (`Vm::run_budget`); sob
@@ -269,7 +275,13 @@ p.x
 
 Campos são públicos. Literal deve nomear todos os campos, em qualquer
 ordem: os inicializadores são avaliados na ordem do fonte e guardados na
-posição declarada.
+posição declarada. Cada campo é nomeado exactamente uma vez (em falta é
+E0253, repetido E0275). Um literal aceita acesso a campo como qualquer
+outra expressão primária (`S { a: 1 }.a`). Uma struct sem campos
+(`struct U {}`) tem o literal `U {}`; na cabeça de `if` / `while` /
+`match` / de um intervalo `for`, fora de parênteses, `U {}` lê-se como o nome
+`U` seguido de um bloco vazio (como em Rust), por isso escreve-se
+`if (u == U {}) { .. }`.
 
 ## Arrays
 
@@ -278,7 +290,8 @@ let a: [i32; 4] = [1, 2, 3, 4];
 a[i]
 ```
 
-Índice fora do intervalo é erro de runtime. `len(a)` devolve o número de
+O índice é `i32` (outro tipo, `i64` incluído, é E0246; converta com
+`as i32`). Índice fora do intervalo é erro de runtime. `len(a)` devolve o número de
 elementos (`N`) como `i32`. `N` é um literal inteiro ≥ 0 (no máximo
 `2147483647`, E0262; a VM limita ainda os arrays a 2^28 elementos).
 
@@ -389,7 +402,8 @@ trabalho interno) é E0270 "too large".
 ### `match` como expressão
 
 `match` pode ser usado onde se espera um valor: `let a = match e { ... };`,
-`return match ...;`, argumento, operando, condição, limite de `for`. O valor
+`return match ...;`, argumento, operando (também de `.campo`, `[i]`:
+`match t { .. }.0`), condição, limite de `for`. O valor
 de um braço de bloco é a sua expressão final sem `;`. Todos os braços têm o
 mesmo tipo (E0273); um braço que não termina (`return` / `break` /
 `continue` em todos os caminhos) tem tipo *never* e não conta. Um literal
@@ -412,7 +426,7 @@ dígitos hexadecimais de um valor escalar Unicode; `\u{41}` é `'A'`). Um
 escapes valem em literais `'c'`; `''` é E0003. Um BOM UTF-8 no início do
 ficheiro é ignorado. Concatenação `+`.
 `len(s)` devolve `i32` e conta valores escalares Unicode (chars), como a
-indexação, não bytes. Indexação devolve `char`.
+indexação, não bytes. Indexação (índice `i32`) devolve `char`.
 
 ## Built-ins
 

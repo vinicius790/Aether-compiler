@@ -350,8 +350,22 @@ impl<'src> Lexer<'src> {
         } else if !self.is_eof() && self.peek_char() != '\'' {
             self.bump();
         }
+        let line_rest = self.src[self.pos..].split('\n').next().unwrap_or("");
         if self.peek_char() == '\'' {
             self.bump();
+        } else if let Some(n) = line_rest.find('\'') {
+            // `'ab'`: one literal with too many characters, not an
+            // unterminated `'a` followed by an unterminated `'; ...`
+            let end = self.pos + n + 1;
+            while self.pos < end {
+                self.bump();
+            }
+            let span = self.span_from(start, line, column);
+            self.diags.push(
+                Diagnostic::error("character literal may only contain one character", span)
+                    .with_code("E0003")
+                    .with_help("use a string literal `\"...\"` for text"),
+            );
         } else {
             let span = self.span_from(start, line, column);
             self.diags.push(

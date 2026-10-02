@@ -1,4 +1,4 @@
-# Manual do repositório Aether 0.2.2
+# Manual do repositório Aether 0.3.0
 
 Este ficheiro explica **o que existe no ZIP**, **para que serve cada peça** e
 **como usar, testar, estender e não partir** o compilador. Não substitui as
@@ -49,7 +49,7 @@ fonte .ae
 A VM é o backend em que se confia. O LLVM emitido é texto; não há JIT
 ligado, não há ABI estável, não há `llc` no caminho crítico.
 
-Versão do software e da linguagem neste ZIP: **0.2.2** (ver `CHANGELOG.md`).
+Versão do software e da linguagem neste ZIP: **0.3.0** (ver `CHANGELOG.md`).
 Licença: MIT (`LICENSE`, `NOTICE`).
 
 ---
@@ -69,7 +69,7 @@ cd aether
 |---------|--------|
 | `README.md` | Porta de entrada (inglês) |
 | `MANUAL.md` | Este manual |
-| `Cargo.toml` / `Cargo.lock` | Pacote Rust `aether` 0.2.2, binário + lib |
+| `Cargo.toml` / `Cargo.lock` | Pacote Rust `aether` 0.3.0, binário + lib |
 | `rust-toolchain.toml` | MSRV 1.75.0 + rustfmt/clippy |
 | `rustfmt.toml` / `clippy.toml` / `.editorconfig` | Estilo |
 | `Makefile` | Atalhos `test`, `examples`, `fuzz`, `verify`, `release` |

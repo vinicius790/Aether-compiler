@@ -1,6 +1,6 @@
 //! Source pretty-printer from the AST.
 
-use crate::ast::{Block, Expr, ExprKind, Item, Program, Stmt};
+use crate::ast::{literal_str, pattern_str, variant_str, Block, Expr, ExprKind, Item, Program, Stmt};
 
 pub fn pretty_program(p: &Program) -> String {
     let mut s = String::new();
@@ -47,6 +47,14 @@ fn pretty_item(item: &Item) -> String {
                 st.name.name,
                 fields.join("\n")
             )
+        }
+        Item::Enum(en) => {
+            let variants: Vec<String> = en
+                .variants
+                .iter()
+                .map(|v| format!("    {},", variant_str(v)))
+                .collect();
+            format!("enum {} {{\n{}\n}}", en.name.name, variants.join("\n"))
         }
         Item::Extern(e) => {
             let params: Vec<String> = e
@@ -114,6 +122,32 @@ fn pretty_stmt(st: &Stmt, indent: usize) -> String {
             s.push(';');
             s
         }
+        Stmt::LetTuple {
+            mutable, names, init, ..
+        } => {
+            let names: Vec<_> = names.iter().map(|n| n.name.clone()).collect();
+            format!(
+                "let {}({}) = {};",
+                if *mutable { "mut " } else { "" },
+                names.join(", "),
+                pretty_expr(init)
+            )
+        }
+        Stmt::Match { scrutinee, arms, .. } => {
+            let pad = "    ".repeat(indent);
+            let inn = "    ".repeat(indent + 1);
+            let mut s = format!("match {} {{\n", pretty_expr(scrutinee));
+            for arm in arms {
+                s.push_str(&inn);
+                s.push_str(&pattern_str(&arm.pattern));
+                s.push_str(" => ");
+                s.push_str(&pretty_block(&arm.body, indent + 1));
+                s.push('\n');
+            }
+            s.push_str(&pad);
+            s.push('}');
+            s
+        }
         Stmt::Assign { target, value, .. } => {
             format!("{} = {};", pretty_expr(target), pretty_expr(value))
         }
@@ -156,14 +190,7 @@ fn pretty_stmt(st: &Stmt, indent: usize) -> String {
 
 fn pretty_expr(e: &Expr) -> String {
     match &e.kind {
-        ExprKind::Literal(l) => match l {
-            crate::ast::Literal::Int(n) => n.to_string(),
-            crate::ast::Literal::Float(n) => format!("{n}"),
-            crate::ast::Literal::Bool(b) => b.to_string(),
-            crate::ast::Literal::String(s) => format!("{s:?}"),
-            crate::ast::Literal::Char(c) => format!("{c:?}"),
-            crate::ast::Literal::Unit => "()".into(),
-        },
+        ExprKind::Literal(l) => literal_str(l),
         ExprKind::Ident(n) => n.name.clone(),
         ExprKind::Binary { op, lhs, rhs } => {
             format!("({} {} {})", pretty_expr(lhs), op, pretty_expr(rhs))
@@ -189,6 +216,22 @@ fn pretty_expr(e: &Expr) -> String {
                 .collect();
             format!("{} {{ {} }}", name.name, fs.join(", "))
         }
+        ExprKind::Tuple { elements } => {
+            let e: Vec<String> = elements.iter().map(pretty_expr).collect();
+            format!("({})", e.join(", "))
+        }
+        ExprKind::EnumLit {
+            enum_name,
+            variant,
+            args,
+        } => {
+            if args.is_empty() {
+                format!("{}::{}", enum_name.name, variant.name)
+            } else {
+                let a: Vec<String> = args.iter().map(pretty_expr).collect();
+                format!("{}::{}({})", enum_name.name, variant.name, a.join(", "))
+            }
+        }
         ExprKind::Group(inner) => format!("({})", pretty_expr(inner)),
     }
 }
@@ -198,6 +241,10 @@ fn type_str(t: &crate::ast::TypeExpr) -> String {
         crate::ast::TypeExprKind::Named(n) => n.clone(),
         crate::ast::TypeExprKind::Unit => "()".into(),
         crate::ast::TypeExprKind::Array { elem, len } => format!("[{}; {len}]", type_str(elem)),
+        crate::ast::TypeExprKind::Tuple(elems) => {
+            let e: Vec<String> = elems.iter().map(type_str).collect();
+            format!("({})", e.join(", "))
+        }
     }
 }
 

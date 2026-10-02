@@ -18,6 +18,18 @@ explicitly unstable.
 - stdlib: `stdlib/vec2.ae` (`Vec2`, `vec2_*`) and `stdlib/rng.ae`
   (`rng_next`, `rng_range`, xorshift32) as importable files;
   `examples/modules.ae`; `tests/modules.rs`
+- Enums with positional payloads: `enum Shape { Circle(f64), Rect(i32, i32), Empty }`,
+  construction `Shape::Circle(1.5)` / `Shape::Empty`, `Type::Enum`; laid out as
+  an object with the tag at field 0 and payload slots after it
+- `match` statement with variant, literal (`i32`/`i64`/`bool`/`char`/`string`),
+  binding and `_` patterns; exhaustiveness (E0270) and duplicate-arm (E0271)
+  checks; arms may `return` / `break` / `continue`; `if let Pat = e { } else { }`
+- Tuples `(T1, T2, ...)`: `(a, b)`, `t.0`, assignable fields,
+  `let (a, b) = t;`, `Type::Tuple`
+- Elementwise `==` / `!=` on tuples, enums and structs (lowered to a
+  short-circuit chain in the IR; struct `==` previously failed with E0300 on the VM)
+- Tokens `enum`, `match`, `::`, `=>`; new error codes E0204–E0206, E0265–E0271
+- `examples/shapes.ae` (+ goldens), `tests/enums_tuples.rs`
 
 ## [0.2.2] — 2026-10-02
 

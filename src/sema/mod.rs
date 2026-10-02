@@ -14,6 +14,7 @@ pub struct HirProgram {
     pub structs: Vec<HirStruct>,
 }
 
+/// A named aggregate type: `ty` is `Type::Struct` or `Type::Enum`.
 #[derive(Debug, Clone)]
 pub struct HirStruct {
     pub name: String,
@@ -75,10 +76,37 @@ pub enum HirStmt {
         body: HirBlock,
         span: Span,
     },
+    /// Exhaustive by construction (sema checks it); arms are tried in order.
+    Match {
+        scrutinee: HirExpr,
+        arms: Vec<HirArm>,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
     Yield(Span),
     Block(HirBlock),
+}
+
+#[derive(Debug, Clone)]
+pub struct HirArm {
+    pub pattern: HirPattern,
+    pub body: HirBlock,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum HirPattern {
+    Wildcard,
+    /// Binds the whole scrutinee.
+    Binding { name: String, ty: Type },
+    /// Compared with `==` at the scrutinee's type.
+    Literal { lit: Literal, ty: Type },
+    /// `fields[i]` binds payload slot `i + 1`, or is `None` for `_`.
+    Variant {
+        tag: usize,
+        fields: Vec<Option<(String, Type)>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +149,15 @@ pub enum HirExprKind {
         name: String,
         fields: Vec<(String, HirExpr)>,
     },
+    /// Laid out like a struct with fields `0`, `1`, ...
+    Tuple {
+        elements: Vec<HirExpr>,
+    },
+    /// Field 0 is the tag, fields `1..=args.len()` the payload.
+    EnumLit {
+        tag: usize,
+        args: Vec<HirExpr>,
+    },
     Cast {
         expr: Box<HirExpr>,
         to: Type,
@@ -135,6 +172,11 @@ pub struct Analyzer<'a> {
     functions: Vec<(String, Type, Span, bool)>, // name, fn type, span, is_extern
     current_return: Type,
     loop_depth: usize,
+    /// Aggregates being resolved on demand (cycle detection).
+    resolving: Vec<String>,
+    /// Counter for compiler-generated locals (`$tN`), which cannot clash
+    /// with source identifiers.
+    temp_counter: usize,
 }
 
 impl<'a> Analyzer<'a> {
@@ -147,6 +189,8 @@ impl<'a> Analyzer<'a> {
             functions: Vec::new(),
             current_return: Type::Unit,
             loop_depth: 0,
+            resolving: Vec::new(),
+            temp_counter: 0,
         }
     }
 
@@ -177,7 +221,7 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 // imports are resolved by the driver before sema
-                Item::Struct(_) | Item::Use(_) => {}
+                Item::Struct(_) | Item::Use(_) | Item::Enum(_) => {}
             }
         }
         self.check_entry_point(&functions);
@@ -195,49 +239,33 @@ impl<'a> Analyzer<'a> {
     }
 
     fn collect_items(&mut self) {
-        // structs first so function signatures can refer to them
-        for item in &self.program.items {
-            if let Item::Struct(s) = item {
-                if self.structs.iter().any(|h| h.name == s.name.name) {
-                    self.err(
-                        format!("duplicate struct `{}`", s.name.name),
-                        s.name.span,
-                        "E0201",
-                    );
-                    continue;
-                }
-                let mut fields = Vec::new();
-                for f in &s.fields {
-                    if fields.iter().any(|(n, _)| n == &f.name.name) {
-                        self.err(
-                            format!("duplicate field `{}`", f.name.name),
-                            f.name.span,
-                            "E0202",
-                        );
-                        continue;
-                    }
-                    let ty = self.resolve_type(&f.ty);
-                    fields.push((f.name.name.clone(), ty));
-                }
-                let ty = Type::Struct {
-                    name: s.name.name.clone(),
-                    fields,
-                };
-                self.structs.push(HirStruct {
-                    name: s.name.name.clone(),
-                    ty,
-                    span: s.span,
-                });
+        // structs and enums first so function signatures can refer to them;
+        // they are resolved on demand so fields may name types declared later
+        let program = self.program;
+        let mut seen: Vec<&str> = Vec::new();
+        for item in &program.items {
+            let (name, kind) = match item {
+                Item::Struct(s) => (&s.name, "struct"),
+                Item::Enum(e) => (&e.name, "enum"),
+                _ => continue,
+            };
+            if seen.contains(&name.name.as_str()) {
+                self.err(format!("duplicate {kind} `{}`", name.name), name.span, "E0201");
+            } else {
+                seen.push(name.name.as_str());
             }
         }
+        for name in seen {
+            self.resolve_aggregate(name);
+        }
 
-        for item in &self.program.items {
+        for item in &program.items {
             match item {
                 Item::Fn(f) => self.register_fn(&f.name, &f.params, &f.return_ty, f.span, false),
                 Item::Extern(e) => {
                     self.register_fn(&e.name, &e.params, &e.return_ty, e.span, true)
                 }
-                Item::Struct(_) | Item::Use(_) => {}
+                Item::Struct(_) | Item::Use(_) | Item::Enum(_) => {}
             }
         }
 
@@ -313,6 +341,78 @@ impl<'a> Analyzer<'a> {
         self.register_builtin("floor", fn_ty(vec![F64], F64));
         self.register_builtin("ceil", fn_ty(vec![F64], F64));
         self.register_builtin("pow_i32", fn_ty(vec![I32, I32], I32));
+    }
+
+    /// Resolves the struct or enum `name` (first declaration wins), caching
+    /// it in `self.structs`. Returns `None` for an unknown name or a type
+    /// that contains itself.
+    fn resolve_aggregate(&mut self, name: &str) -> Option<Type> {
+        if let Some(s) = self.structs.iter().find(|s| s.name == name) {
+            return Some(s.ty.clone());
+        }
+        if self.resolving.iter().any(|n| n == name) {
+            return None;
+        }
+        let program = self.program;
+        let item = program.items.iter().find(|it| {
+            matches!(it, Item::Struct(_) | Item::Enum(_)) && it.name() == name
+        })?;
+        self.resolving.push(name.to_string());
+        let ty = match item {
+            Item::Struct(s) => {
+                let mut fields = Vec::new();
+                for f in &s.fields {
+                    if fields.iter().any(|(n, _)| n == &f.name.name) {
+                        self.err(
+                            format!("duplicate field `{}`", f.name.name),
+                            f.name.span,
+                            "E0202",
+                        );
+                        continue;
+                    }
+                    let ty = self.resolve_type(&f.ty);
+                    fields.push((f.name.name.clone(), ty));
+                }
+                Type::Struct {
+                    name: s.name.name.clone(),
+                    fields,
+                }
+            }
+            Item::Enum(e) => {
+                let mut variants: Vec<(String, Vec<Type>)> = Vec::new();
+                for v in &e.variants {
+                    if variants.iter().any(|(n, _)| n == &v.name.name) {
+                        self.err(
+                            format!("duplicate variant `{}`", v.name.name),
+                            v.name.span,
+                            "E0204",
+                        );
+                        continue;
+                    }
+                    let payload = v.payload.iter().map(|t| self.resolve_type(t)).collect();
+                    variants.push((v.name.name.clone(), payload));
+                }
+                if variants.is_empty() {
+                    self.err(
+                        format!("enum `{}` has no variants", e.name.name),
+                        e.name.span,
+                        "E0206",
+                    );
+                }
+                Type::Enum {
+                    name: e.name.name.clone(),
+                    variants,
+                }
+            }
+            _ => unreachable!(),
+        };
+        self.resolving.pop();
+        self.structs.push(HirStruct {
+            name: name.to_string(),
+            ty: ty.clone(),
+            span: item.span(),
+        });
+        Some(ty)
     }
 
     /// Built-ins are registered after user functions, so a user `fn` with
@@ -445,7 +545,17 @@ impl<'a> Analyzer<'a> {
         self.scopes.push();
         let mut stmts = Vec::new();
         for s in &block.stmts {
-            stmts.push(self.check_stmt(s));
+            if let Stmt::LetTuple {
+                mutable,
+                names,
+                init,
+                span,
+            } = s
+            {
+                self.check_let_tuple(*mutable, names, init, *span, &mut stmts);
+            } else {
+                stmts.push(self.check_stmt(s));
+            }
         }
         let mut tail = block
             .tail
@@ -461,6 +571,285 @@ impl<'a> Analyzer<'a> {
             stmts,
             tail,
             span: block.span,
+        }
+    }
+
+    /// `let (a, b) = t;` → `let $t = t; let a = $t.0; let b = $t.1;`
+    fn check_let_tuple(
+        &mut self,
+        mutable: bool,
+        names: &[Ident],
+        init: &Expr,
+        span: Span,
+        out: &mut Vec<HirStmt>,
+    ) {
+        let init_e = self.check_expr(init, None);
+        let elems: Vec<Type> = match &init_e.ty {
+            Type::Tuple(elems) if elems.len() == names.len() => elems.clone(),
+            Type::Error => vec![Type::Error; names.len()],
+            other => {
+                self.err(
+                    format!(
+                        "cannot destructure `{other}` into {} names",
+                        names.len()
+                    ),
+                    init.span,
+                    "E0269",
+                );
+                vec![Type::Error; names.len()]
+            }
+        };
+        let temp = format!("$t{}", self.temp_counter);
+        self.temp_counter += 1;
+        let tuple_ty = init_e.ty.clone();
+        out.push(HirStmt::Let {
+            name: temp.clone(),
+            ty: tuple_ty.clone(),
+            mutable: false,
+            init: Some(init_e),
+            span,
+        });
+        for (i, name) in names.iter().enumerate() {
+            if name.name == "_" {
+                continue;
+            }
+            let ty = elems[i].clone();
+            self.define_local(name, ty.clone(), mutable);
+            let base = HirExpr {
+                kind: HirExprKind::Local(temp.clone()),
+                ty: tuple_ty.clone(),
+                span: init.span,
+            };
+            out.push(HirStmt::Let {
+                name: name.name.clone(),
+                ty: ty.clone(),
+                mutable,
+                init: Some(HirExpr {
+                    kind: HirExprKind::Field {
+                        base: Box::new(base),
+                        field: i.to_string(),
+                        index: i,
+                    },
+                    ty,
+                    span: name.span,
+                }),
+                span: name.span,
+            });
+        }
+    }
+
+    /// Defines a local, warning when it shadows an existing binding.
+    fn define_local(&mut self, name: &Ident, ty: Type, mutable: bool) {
+        if !self.scopes.define(
+            name.name.clone(),
+            Symbol {
+                name: name.name.clone(),
+                ty,
+                mutable,
+                kind: DefKind::Local,
+                span: name.span,
+            },
+        ) {
+            self.diags.push(
+                Diagnostic::warning(
+                    format!("shadows existing binding `{}`", name.name),
+                    name.span,
+                )
+                .with_code("W0232"),
+            );
+        }
+    }
+
+    fn check_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> HirStmt {
+        let s = self.check_expr(scrutinee, None);
+        let sty = s.ty.clone();
+        let mut seen_tags: Vec<usize> = Vec::new();
+        let mut catch_all = false;
+        let mut out = Vec::new();
+        for arm in arms {
+            self.scopes.push();
+            let pattern = self.check_pattern(&arm.pattern, &sty);
+            match &pattern {
+                HirPattern::Variant { tag, .. } => {
+                    if seen_tags.contains(tag) {
+                        self.err(
+                            "duplicate match arm: this variant is already covered",
+                            arm.pattern.span,
+                            "E0271",
+                        );
+                    } else {
+                        seen_tags.push(*tag);
+                    }
+                }
+                HirPattern::Wildcard | HirPattern::Binding { .. } => catch_all = true,
+                HirPattern::Literal { .. } => {}
+            }
+            let body = self.check_block(&arm.body);
+            self.scopes.pop();
+            out.push(HirArm {
+                pattern,
+                body,
+                span: arm.span,
+            });
+        }
+        if !catch_all {
+            match &sty {
+                Type::Enum { variants, .. } => {
+                    let missing: Vec<&str> = variants
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !seen_tags.contains(i))
+                        .map(|(_, (n, _))| n.as_str())
+                        .collect();
+                    if !missing.is_empty() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                format!(
+                                    "non-exhaustive match: variant(s) `{}` not covered",
+                                    missing.join("`, `")
+                                ),
+                                span,
+                            )
+                            .with_code("E0270")
+                            .with_help("add the missing arms or a `_ => { ... }` arm"),
+                        );
+                    }
+                }
+                Type::Error => {}
+                _ => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            format!("non-exhaustive match on `{sty}`"),
+                            span,
+                        )
+                        .with_code("E0270")
+                        .with_help("a match on a scalar needs a `_` or binding arm"),
+                    );
+                }
+            }
+        }
+        HirStmt::Match {
+            scrutinee: s,
+            arms: out,
+            span,
+        }
+    }
+
+    /// Checks a pattern against the scrutinee type and defines its bindings
+    /// in the current scope.
+    fn check_pattern(&mut self, pat: &Pattern, sty: &Type) -> HirPattern {
+        match &pat.kind {
+            PatternKind::Wildcard => HirPattern::Wildcard,
+            PatternKind::Binding(id) => {
+                self.define_local(id, sty.clone(), false);
+                HirPattern::Binding {
+                    name: id.name.clone(),
+                    ty: sty.clone(),
+                }
+            }
+            PatternKind::Literal(lit) => {
+                let lit_ty = match lit {
+                    Literal::Int(v) => {
+                        if sty.is_integer() || sty.is_error() {
+                            self.int_literal(*v, Some(sty), pat.span).ty
+                        } else {
+                            Type::I32
+                        }
+                    }
+                    Literal::Float(_) => {
+                        self.err(
+                            "float literals cannot be used as patterns",
+                            pat.span,
+                            "E0268",
+                        );
+                        return HirPattern::Wildcard;
+                    }
+                    Literal::Bool(_) => Type::Bool,
+                    Literal::String(_) => Type::String,
+                    Literal::Char(_) => Type::Char,
+                    Literal::Unit => Type::Unit,
+                };
+                if !sty.assignable_from(&lit_ty) {
+                    self.err(
+                        format!("pattern has type `{lit_ty}`, but the value matched has type `{sty}`"),
+                        pat.span,
+                        "E0269",
+                    );
+                }
+                HirPattern::Literal {
+                    lit: lit.clone(),
+                    ty: sty.clone(),
+                }
+            }
+            PatternKind::Variant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                let ety = match self.resolve_aggregate(&enum_name.name) {
+                    Some(t @ Type::Enum { .. }) => t,
+                    _ => {
+                        self.err(
+                            format!("unknown enum `{}`", enum_name.name),
+                            enum_name.span,
+                            "E0265",
+                        );
+                        return HirPattern::Wildcard;
+                    }
+                };
+                if !sty.assignable_from(&ety) {
+                    self.err(
+                        format!("pattern has type `{ety}`, but the value matched has type `{sty}`"),
+                        pat.span,
+                        "E0269",
+                    );
+                }
+                let (tag, payload) = match ety.variant(&variant.name) {
+                    Some((tag, p)) => (tag, p.to_vec()),
+                    None => {
+                        self.err(
+                            format!("enum `{}` has no variant `{}`", enum_name.name, variant.name),
+                            variant.span,
+                            "E0266",
+                        );
+                        return HirPattern::Wildcard;
+                    }
+                };
+                if fields.len() != payload.len() {
+                    self.err(
+                        format!(
+                            "variant `{}::{}` has {} payload value(s), but the pattern names {}",
+                            enum_name.name,
+                            variant.name,
+                            payload.len(),
+                            fields.len()
+                        ),
+                        pat.span,
+                        "E0267",
+                    );
+                }
+                let mut out = Vec::new();
+                for (i, f) in fields.iter().enumerate() {
+                    let fty = payload.get(i).cloned().unwrap_or(Type::Error);
+                    match &f.kind {
+                        PatternKind::Wildcard => out.push(None),
+                        PatternKind::Binding(id) => {
+                            self.define_local(id, fty.clone(), false);
+                            out.push(Some((id.name.clone(), fty)));
+                        }
+                        _ => {
+                            self.err(
+                                "nested patterns are not supported; use a name or `_`",
+                                f.span,
+                                "E0268",
+                            );
+                            out.push(None);
+                        }
+                    }
+                }
+                out.truncate(payload.len());
+                HirPattern::Variant { tag, fields: out }
+            }
         }
     }
 
@@ -677,6 +1066,27 @@ impl<'a> Analyzer<'a> {
                 HirStmt::Continue(*span)
             }
             Stmt::Block { block, .. } => HirStmt::Block(self.check_block(block)),
+            Stmt::Match {
+                scrutinee,
+                arms,
+                span,
+            } => self.check_match(scrutinee, arms, *span),
+            // Normally expanded by `check_block_with`; a stray one (not
+            // directly in a block) is scoped to itself.
+            Stmt::LetTuple {
+                mutable,
+                names,
+                init,
+                span,
+            } => {
+                let mut stmts = Vec::new();
+                self.check_let_tuple(*mutable, names, init, *span, &mut stmts);
+                HirStmt::Block(HirBlock {
+                    stmts,
+                    tail: None,
+                    span: *span,
+                })
+            }
         }
     }
 
@@ -773,6 +1183,12 @@ impl<'a> Analyzer<'a> {
             ExprKind::Field { base, field } => self.check_field(base, field, expr.span),
             ExprKind::Array { elements } => self.check_array(elements, expr.span),
             ExprKind::StructLit { name, fields } => self.check_struct_lit(name, fields, expr.span),
+            ExprKind::Tuple { elements } => self.check_tuple(elements, expected, expr.span),
+            ExprKind::EnumLit {
+                enum_name,
+                variant,
+                args,
+            } => self.check_enum_lit(enum_name, variant, args, expr.span),
             ExprKind::Cast { expr: inner, ty } => self.check_cast(inner, ty, expr.span),
             ExprKind::Group(inner) => self.check_expr(inner, expected),
         }
@@ -1044,6 +1460,93 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn check_tuple(&mut self, elements: &[Expr], expected: Option<&Type>, span: Span) -> HirExpr {
+        let hints: Vec<Option<&Type>> = match expected {
+            Some(Type::Tuple(ts)) if ts.len() == elements.len() => ts.iter().map(Some).collect(),
+            _ => vec![None; elements.len()],
+        };
+        let mut checked = Vec::new();
+        let mut tys = Vec::new();
+        for (e, hint) in elements.iter().zip(hints) {
+            let c = self.check_expr(e, hint);
+            tys.push(c.ty.clone());
+            checked.push(c);
+        }
+        HirExpr {
+            kind: HirExprKind::Tuple { elements: checked },
+            ty: Type::Tuple(tys),
+            span,
+        }
+    }
+
+    fn check_enum_lit(&mut self, enum_name: &Ident, variant: &Ident, args: &[Expr], span: Span) -> HirExpr {
+        let error = |args: Vec<HirExpr>| HirExpr {
+            kind: HirExprKind::EnumLit { tag: 0, args },
+            ty: Type::Error,
+            span,
+        };
+        let ety = match self.resolve_aggregate(&enum_name.name) {
+            Some(t @ Type::Enum { .. }) => t,
+            _ => {
+                self.err(
+                    format!("unknown enum `{}`", enum_name.name),
+                    enum_name.span,
+                    "E0265",
+                );
+                let args = args.iter().map(|a| self.check_expr(a, None)).collect();
+                return error(args);
+            }
+        };
+        let (tag, payload) = match ety.variant(&variant.name) {
+            Some((tag, p)) => (tag, p.to_vec()),
+            None => {
+                self.err(
+                    format!("enum `{}` has no variant `{}`", enum_name.name, variant.name),
+                    variant.span,
+                    "E0266",
+                );
+                let args = args.iter().map(|a| self.check_expr(a, None)).collect();
+                return error(args);
+            }
+        };
+        if args.len() != payload.len() {
+            self.err(
+                format!(
+                    "variant `{}::{}` takes {} value(s), but {} were given",
+                    enum_name.name,
+                    variant.name,
+                    payload.len(),
+                    args.len()
+                ),
+                span,
+                "E0267",
+            );
+        }
+        let mut checked = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let want = payload.get(i);
+            let c = self.check_expr(a, want);
+            if let Some(w) = want {
+                if !w.assignable_from(&c.ty) {
+                    self.err(
+                        format!(
+                            "payload {i} of `{}::{}` has type `{w}`, found `{}`",
+                            enum_name.name, variant.name, c.ty
+                        ),
+                        a.span,
+                        "E0269",
+                    );
+                }
+            }
+            checked.push(c);
+        }
+        HirExpr {
+            kind: HirExprKind::EnumLit { tag, args: checked },
+            ty: ety,
+            span,
+        }
+    }
+
     fn check_cast(&mut self, inner: &Expr, ty: &TypeExpr, span: Span) -> HirExpr {
         let to = self.resolve_type(ty);
         let e = self.check_expr(inner, None);
@@ -1162,12 +1665,22 @@ impl<'a> Analyzer<'a> {
             TypeExprKind::Named(n) => {
                 if let Some(t) = parse_named_type(n) {
                     t
-                } else if let Some(s) = self.structs.iter().find(|s| s.name == *n) {
-                    s.ty.clone()
+                } else if let Some(t) = self.resolve_aggregate(n) {
+                    t
+                } else if self.resolving.iter().any(|r| r == n) {
+                    self.err(
+                        format!("recursive type `{n}` has infinite size"),
+                        te.span,
+                        "E0205",
+                    );
+                    Type::Error
                 } else {
                     self.err(format!("unknown type `{n}`"), te.span, "E0261");
                     Type::Error
                 }
+            }
+            TypeExprKind::Tuple(elems) => {
+                Type::Tuple(elems.iter().map(|t| self.resolve_type(t)).collect())
             }
             TypeExprKind::Array { elem, len } => {
                 if *len < 0 {
@@ -1252,6 +1765,9 @@ fn stmt_always_returns(stmt: &HirStmt) -> bool {
                     .unwrap_or(false)
         }
         HirStmt::Block(b) => block_always_returns(b),
+        HirStmt::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|a| block_always_returns(&a.body))
+        }
         _ => false,
     }
 }
@@ -1289,6 +1805,44 @@ mod tests {
         "#;
         let (hir, msg) = sema(src);
         assert!(hir.is_some(), "{msg}");
+    }
+
+    #[test]
+    fn enums_tuples_and_match_type_check() {
+        let src = "
+            struct P { x: i32 }
+            enum E { A(f64), B(P, i64), C }
+            fn f(e: E) -> i32 {
+                match e {
+                    E::A(r) => { return r as i32; }
+                    E::B(p, n) => { return p.x + n as i32; }
+                    E::C => { return 0; }
+                }
+            }
+            fn main() -> i32 {
+                let t: (i32, E) = (1, E::B(P { x: 2 }, 3));
+                let (a, e) = t;
+                if let E::C = e { return 1; }
+                let ok = t == (1, E::C) || e != E::A(1.0);
+                match a { 1 => { } x => { } }
+                return f(e) + t.0;
+            }";
+        let (hir, msg) = sema(src);
+        assert!(hir.is_some(), "{msg}");
+        for (src, code) in [
+            ("enum E { A, B } fn main() -> i32 { match E::A { E::A => { } } return 0; }", "E0270"),
+            ("fn main() -> i32 { match 1 { 1 => { } } return 0; }", "E0270"),
+            ("enum E { A, B } fn main() -> i32 { match E::A { E::A => { } E::A => { } _ => { } } return 0; }", "E0271"),
+            ("enum E { A(i32) } fn main() -> i32 { match E::A(1) { E::A => { } } return 0; }", "E0267"),
+            ("enum E { A } fn main() -> i32 { let x = E::B; return 0; }", "E0266"),
+            ("fn main() -> i32 { let t = (1, 2); return t.5; }", "E0248"),
+            ("fn main() -> i32 { let t = (1, 2); let (a, b, c) = t; return 0; }", "E0269"),
+            ("enum E { A } fn main() -> i32 { return (E::A < E::A) as i32; }", "E0244"),
+            ("struct S { e: E } enum E { A(S) } fn main() -> i32 { return 0; }", "E0205"),
+        ] {
+            let (hir, msg) = sema(src);
+            assert!(hir.is_none() && msg.contains(code), "expected {code} for {src}, got:\n{msg}");
+        }
     }
 
     #[test]

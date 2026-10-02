@@ -67,7 +67,15 @@ impl<'src> Lexer<'src> {
             ']' => self.single(TokenKind::RBracket, start, line, column),
             ',' => self.single(TokenKind::Comma, start, line, column),
             ';' => self.single(TokenKind::Semicolon, start, line, column),
-            ':' => self.single(TokenKind::Colon, start, line, column),
+            ':' => {
+                self.bump();
+                if self.peek_char() == ':' {
+                    self.bump();
+                    self.make(TokenKind::ColonColon, start, line, column)
+                } else {
+                    self.make(TokenKind::Colon, start, line, column)
+                }
+            }
             '+' => {
                 self.bump();
                 self.op_or_assign(TokenKind::Plus, TokenKind::PlusEq, start, line, column)
@@ -101,6 +109,9 @@ impl<'src> Lexer<'src> {
                 if self.peek_char() == '=' {
                     self.bump();
                     self.make(TokenKind::EqEq, start, line, column)
+                } else if self.peek_char() == '>' {
+                    self.bump();
+                    self.make(TokenKind::FatArrow, start, line, column)
                 } else {
                     self.make(TokenKind::Eq, start, line, column)
                 }

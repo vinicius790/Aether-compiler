@@ -651,6 +651,7 @@ fn repl_eval(items: &mut Vec<ReplItem>, buf: String, a: &Args) {
                 let (name, span) = match it {
                     Item::Fn(f) => (f.name.name.clone(), f.span),
                     Item::Struct(s) => (s.name.name.clone(), s.span),
+                    Item::Enum(en) => (en.name.name.clone(), en.span),
                     Item::Extern(e) => (e.name.name.clone(), e.span),
                     Item::Use(u) => (format!("use {}", u.path), u.span),
                 };

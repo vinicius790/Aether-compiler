@@ -1,4 +1,4 @@
-# Especificação da linguagem Aether 0.2
+# Especificação da linguagem Aether 0.3
 
 ## Propósito
 
@@ -246,6 +246,82 @@ a[i]
 
 Índice fora do intervalo é erro de runtime. `len(a)` devolve o número de
 elementos (`N`) como `i32`.
+
+## Tuplas
+
+```
+let t: (i32, bool) = (1, true);
+t.0            // 1
+t.1 = false;   // campos são atribuíveis (t: mut)
+let (a, b) = t;
+```
+
+Tipo `(T1, T2, ...)` e expressão `(e1, e2, ...)` com **dois ou mais**
+elementos (`()` continua a ser `unit`, `(e)` é só `e`). Acesso posicional
+`t.0`, `t.1`, ... (`t.0.1` acede ao elemento 1 do elemento 0). A
+desestruturação `let [mut] (a, b, ...) = expr;` exige tantos nomes quantos
+elementos (E0269); `_` descarta um elemento. Tuplas têm semântica de valor
+como structs. `==` / `!=` comparam elemento a elemento (todos os elementos
+têm de suportar `==`); `<` etc. não existem.
+
+## Enums
+
+```
+enum Shape {
+    Circle(f64),
+    Rect(i32, i32),
+    Empty,
+}
+let c = Shape::Circle(1.5);
+let e = Shape::Empty;
+```
+
+Cada variante tem 0..n cargas posicionais. Construção `Enum::Variante(args)`
+(a aridade e os tipos são verificados: E0267, E0269); variante sem carga
+escreve-se sem parênteses. `==` / `!=` comparam a etiqueta e, se igual, a
+carga elemento a elemento; `<` etc. são rejeitados (E0244). Um enum não
+pode conter-se a si próprio, directa ou indirectamente (E0205); nomes de
+structs e enums partilham o mesmo espaço (E0201). As cargas só são
+acessíveis por `match` / `if let`.
+
+Representação: um objecto cujo campo 0 é a etiqueta (`i32`, índice da
+variante na declaração) e os campos `1..=max_carga` as ranhuras de carga
+(as não usadas pela variante activa ficam `unit`).
+
+## `match`
+
+```
+match s {
+    Shape::Circle(r) => { ... }
+    Shape::Rect(w, _) => { ... }
+    _ => { ... }
+}
+```
+
+`match` é uma **instrução** (como `if`): cada braço é `Padrão => Bloco`
+(vírgula opcional entre braços) e os blocos podem `return` / `break` /
+`continue`. Os braços são testados por ordem. Padrões:
+
+- `Enum::Variante(p1, ..., pn)` com um nome (vincula a carga, imutável) ou
+  `_` por posição (padrões aninhados não são suportados, E0268);
+- literal `i32` / `i64` (também negativo), `bool`, `char`, `string`, para
+  escrutinador do mesmo tipo (E0269; floats não são padrões);
+- `nome` — vincula o escrutinador inteiro e apanha tudo;
+- `_` — apanha tudo.
+
+Exaustividade (E0270): um `match` sobre enum cobre todas as variantes ou
+tem um braço `_`/nome; sobre escalares exige sempre um braço `_`/nome. Uma
+variante repetida é erro (E0271). Um `match` cujos braços todos retornam
+conta como caminho de retorno da função.
+
+## `if let`
+
+```
+if let Shape::Rect(w, h) = s { ... } else { ... }
+```
+
+Açúcar para um `match` de dois braços: o padrão dado e `_ => { else }`
+(bloco vazio sem `else`). Vale qualquer padrão de `match`.
 
 ## Strings
 

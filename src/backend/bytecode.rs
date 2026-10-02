@@ -612,10 +612,8 @@ fn emit_inst(
             len: *len as u32,
         }),
         Inst::AllocStruct { dest, ty } => {
-            let n = match ty {
-                Type::Struct { fields, .. } => fields.len() as u8,
-                _ => 0,
-            };
+            // structs, tuples and enums (tag + payload slots) are all objects
+            let n = ty.layout_fields().map(|f| f.len()).unwrap_or(0) as u8;
             code.push(Op::AllocObj {
                 dest: reg(*dest, fname)?,
                 fields: n,

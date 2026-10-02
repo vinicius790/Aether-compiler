@@ -1,0 +1,72 @@
+// Enums with payloads, `match`, `if let` and tuples: the area of shapes.
+
+enum Shape {
+    Circle(f64),
+    Rect(f64, f64),
+    Empty,
+}
+
+struct Named {
+    name: string,
+    shape: Shape,
+}
+
+fn area(s: Shape) -> f64 {
+    match s {
+        Shape::Circle(r) => { return 3.0 * r * r; }
+        Shape::Rect(w, h) => { return w * h; }
+        Shape::Empty => { return 0.0; }
+    }
+}
+
+fn describe(s: Shape) -> string {
+    match s {
+        Shape::Circle(_) => { return "circle"; }
+        Shape::Rect(w, h) => {
+            if w == h { return "square"; }
+            return "rectangle";
+        }
+        _ => { return "nothing"; }
+    }
+}
+
+fn min_max(a: i32, b: i32) -> (i32, i32) {
+    if a < b { return (a, b); }
+    return (b, a);
+}
+
+fn code_for(x: i32) -> i32 {
+    match x {
+        4 => { return 40; }
+        9 => { return 0; }
+        _ => { return 1; }
+    }
+}
+
+fn main() -> i32 {
+    let shapes = [Shape::Circle(2.0), Shape::Rect(3.0, 4.0), Shape::Rect(5.0, 5.0), Shape::Empty];
+    let mut total = 0.0;
+    for i in 0..4 {
+        let s = shapes[i];
+        println(describe(s));
+        print_f64(area(s));
+        total = total + area(s);
+    }
+    print_f64(total);
+
+    let n = Named { name: "box", shape: Shape::Rect(2.0, 8.0) };
+    if let Shape::Rect(w, h) = n.shape {
+        println(n.name);
+        print_f64(w * h);
+    } else {
+        println("not a box");
+    }
+
+    let (lo, hi) = min_max(9, 4);
+    let pair = (lo, hi);
+    print_i32(pair.0);
+    print_i32(pair.1);
+    if pair == (4, 9) { println("pair ok"); }
+    if shapes[0] != Shape::Circle(2.0) { return 1; }
+    return code_for(hi);
+}

@@ -1,0 +1,346 @@
+fn area(%0: Shape /* s */) -> f64 {
+bb0:
+  %1 = mov %0
+  %2 = field %1.0
+  %3 = const 0_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb2, bb3
+bb1:
+  ret
+bb2:
+  %5 = field %1.1
+  %6 = const 3_f64
+  %7 = *.f64 %6, %5
+  %8 = *.f64 %7, %5
+  ret %8
+bb3:
+  %9 = const 1_i32
+  %10 = ==.i32 %2, %9
+  br %10, bb5, bb6
+bb4:
+  jmp bb1
+bb5:
+  %11 = field %1.1
+  %12 = field %1.2
+  %13 = *.f64 %11, %12
+  ret %13
+bb6:
+  %14 = const 2_i32
+  %15 = ==.i32 %2, %14
+  br %15, bb8, bb9
+bb7:
+  jmp bb1
+bb8:
+  %16 = const 0_f64
+  ret %16
+bb9:
+  jmp bb1
+bb10:
+  jmp bb1
+}
+
+fn describe(%0: Shape /* s */) -> string {
+bb0:
+  %1 = mov %0
+  %2 = field %1.0
+  %3 = const 0_i32
+  %4 = ==.i32 %2, %3
+  br %4, bb2, bb3
+bb1:
+  ret
+bb2:
+  %5 = const "circle"
+  ret %5
+bb3:
+  %6 = const 1_i32
+  %7 = ==.i32 %2, %6
+  br %7, bb5, bb6
+bb4:
+  jmp bb1
+bb5:
+  %8 = field %1.1
+  %9 = field %1.2
+  %10 = ==.f64 %8, %9
+  br %10, bb7, bb8
+bb6:
+  %13 = const "nothing"
+  ret %13
+bb7:
+  %11 = const "square"
+  ret %11
+bb8:
+  jmp bb9
+bb9:
+  %12 = const "rectangle"
+  ret %12
+bb10:
+  jmp bb9
+bb11:
+  jmp bb1
+bb12:
+  jmp bb1
+bb13:
+  jmp bb1
+}
+
+fn min_max(%0: i32 /* a */, %1: i32 /* b */) -> (i32, i32) {
+bb0:
+  %2 = <.i32 %0, %1
+  br %2, bb1, bb2
+bb1:
+  %3 = alloc (i32, i32)
+  store %3.0 = %0
+  store %3.1 = %1
+  ret %3
+bb2:
+  jmp bb3
+bb3:
+  %4 = alloc (i32, i32)
+  store %4.0 = %1
+  store %4.1 = %0
+  ret %4
+bb4:
+  jmp bb3
+bb5:
+  ret
+}
+
+fn code_for(%0: i32 /* x */) -> i32 {
+bb0:
+  %1 = mov %0
+  %2 = const 4_i32
+  %3 = ==.i32 %1, %2
+  br %3, bb2, bb3
+bb1:
+  %9 = const 0_i32
+  ret %9
+bb2:
+  %4 = const 40_i32
+  ret %4
+bb3:
+  %5 = const 9_i32
+  %6 = ==.i32 %1, %5
+  br %6, bb5, bb6
+bb4:
+  jmp bb1
+bb5:
+  %7 = const 0_i32
+  ret %7
+bb6:
+  %8 = const 1_i32
+  ret %8
+bb7:
+  jmp bb1
+bb8:
+  jmp bb1
+bb9:
+  jmp bb1
+}
+
+fn main() -> i32 {
+bb0:
+  %1 = alloc [Shape; 4]
+  %2 = alloc Shape
+  %3 = const 0_i32
+  store %2.0 = %3
+  %4 = const 2_f64
+  store %2.1 = %4
+  %5 = const 0_i32
+  store %1[%5] = %2
+  %6 = alloc Shape
+  %7 = const 1_i32
+  store %6.0 = %7
+  %8 = const 3_f64
+  store %6.1 = %8
+  %9 = const 4_f64
+  store %6.2 = %9
+  %10 = const 1_i32
+  store %1[%10] = %6
+  %11 = alloc Shape
+  %12 = const 1_i32
+  store %11.0 = %12
+  %13 = const 5_f64
+  store %11.1 = %13
+  %14 = const 5_f64
+  store %11.2 = %14
+  %15 = const 2_i32
+  store %1[%15] = %11
+  %16 = alloc Shape
+  %17 = const 2_i32
+  store %16.0 = %17
+  %18 = const 3_i32
+  store %1[%18] = %16
+  %0 = mov %1
+  %20 = const 0_f64
+  %19 = mov %20
+  %22 = const 0_i32
+  %21 = mov %22
+  %23 = const 4_i32
+  jmp bb1
+bb1:
+  %24 = <.i32 %21, %23
+  br %24, bb2, bb4
+bb2:
+  %26 = load %0[%21]
+  %25 = mov %26
+  %27 = call describe(%25)
+  call println(%27)
+  %28 = const ()
+  %29 = call area(%25)
+  call print_f64(%29)
+  %30 = const ()
+  %31 = call area(%25)
+  %32 = +.f64 %19, %31
+  %19 = mov %32
+  jmp bb3
+bb3:
+  %33 = const 1_i32
+  %21 = +.i32 %21, %33
+  jmp bb1
+bb4:
+  call print_f64(%19)
+  %34 = const ()
+  %36 = alloc Named
+  %37 = const "box"
+  store %36.0 = %37
+  %38 = alloc Shape
+  %39 = const 1_i32
+  store %38.0 = %39
+  %40 = const 2_f64
+  store %38.1 = %40
+  %41 = const 8_f64
+  store %38.2 = %41
+  store %36.1 = %38
+  %35 = mov %36
+  %42 = field %35.1
+  %43 = mov %42
+  %44 = field %43.0
+  %45 = const 1_i32
+  %46 = ==.i32 %44, %45
+  br %46, bb6, bb7
+bb5:
+  %56 = const 9_i32
+  %57 = const 4_i32
+  %58 = call min_max(%56, %57)
+  %55 = mov %58
+  %60 = field %55.0
+  %59 = mov %60
+  %62 = field %55.1
+  %61 = mov %62
+  %64 = alloc (i32, i32)
+  store %64.0 = %59
+  store %64.1 = %61
+  %63 = mov %64
+  %65 = field %63.0
+  call print_i32(%65)
+  %66 = const ()
+  %67 = field %63.1
+  call print_i32(%67)
+  %68 = const ()
+  %69 = alloc (i32, i32)
+  %70 = const 4_i32
+  store %69.0 = %70
+  %71 = const 9_i32
+  store %69.1 = %71
+  %72 = const true
+  %73 = field %63.0
+  %74 = field %69.0
+  %75 = ==.i32 %73, %74
+  %72 = mov %75
+  br %75, bb10, bb9
+bb6:
+  %47 = field %43.1
+  %48 = field %43.2
+  %49 = field %35.0
+  call println(%49)
+  %50 = const ()
+  %51 = *.f64 %47, %48
+  call print_f64(%51)
+  %52 = const ()
+  jmp bb5
+bb7:
+  %53 = const "not a box"
+  call println(%53)
+  %54 = const ()
+  jmp bb5
+bb8:
+  jmp bb5
+bb9:
+  br %72, bb12, bb13
+bb10:
+  %76 = field %63.1
+  %77 = field %69.1
+  %78 = ==.i32 %76, %77
+  %72 = mov %78
+  br %78, bb11, bb9
+bb11:
+  jmp bb9
+bb12:
+  %79 = const "pair ok"
+  call println(%79)
+  %80 = const ()
+  jmp bb14
+bb13:
+  jmp bb14
+bb14:
+  %81 = const 0_i32
+  %82 = load %0[%81]
+  %83 = alloc Shape
+  %84 = const 0_i32
+  store %83.0 = %84
+  %85 = const 2_f64
+  store %83.1 = %85
+  %87 = field %82.0
+  %88 = field %83.0
+  %86 = ==.i32 %87, %88
+  br %86, bb16, bb15
+bb15:
+  %102 = !.bool %86
+  br %102, bb24, bb25
+bb16:
+  %89 = const 0_i32
+  %90 = ==.i32 %87, %89
+  br %90, bb17, bb18
+bb17:
+  %91 = field %82.1
+  %92 = field %83.1
+  %93 = ==.f64 %91, %92
+  %86 = mov %93
+  br %93, bb19, bb15
+bb18:
+  %94 = const 1_i32
+  %95 = ==.i32 %87, %94
+  br %95, bb20, bb21
+bb19:
+  jmp bb15
+bb20:
+  %96 = field %82.1
+  %97 = field %83.1
+  %98 = ==.f64 %96, %97
+  %86 = mov %98
+  br %98, bb22, bb15
+bb21:
+  jmp bb15
+bb22:
+  %99 = field %82.2
+  %100 = field %83.2
+  %101 = ==.f64 %99, %100
+  %86 = mov %101
+  br %101, bb23, bb15
+bb23:
+  jmp bb15
+bb24:
+  %103 = const 1_i32
+  ret %103
+bb25:
+  jmp bb26
+bb26:
+  %104 = call code_for(%61)
+  ret %104
+bb27:
+  jmp bb26
+bb28:
+  %105 = const 0_i32
+  ret %105
+}
+

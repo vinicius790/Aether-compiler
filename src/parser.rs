@@ -1125,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn nesting_400_parens_end_to_end() {
+    fn nesting_near_limit_end_to_end() {
         // The parser itself fits 256 levels in a 2 MiB test thread, but
         // sema's `check_expr` frame is several KiB in debug builds and
         // overflows 2 MiB somewhere between 128 and 256 `Group` levels, so
@@ -1134,7 +1134,7 @@ mod tests {
         let handle = std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(|| {
-                let src = nested_parens(400);
+                let src = nested_parens(MAX_NESTING - 8);
                 let (v, _, _) = crate::run_source("deep.ae", &src, 0).expect("-O0");
                 assert_eq!(v, crate::vm::Value::I32(1));
                 let (v, _, _) = crate::run_source("deep.ae", &src, 2).expect("-O2");

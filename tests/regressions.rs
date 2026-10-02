@@ -356,3 +356,21 @@ fn leaf_functions_are_inlined() {
     );
     check(src, 42, "");
 }
+
+#[test]
+fn expected_array_type_types_the_elements() {
+    check(
+        "fn g(a: [i64; 2]) -> i64 { return a[0] + a[1]; }\nfn main() -> i32 { let a: [i64; 2] = [1, 3000000000]; print_i64(g([3, 4])); print_i64(a[1]); let n: [[i64; 2]; 1] = [[5, 6]]; print_i64(n[0][1]); return 0; }",
+        0,
+        "7\n3000000000\n6\n",
+    );
+}
+
+#[test]
+fn negating_a_negative_literal_wraps_like_a_variable() {
+    check(
+        "fn main() -> i32 { let a = -(-2147483648); let b = -2147483648; let c = -b; print_i32(a); print_i32(c); let d: i64 = -(-2147483648); print_i64(d); return 0; }",
+        0,
+        "-2147483648\n-2147483648\n2147483648\n",
+    );
+}

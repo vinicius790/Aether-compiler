@@ -1422,7 +1422,7 @@ impl<'a> Analyzer<'a> {
             ExprKind::Call { callee, args } => self.check_call(callee, args, expr.span),
             ExprKind::Index { base, index } => self.check_index(base, index, expr.span),
             ExprKind::Field { base, field } => self.check_field(base, field, expr.span),
-            ExprKind::Array { elements } => self.check_array(elements, expr.span),
+            ExprKind::Array { elements } => self.check_array(elements, expected, expr.span),
             ExprKind::StructLit { name, fields } => self.check_struct_lit(name, fields, expr.span),
             ExprKind::Tuple { elements } => self.check_tuple(elements, expected, expr.span),
             ExprKind::EnumLit {
@@ -1524,8 +1524,10 @@ impl<'a> Analyzer<'a> {
 
     fn check_unary(&mut self, op: UnOp, inner: &Expr, expected: Option<&Type>, span: Span) -> HirExpr {
         // `-5` is one literal, so `let x: i64 = -1;` and `-2147483648` type-check
+        // Only a directly negated literal is one literal: `-(-2147483648)` is
+        // a negation of an `i32` value and wraps like `-a`, it is not a literal.
         if op == UnOp::Neg {
-            if let Some(v) = int_literal_value(inner) {
+            if let ExprKind::Literal(Literal::Int(v)) = &inner.kind {
                 return self.int_literal(v.wrapping_neg(), expected, span);
             }
         }
@@ -1607,11 +1609,16 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn check_array(&mut self, elements: &[Expr], span: Span) -> HirExpr {
+    fn check_array(&mut self, elements: &[Expr], expected: Option<&Type>, span: Span) -> HirExpr {
         let mut checked = Vec::new();
         let mut elem_ty = Type::Error;
+        // an expected `[T; N]` types the elements (`let a: [i64; 2] = [1, 2];`)
+        let expected_elem = match expected {
+            Some(Type::Array { elem, .. }) => Some((**elem).clone()),
+            _ => None,
+        };
         for (i, e) in elements.iter().enumerate() {
-            let hint = if i == 0 { None } else { Some(&elem_ty) };
+            let hint = if i == 0 { expected_elem.as_ref() } else { Some(&elem_ty) };
             let c = self.check_expr(e, hint);
             if i == 0 {
                 elem_ty = c.ty.clone();
